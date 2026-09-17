@@ -1,0 +1,34 @@
+seed: 17
+output_root: outputs
+curves: [raster, snake, morton, hilbert, random]
+# Use one source per primary run. FOMO300K contains OpenMind scans.
+manifests:
+  - data/manifests/mrrate_atlas.csv
+
+data:
+  target_shape: [128, 128, 128]
+  patch_size: 8
+  cache_dir: .cache/volumes
+  max_train_per_dataset: 512
+  max_val_per_dataset: 128
+
+model:
+  d_model: 256
+  depth: 4
+  head_dim: 64
+  num_heads: 4
+  dropout: 0.0
+  use_short_conv: true
+
+microtrain:
+  steps: 500
+  batch_size: 2
+  lr: 0.0003
+  weight_decay: 0.05
+  mask_ratio: 0.50
+  eval_every: 50
+  amp: true
+
+geometry:
+  windows: [4, 8, 16, 32, 64, 128]
+  spatial_radius: 1.75

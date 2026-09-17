@@ -1,0 +1,7 @@
+name: fomo300k
+kind: bids_like
+root: /path/to/FOMO300K
+output: data/manifests/fomo300k.csv
+split: train
+max_samples: 2000
+modalities: [T1w, MPRAGE, T1]
