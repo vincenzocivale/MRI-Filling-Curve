@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from pathlib import Path
-import pandas as pd
+
 import torch
 from torch.utils.data import DataLoader
+
 from .data.dataset import MRIPatchDataset, balanced_split, load_manifests
-from .metrics import masked_errors, auc
-from .model import MRIProbe
 from .io import seed_all
+from .metrics import auc, masked_errors
+from .model import MRIProbe
 
 
 def collate(batch):
@@ -20,17 +20,25 @@ def collate(batch):
 def _mask(batch: int, n: int, ratio: float, device, generator: torch.Generator):
     return torch.rand((batch, n), generator=generator, device=device) < ratio
 
+def prediction_batch(model, x, ratio, device, generator):
+    if model.objective == "next_patch":
+        target = x[:, model.perm[1:]]
+        mask = torch.ones(target.shape[:2], dtype=torch.bool, device=device)
+        return model(x), target, mask
+    mask = _mask(len(x), x.shape[1], ratio, device, generator)
+    return model(x, mask), x, mask
+
+
 @torch.no_grad()
 def evaluate(model, loader, ratio, device, seed):
     model.eval(); by = defaultdict(lambda: [0.,0.,0])
     g = torch.Generator(device=device).manual_seed(seed + 991)
     for batch in loader:
         x = batch["patches"].to(device)
-        m = _mask(len(x), x.shape[1], ratio, device, g)
-        p = model(x, m)
+        p, target, m = prediction_batch(model, x, ratio, device, g)
         for ds in set(batch["dataset"]):
             idx = torch.tensor([v == ds for v in batch["dataset"]], device=device)
-            mse, mae = masked_errors(p[idx], x[idx], m[idx])
+            mse, mae = masked_errors(p[idx], target[idx], m[idx])
             by[ds][0] += mse; by[ds][1] += mae; by[ds][2] += 1
     rows = [{"dataset": ds, "mse": a/n, "mae": b/n} for ds,(a,b,n) in by.items()]
     return rows
@@ -49,7 +57,7 @@ def microtrain(cfg: dict, curve: str):
     if len(set(shape)) != 1: raise ValueError("Pilot currently requires cubic target_shape.")
     grid = shape[0] // patch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MRIProbe(patch**3, grid, curve, seed, cfg["model"]).to(device)
+    model = MRIProbe(patch**3, grid, curve, seed, cfg["model"], mt.get("objective", "masked")).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=mt["lr"], weight_decay=mt["weight_decay"])
     scaler = torch.amp.GradScaler("cuda", enabled=bool(mt.get("amp", True) and device.type == "cuda"))
     g = torch.Generator(device=device).manual_seed(seed + 123)
@@ -57,15 +65,16 @@ def microtrain(cfg: dict, curve: str):
     for step in range(1, mt["steps"] + 1):
         try: batch = next(it)
         except StopIteration: it = iter(loader); batch = next(it)
-        x = batch["patches"].to(device); m = _mask(len(x), x.shape[1], mt["mask_ratio"], device, g)
+        x = batch["patches"].to(device)
         model.train(); opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=scaler.is_enabled()):
-            pred = model(x, m); loss = ((pred - x)[m] ** 2).mean()
+            pred, target, m = prediction_batch(model, x, mt.get("mask_ratio", 0.5), device, g)
+            loss = ((pred - target)[m] ** 2).mean()
         scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step % mt["eval_every"] == 0 or step == mt["steps"]:
-            rows = evaluate(model, val_loader, mt["mask_ratio"], device, seed)
+            rows = evaluate(model, val_loader, mt.get("mask_ratio", 0.5), device, seed)
             hist.append({"step": step, "train_mse": float(loss.item()),
                          "val_mse": sum(r["mse"] for r in rows)/len(rows),
                          "seconds": time.time()-t0})
-    final = evaluate(model, val_loader, mt["mask_ratio"], device, seed)
+    final = evaluate(model, val_loader, mt.get("mask_ratio", 0.5), device, seed)
     return model, hist, final, {"val_mse_auc": auc(hist)}
