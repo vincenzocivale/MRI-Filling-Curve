@@ -6,7 +6,7 @@ A small, controlled benchmark for one question:
 
 > Does locality-preserving 3D serialization make a measurable difference for Gated DeltaNet-2 before committing to full MRI foundation-model pretraining?
 
-The benchmark keeps data, preprocessing, architecture, masking, optimizer, and update budget fixed. Only the token ordering changes.
+Within each training objective, the benchmark keeps data, preprocessing, architecture, masking, optimizer, and update budget fixed. Only the token ordering changes.
 
 **Curves:** `raster`, `snake`, `morton`, `hilbert`, `random`.
 
@@ -24,7 +24,8 @@ The repository does **not** redistribute datasets or NVIDIA Gated DeltaNet-2 cod
    - consecutive-step 3D distance;
    - MRI sequence total variation after patch pooling.
 2. **Micro-training diagnostic**
-   - masked patch reconstruction with a small bidirectional GDN-2 encoder;
+   - masked patch reconstruction with a small bidirectional GDN-2 encoder (default);
+   - causal next-patch prediction with the same blocks running forward only;
    - fixed number of optimizer updates (`500` by default), not full pretraining;
    - validation MSE/MAE and convergence AUC per dataset and curve.
 
@@ -71,6 +72,18 @@ Edit `configs/benchmark.yaml` with the manifest(s) for one benchmark cohort, the
 python scripts/run.py configs/benchmark.yaml
 ```
 
+Set `microtrain.objective: next_patch` in the same config to run the causal spatial
+prediction probe across all five curves. The default is `masked` when omitted.
+The causal model consumes the first N-1 patches in curve order and predicts patches
+2 through N with MSE, without masking or a reverse pass (`mask_ratio` is ignored).
+Both objectives report MSE/MAE and validation MSE AUC; `summary.csv` groups results
+by objective, including older runs as `masked`.
+
+Compare curves within each objective: the targets and available context differ
+between objectives. Next-patch prediction probes how serialization turns spatial
+continuity into sequential predictability; lower error can reflect local MRI
+smoothness and does not establish better downstream representations.
+
 **Do not treat FOMO300K and OpenMind as independent pooled cohorts:** FOMO300K is a superset of OpenMind. Run them separately (or explicitly de-duplicate them) and report per-source results.
 
 For a fast geometry-only check:
@@ -101,10 +114,10 @@ outputs/<run_id>/
 ## Fairness rules
 
 - same manifest rows and split for every curve;
-- same random mask in **3D patch coordinates**, then reordered by the selected curve;
+- for masked reconstruction, same random mask in **3D patch coordinates**, then reordered by the selected curve;
 - same initialization seed, optimizer and number of updates;
 - same 3D coordinate encoding;
-- curve-specific ordering is the only experimental variable;
+- within each objective, curve-specific ordering is the only experimental variable;
 - report each dataset separately before pooled metrics.
 
 `random` is a negative control. `snake` is necessary to distinguish simple removal of raster discontinuities from multiscale locality preservation.

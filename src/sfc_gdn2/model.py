@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+
 from .curves import order
 
 
@@ -15,9 +16,10 @@ def _gdn2():
         ) from e
 
 
-class BiGDN2Block(nn.Module):
-    def __init__(self, d_model: int, head_dim: int, num_heads: int, use_short_conv: bool):
+class GDN2Block(nn.Module):
+    def __init__(self, d_model: int, head_dim: int, num_heads: int, use_short_conv: bool, bidirectional: bool = True):
         super().__init__()
+        self.bidirectional = bidirectional
         GDN2 = _gdn2()
         self.norm = nn.LayerNorm(d_model)
         self.mix = GDN2(hidden_size=d_model, head_dim=head_dim, num_heads=num_heads,
@@ -28,14 +30,21 @@ class BiGDN2Block(nn.Module):
     def forward(self, x):
         z = self.norm(x)
         f = self.mix(z)[0]
-        b = torch.flip(self.mix(torch.flip(z, dims=[1]))[0], dims=[1])
-        x = x + 0.5 * (f + b)
+        if self.bidirectional:
+            b = torch.flip(self.mix(torch.flip(z, dims=[1]))[0], dims=[1])
+            f = 0.5 * (f + b)
+        x = x + f
         return x + self.ffn(self.ffn_norm(x))
 
 
 class MRIProbe(nn.Module):
-    def __init__(self, patch_voxels: int, grid: int, curve: str, seed: int, cfg: dict):
+    def __init__(self, patch_voxels: int, grid: int, curve: str, seed: int, cfg: dict, objective: str = "masked"):
         super().__init__()
+        if objective not in {"masked", "next_patch"}:
+            raise ValueError(f"Unknown objective: {objective}")
+        if objective == "next_patch" and grid < 2:
+            raise ValueError("next_patch requires at least two patches.")
+        self.objective = objective
         d = cfg["d_model"]
         self.grid = grid
         self.register_buffer("perm", torch.from_numpy(order(curve, grid, seed)), persistent=False)
@@ -43,7 +52,8 @@ class MRIProbe(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(d))
         self.coord = nn.Sequential(nn.Linear(3, d), nn.GELU(), nn.Linear(d, d))
         self.blocks = nn.ModuleList([
-            BiGDN2Block(d, cfg["head_dim"], cfg["num_heads"], cfg.get("use_short_conv", True))
+            GDN2Block(d, cfg["head_dim"], cfg["num_heads"], cfg.get("use_short_conv", True),
+                      bidirectional=objective == "masked")
             for _ in range(cfg["depth"])
         ])
         self.norm = nn.LayerNorm(d)
@@ -55,13 +65,20 @@ class MRIProbe(nn.Module):
         ), -1).reshape(-1, 3)
         self.register_buffer("coords", c, persistent=False)
 
-    def forward(self, patches: torch.Tensor, mask3d: torch.Tensor):
+    def forward(self, patches: torch.Tensor, mask3d: torch.Tensor | None = None):
         # patches [B,N,V], mask3d [B,N] in canonical raster coordinates.
         x = self.patch_embed(patches)
-        x = torch.where(mask3d[..., None], self.mask_token.view(1,1,-1), x)
+        if self.objective == "masked":
+            if mask3d is None:
+                raise ValueError("masked reconstruction requires mask3d.")
+            x = torch.where(mask3d[..., None], self.mask_token.view(1,1,-1), x)
         x = x + self.coord(self.coords)[None]
         x = x[:, self.perm]
+        if self.objective == "next_patch":
+            x = x[:, :-1]
         for block in self.blocks: x = block(x)
         pred = self.head(self.norm(x))
+        if self.objective == "next_patch":
+            return pred
         inv = torch.argsort(self.perm)
         return pred[:, inv]

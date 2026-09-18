@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import argparse, json
+import argparse
+import json
 from pathlib import Path
+
 import pandas as pd
 import torch
+
 from .data.manifest import build
 from .io import dump_json, dump_yaml, environment, load_yaml, stable_id
 from .metrics import geometry_metrics
@@ -33,7 +36,7 @@ def run():
         pd.DataFrame([gm]).to_csv(out/"geometry.csv", index=False)
         model, hist, per_ds, extra = microtrain(cfg, curve)
         pd.DataFrame(hist).to_csv(out/"history.csv", index=False); pd.DataFrame(per_ds).to_csv(out/"per_dataset.csv", index=False)
-        dump_json({"curve": curve, **extra, "mean_mse": sum(x["mse"] for x in per_ds)/len(per_ds), "mean_mae": sum(x["mae"] for x in per_ds)/len(per_ds)}, out/"metrics.json")
+        dump_json({"curve": curve, "objective": cfg["microtrain"].get("objective", "masked"), **extra, "mean_mse": sum(x["mse"] for x in per_ds)/len(per_ds), "mean_mae": sum(x["mae"] for x in per_ds)/len(per_ds)}, out/"metrics.json")
         torch.save(model.state_dict(), out/"checkpoint.pt"); print(out)
 
 
@@ -41,7 +44,8 @@ def summarize():
     ap = argparse.ArgumentParser(); ap.add_argument("output_root"); a = ap.parse_args(); rows = []
     for p in Path(a.output_root).glob("*/metrics.json"):
         with open(p) as f: r = json.load(f)
+        r.setdefault("objective", "masked")
         r["run"] = p.parent.name; rows.append(r)
     if not rows: raise SystemExit("No metrics.json found.")
-    df = pd.DataFrame(rows).sort_values("mean_mse"); out = Path(a.output_root)/"summary.csv"; df.to_csv(out, index=False)
+    df = pd.DataFrame(rows).sort_values(["objective", "mean_mse"]); out = Path(a.output_root)/"summary.csv"; df.to_csv(out, index=False)
     print(df.to_string(index=False)); print(f"\n{out}")

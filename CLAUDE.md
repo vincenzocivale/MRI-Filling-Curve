@@ -47,7 +47,7 @@ are the thin argparse wrappers around `sfc_gdn2.cli.{prepare,run,summarize}`.
 
 ## Architecture
 
-**Curve ordering is the single experimental variable.** `src/sfc_gdn2/curves.py::order(name, n, seed)`
+**Curve ordering is the single experimental variable within each objective.** `src/sfc_gdn2/curves.py::order(name, n, seed)`
 returns a permutation of a canonical raster-ordered `n³` coordinate grid. `MRIProbe` (in `model.py`)
 always embeds patches and applies masking in canonical raster order, then permutes into the curve
 order (`x[:, self.perm]`) before running GDN-2 blocks, and un-permutes (`argsort(perm)`) before the
@@ -57,10 +57,15 @@ sees changes.
 **Two independent diagnostics, both keyed by curve:**
 - *Geometry* (`metrics.py::geometry_metrics`, no training, no GDN-2 dependency): spatial-neighbor
   recall within sequence windows, consecutive-step 3D distance stats. Driven by `--geometry-only`.
-- *Micro-training* (`engine.py::microtrain`): a small bidirectional GDN-2 encoder (`BiGDN2Block` runs
+- *Micro-training* (`engine.py::microtrain`): a small bidirectional GDN-2 encoder (`GDN2Block` runs
   GDN-2 forward and on the time-reversed sequence, averages) does masked-patch reconstruction for a
   fixed step budget (`microtrain.steps`, default 500) — never full pretraining. Reports val MSE/MAE
   and convergence AUC (`metrics.py::auc`) per dataset and per curve.
+
+`microtrain.objective` selects `masked` (default) or `next_patch`. The latter uses
+forward-only blocks, no masking, and predicts curve-ordered patches 2..N from
+patches 1..N-1. Predictions stay in curve order; training and evaluation share the
+same shifted targets. Metrics and summaries record the objective.
 
 **Data pipeline** (`src/sfc_gdn2/data/`):
 - `manifest.py::build` — dataset-specific scanners producing a canonical CSV manifest

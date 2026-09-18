@@ -20,6 +20,7 @@ model:
   use_short_conv: true
 
 microtrain:
+  objective: masked
   steps: 500
   batch_size: 2
   lr: 0.0003
