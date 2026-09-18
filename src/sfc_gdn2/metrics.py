@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+
 from .curves import ordered_coords
 
 
@@ -35,6 +36,16 @@ def geometry_metrics(curve: str, grid: int, windows: list[int], radius: float, s
 def masked_errors(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> tuple[float,float]:
     e = (pred - target)[mask]
     return float((e*e).mean().item()), float(e.abs().mean().item())
+
+
+def copy_baseline_errors(x: torch.Tensor, perm: torch.Tensor, k: int = 1) -> tuple[float, float]:
+    """Zero-order-hold baseline for next_patch: predict patch i+k (curve order) as patch i.
+    Isolates how much of a curve's k-step MSE is explained by raw local
+    redundancy in that ordering, vs. anything the model actually learned."""
+    ordered = x[:, perm]
+    pred, target = ordered[:, :-k], ordered[:, k:]
+    e = pred - target
+    return float((e * e).mean().item()), float(e.abs().mean().item())
 
 
 def auc(history: list[dict], key: str = "val_mse") -> float:

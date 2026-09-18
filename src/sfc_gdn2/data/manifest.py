@@ -86,7 +86,43 @@ def _scan_mrrate_atlas(cfg: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-_SCANNERS = {"bids_like": _scan_bids_like, "mrrate_atlas": _scan_mrrate_atlas}
+def _scan_zip_bids(cfg: dict) -> pd.DataFrame:
+    """cohort_root/**/sub-*/ses-*.zip, each a BIDS-like tree of NIfTI members."""
+    root = Path(cfg["root"])
+    modalities = cfg.get("modalities") or []
+    rows = []
+    for archive in sorted(root.rglob("*.zip")):
+        subj_match = re.search(r"sub-([A-Za-z0-9]+)", str(archive))
+        if not subj_match:
+            continue
+        cohort = archive.relative_to(root).parts[0]
+        subject = f"{cohort}_{subj_match.group(1)}"
+        sess_match = re.search(r"ses-([A-Za-z0-9]+)", archive.stem)
+        session = sess_match.group(1) if sess_match else ""
+        with zipfile.ZipFile(archive) as zf:
+            members = [n for n in zf.namelist() if n.endswith((".nii", ".nii.gz")) and not n.endswith("/")]
+        mask_members = [m for m in members if "mask" in Path(m).name.lower()]
+        vol_members = [m for m in members if m not in mask_members]
+        for member in sorted(vol_members):
+            stem = _strip_nifti_suffix(Path(member).name)
+            if stem is None:
+                continue
+            modality = _match_modality(stem, modalities)
+            if modality is None:
+                continue
+            mask_member = next((mm for mm in mask_members if Path(mm).stem.split(".")[0].startswith(stem)), None)
+            sample_id = "_".join(filter(None, [subject, session, modality]))
+            rows.append({
+                "dataset": cfg["name"], "sample_id": sample_id, "subject": subject,
+                "session": session, "modality": modality,
+                "path": f"zip://{archive}::{member}",
+                "mask_path": f"zip://{archive}::{mask_member}" if mask_member else "",
+                "split": cfg.get("split", "train"),
+            })
+    return pd.DataFrame(rows)
+
+
+_SCANNERS = {"bids_like": _scan_bids_like, "mrrate_atlas": _scan_mrrate_atlas, "zip_bids": _scan_zip_bids}
 
 
 def build(cfg: dict) -> pd.DataFrame:

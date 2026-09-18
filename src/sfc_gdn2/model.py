@@ -38,13 +38,18 @@ class GDN2Block(nn.Module):
 
 
 class MRIProbe(nn.Module):
-    def __init__(self, patch_voxels: int, grid: int, curve: str, seed: int, cfg: dict, objective: str = "masked"):
+    def __init__(self, patch_voxels: int, grid: int, curve: str, seed: int, cfg: dict,
+                 objective: str = "masked", predict_k: int = 1):
         super().__init__()
         if objective not in {"masked", "next_patch"}:
             raise ValueError(f"Unknown objective: {objective}")
-        if objective == "next_patch" and grid < 2:
-            raise ValueError("next_patch requires at least two patches.")
+        if objective == "next_patch":
+            if predict_k < 1:
+                raise ValueError("predict_k must be >= 1.")
+            if grid**3 <= predict_k:
+                raise ValueError("next_patch requires more patches than predict_k.")
         self.objective = objective
+        self.predict_k = predict_k
         d = cfg["d_model"]
         self.grid = grid
         self.register_buffer("perm", torch.from_numpy(order(curve, grid, seed)), persistent=False)
@@ -75,7 +80,7 @@ class MRIProbe(nn.Module):
         x = x + self.coord(self.coords)[None]
         x = x[:, self.perm]
         if self.objective == "next_patch":
-            x = x[:, :-1]
+            x = x[:, :-self.predict_k]
         for block in self.blocks: x = block(x)
         pred = self.head(self.norm(x))
         if self.objective == "next_patch":

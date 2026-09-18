@@ -1,0 +1,35 @@
+seed: 17
+output_root: outputs
+curves: [hilbert]
+manifests:
+  - data/manifests/fomo300k.csv
+
+data:
+  target_shape: [128, 128, 128]
+  patch_size: 8
+  cache_dir: .cache/volumes
+  num_workers: 8
+  max_train_per_dataset: 400
+  max_val_per_dataset: 50
+
+model:
+  d_model: 256
+  depth: 4
+  head_dim: 64
+  num_heads: 4
+  dropout: 0.0
+  use_short_conv: true
+
+microtrain:
+  objective: next_patch
+  steps: 5000
+  batch_size: 8
+  lr: 0.0003
+  weight_decay: 0.05
+  mask_ratio: 0.50
+  eval_every: 250
+  amp: true
+
+geometry:
+  windows: [4, 8, 16, 32, 64, 128]
+  spatial_radius: 1.75

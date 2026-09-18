@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -12,15 +14,19 @@ import torch.nn.functional as F
 def materialize(path: str, cache_dir: str | Path) -> Path:
     if not path.startswith("zip://"):
         return Path(path)
-    archive, member = path[len("zip://"):].split("::", 1)
-    dest = Path(cache_dir) / Path(archive).stem / member
+    archive_str, member = path[len("zip://"):].split("::", 1)
+    archive = Path(archive_str)
+    # archive.parent.name disambiguates layouts where the archive stem alone repeats
+    # across subjects (e.g. every subject's `ses-01.zip`).
+    dest = Path(cache_dir) / archive.parent.name / archive.stem / member
     if not dest.exists():
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(archive) as zf, zf.open(member) as src:
-            tmp = dest.with_suffix(dest.suffix + ".part")
-            with open(tmp, "wb") as out:
-                out.write(src.read())
-            tmp.rename(dest)
+        # Unique per-call tmp name + atomic replace: safe if multiple processes/workers
+        # materialize the same member concurrently (shared cache_dir across parallel runs).
+        tmp = dest.with_name(f"{dest.name}.{os.getpid()}.{uuid.uuid4().hex}.part")
+        with zipfile.ZipFile(archive) as zf, zf.open(member) as src, open(tmp, "wb") as out:
+            out.write(src.read())
+        os.replace(tmp, dest)
     return dest
 
 
