@@ -1,0 +1,35 @@
+# conda env create -f environment.yml
+#
+# GDN-2 itself is not installed here (NVIDIA Source Code License-NC, see THIRD_PARTY.md).
+# Clone it separately and put its root on the env's path, e.g.:
+#   echo /path/to/GatedDeltaNet-2 > "$CONDA_PREFIX"/lib/python3.11/site-packages/gdn2.pth
+# so that `from lit_gpt.gdn2 import GatedDeltaNet2` resolves.
+name: sfc-gdn2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      # 2.8 (not GDN-2's pinned 2.9) so the prebuilt flash-attn wheel below matches the ABI
+      - torch==2.8.0
+      # benchmark
+      - numpy>=1.26
+      - pandas>=2.2
+      - pyyaml>=6.0
+      - nibabel>=5.2
+      - scipy>=1.12
+      - pytest>=8
+      - ruff>=0.6
+      # GatedDeltaNet-2 (NVlabs) — imported, not vendored; see THIRD_PARTY.md
+      - einops
+      - transformers
+      - sentencepiece
+      - tokenizers
+      - lightning
+      - ninja
+      - packaging
+      # 0.4.2, not HEAD: later fla drops the `use_exp2` argument GDN-2's kernels pass
+      - git+https://github.com/fla-org/flash-linear-attention@v0.4.2
+      - https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1%2Bcu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl

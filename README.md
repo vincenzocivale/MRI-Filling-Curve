@@ -34,8 +34,9 @@ The primary evidence is whether geometric locality and micro-task efficiency imp
 ## Install
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'
+conda env create -f environment.yml
+conda activate sfc-gdn2
+pip install -e . --no-deps
 ```
 
 Install the **official** Gated DeltaNet-2 implementation separately, following NVIDIA's repository instructions, so this import works:
@@ -44,7 +45,15 @@ Install the **official** Gated DeltaNet-2 implementation separately, following N
 from lit_gpt.gdn2 import GatedDeltaNet2
 ```
 
-The official implementation currently uses custom FLA/Triton kernels and its own CUDA/PyTorch requirements. Do not vendor it into this repository.
+It is not pip-installable in place, so point the env at a clone instead:
+
+```bash
+echo /path/to/GatedDeltaNet-2 > "$CONDA_PREFIX"/lib/python3.11/site-packages/gdn2.pth
+```
+
+Two version constraints are load-bearing and are pinned in `environment.yml`: `torch==2.8.0` (GDN-2 asks for 2.9, but prebuilt `flash-attn` wheels stop at 2.8 and building it from source takes hours), and `flash-linear-attention==v0.4.2` (later versions drop the `use_exp2` argument GDN-2's Triton kernels pass, which fails at the first backward pass, not at import).
+
+Do not vendor GDN-2 into this repository.
 
 ## 1. Build canonical manifests
 

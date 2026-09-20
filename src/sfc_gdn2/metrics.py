@@ -51,4 +51,5 @@ def copy_baseline_errors(x: torch.Tensor, perm: torch.Tensor, k: int = 1) -> tup
 def auc(history: list[dict], key: str = "val_mse") -> float:
     ys = np.array([r[key] for r in history if key in r], dtype=float)
     if len(ys) < 2: return float(ys[0]) if len(ys) else float("nan")
-    return float(np.trapz(ys, dx=1) / (len(ys)-1))
+    trapezoid = getattr(np, "trapezoid", None) or np.trapz  # np.trapz removed in numpy 2
+    return float(trapezoid(ys, dx=1) / (len(ys)-1))
