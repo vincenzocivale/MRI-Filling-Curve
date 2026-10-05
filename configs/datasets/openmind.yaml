@@ -1,7 +1,0 @@
-name: openmind
-kind: bids_like
-root: /raid/DATASETS/OpenMind/OpenMind
-output: data/manifests/openmind.csv
-split: train
-max_samples: 2000
-modalities: [T1w, MPRAGE, T1]

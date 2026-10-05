@@ -1,7 +1,0 @@
-name: mrrate_atlas
-kind: mrrate_atlas
-root: /path/to/MR-RATE-atlas
-output: data/manifests/mrrate_atlas.csv
-split: train
-max_samples: 2000
-modalities: []

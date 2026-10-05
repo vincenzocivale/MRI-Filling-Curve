@@ -1,0 +1,11 @@
+# Patch-level segmentation on TotalSegmentator MRI (50 classes + background, per-patch majority
+# label): logistic regression on each patch's output token, selected on val macro average
+# precision over foreground classes (threshold-free: ~90% of patches are background).
+# Probe cases are disjoint from the TotalSeg cases in the pretraining pool.
+seed: 17
+task: segmentation
+manifest: data/manifests/totalseg_mri.csv
+label: segmentation
+train_patches_per_volume: 1024   # random non-padding patches per train volume; val/test use all
+batch_size: 8
+num_workers: 16

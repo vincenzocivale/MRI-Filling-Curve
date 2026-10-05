@@ -1,132 +1,73 @@
 # MRI-Filling-Curve
 
-SFC × Gated DeltaNet-2 for 3D MRI
+Self-supervised pretraining of a causal Gated DeltaNet-2 on 3D MRI with LeJEPA, where the views of a
+region are different space-filling-curve serializations of it, evaluated with frozen linear probes.
 
-A small, controlled benchmark for one question:
+## Pretraining (`configs/pretrain_lejepa.yaml`)
 
-> Does locality-preserving 3D serialization make a measurable difference for Gated DeltaNet-2 before committing to full MRI foundation-model pretraining?
+A volume is a `16³` grid of `8³`-voxel patches (linear embedding, no position embedding). Per batch of
+B volumes:
 
-Within each training objective, the benchmark keeps data, preprocessing, architecture, masking, optimizer, and update budget fixed. Only the token ordering changes.
+1. **Groups.** N boxes of the patch grid per volume, centred on foreground patches: `groups_global`
+   spanning `global_frac` of the foreground bounding box, `groups_local` with `local_edge` patches per edge.
+2. **Views.** K per group. A view is the group box rescaled/shifted by up to `jitter` (partial
+   overlap), intensity-augmented (gamma, scale, shift, noise), with `mask_ratio` of its patches set to
+   the mask token, read along a curve drawn from `view_curves` in a random cube symmetry.
+3. **Loss.** View embedding = mean encoder output over its tokens → projector;
+   `(1-λ)·invariance(views of a group) + λ·SIGReg(per-volume-centred embeddings)`.
 
-**Curves:** `raster`, `snake`, `morton`, `hilbert`, `random`.
-
-**Datasets:**
-- `Forithmus/MR-RATE-atlas` — atlas-registered MRI, including zipped study archives. The official dataset is gated and non-commercial. 
-- `FOMO-MRI/FOMO300K` — modified-BIDS NIfTI collection. The official dataset is gated and includes constituent-specific DUAs.
-- `MIC-DKFZ/OpenMind` — modified-BIDS/OpenNeuro-style NIfTI collection.
-
-The repository does **not** redistribute datasets or NVIDIA Gated DeltaNet-2 code. External resources retain their own licenses.
-
-## What is measured
-
-1. **No-training diagnostics**
-   - spatial-neighbor recall within sequence windows;
-   - consecutive-step 3D distance;
-   - MRI sequence total variation after patch pooling.
-2. **Micro-training diagnostic**
-   - masked patch reconstruction with a small bidirectional GDN-2 encoder (default);
-   - causal next-patch prediction with the same blocks running forward only;
-   - fixed number of optimizer updates (`500` by default), not full pretraining;
-   - validation MSE/MAE and convergence AUC per dataset and curve.
-
-The primary evidence is whether geometric locality and micro-task efficiency improve consistently across independent MRI sources.
+Views differ in content as well as order: with no position embedding, serialization alone would be
+satisfied by an encoder that ignores order.
 
 ## Install
 
 ```bash
-conda env create -f environment.yml
-conda activate sfc-gdn2
+conda env create -f environment.yml && conda activate sfc-gdn2
 pip install -e . --no-deps
 ```
 
-Install the **official** Gated DeltaNet-2 implementation separately, following NVIDIA's repository instructions, so this import works:
-
-```python
-from lit_gpt.gdn2 import GatedDeltaNet2
-```
-
-It is not pip-installable in place, so point the env at a clone instead:
+The official [NVlabs/GatedDeltaNet-2](https://github.com/NVlabs/GatedDeltaNet-2) is required and not
+vendored (NVIDIA Source Code License-NC); put a clone on the env's path so
+`from lit_gpt.gdn2 import GatedDeltaNet2` resolves:
 
 ```bash
 echo /path/to/GatedDeltaNet-2 > "$CONDA_PREFIX"/lib/python3.11/site-packages/gdn2.pth
 ```
 
-Two version constraints are load-bearing and are pinned in `environment.yml`: `torch==2.8.0` (GDN-2 asks for 2.9, but prebuilt `flash-attn` wheels stop at 2.8 and building it from source takes hours), and `flash-linear-attention==v0.4.2` (later versions drop the `use_exp2` argument GDN-2's Triton kernels pass, which fails at the first backward pass, not at import).
+`torch==2.8.0` and `flash-linear-attention==v0.4.2` are pinned in `environment.yml` on purpose
+(prebuilt flash-attn wheels; later FLA drops the `use_exp2` argument GDN-2 passes).
 
-Do not vendor GDN-2 into this repository.
-
-## 1. Build canonical manifests
-
-Point each dataset config at an already-downloaded local root.
+## Usage
 
 ```bash
-python scripts/prepare.py configs/datasets/mrrate_atlas.yaml
-python scripts/prepare.py configs/datasets/fomo300k.yaml
-python scripts/prepare.py configs/datasets/openmind.yaml
+sfc prepare  configs/datasets/fomo300k.yaml          # scan a local dataset root -> manifest CSV
+sfc split    configs/splits/fomo300k_sex.yaml        # exact subject counts: pretrain/train/val/test
+sfc split    configs/splits/totalseg_mri.yaml        # TotalSegmentator MRI: pretrain + seg probe splits
+sfc pretrain configs/pretrain_lejepa.yaml            # -> <output_root>/lejepa-<hash>/
+sfc probe    configs/probe_{sex,age,totalseg}.yaml --run-dir <run> [...] [--raw configs/pretrain_lejepa.yaml]
+sfc summarize <output_root>                           # -> probe_summary.csv
 ```
 
-Outputs are CSV manifests with the same schema:
+Pretraining uses every `pretrain` row of `data.manifests` (FOMO300K brain T1w + TotalSegmentator MRI)
+and saves `encoder_step*.pt` every `save_every` steps, starting with step 0 (the run's own init).
 
-```text
-dataset,sample_id,subject,session,modality,path,mask_path,split
-```
+| probe | task | features | head | selected on |
+|---|---|---|---|---|
+| `probe_totalseg.yaml` | per-patch majority class, 50 classes + background | patch token: `token` (causal) / `bi` (++ backward pass) | logistic | val macro AP (fg) |
+| `probe_age.yaml` | age − cohort train mean, IXI/NKI/OASIS1 | pooled tokens (`mean`, `late`, `last`, `fg_mean`, `fg_meanstd`) | ridge | 5-fold CV R² |
+| `probe_sex.yaml` | sex (sanity check: trivial cues give AUC ~0.81) | pooled tokens | logistic | 5-fold CV AUC |
 
-MR-RATE archives can remain zipped; members are represented as `zip://...::...nii.gz` and extracted lazily into a local cache.
+Each probe reports, per inference curve in the run's `view_curves`, the pretrained encoder (best
+checkpoint × features × L2) and its step-0 `init`, scores test once with a volume-bootstrap 95% CI and
+saves `test_preds.pt` for paired comparisons. Segmentation also reports `@token`/`@bi` separately and
+`chance_ap`. `--raw` adds encoder-free baselines (patch intensities; for segmentation also `position`,
+random Fourier features of patch coordinates). A probe refuses to run if a probe subject was seen in
+pretraining.
 
-## 2. Run the controlled benchmark
+Preprocessing (canonical reorientation, foreground 1–99th percentile, aspect-preserving isotropic
+resample with the longest side spanning `target_shape`, zero-padded to the cube) runs once per scan and is cached as a float16 `.npy` cube under `cache_dir/cubes/`;
+later epochs memory-map it.
 
-Edit `configs/benchmark.yaml` with the manifest(s) for one benchmark cohort, then:
+**FOMO300K is a superset of OpenMind:** never pool them as independent cohorts.
 
-```bash
-python scripts/run.py configs/benchmark.yaml
-```
-
-Set `microtrain.objective: next_patch` in the same config to run the causal spatial
-prediction probe across all five curves. The default is `masked` when omitted.
-The causal model consumes the first N-1 patches in curve order and predicts patches
-2 through N with MSE, without masking or a reverse pass (`mask_ratio` is ignored).
-Both objectives report MSE/MAE and validation MSE AUC; `summary.csv` groups results
-by objective, including older runs as `masked`.
-
-Compare curves within each objective: the targets and available context differ
-between objectives. Next-patch prediction probes how serialization turns spatial
-continuity into sequential predictability; lower error can reflect local MRI
-smoothness and does not establish better downstream representations.
-
-**Do not treat FOMO300K and OpenMind as independent pooled cohorts:** FOMO300K is a superset of OpenMind. Run them separately (or explicitly de-duplicate them) and report per-source results.
-
-For a fast geometry-only check:
-
-```bash
-python scripts/run.py configs/benchmark.yaml --geometry-only
-```
-
-## 3. Aggregate
-
-```bash
-python scripts/summarize.py outputs
-```
-
-Each run is self-contained:
-
-```text
-outputs/<run_id>/
-  config.yaml
-  environment.json
-  geometry.csv
-  history.csv
-  metrics.json
-  per_dataset.csv
-  checkpoint.pt
-```
-
-## Fairness rules
-
-- same manifest rows and split for every curve;
-- for masked reconstruction, same random mask in **3D patch coordinates**, then reordered by the selected curve;
-- same initialization seed, optimizer and number of updates;
-- same 3D coordinate encoding;
-- within each objective, curve-specific ordering is the only experimental variable;
-- report each dataset separately before pooled metrics.
-
-`random` is a negative control. `snake` is necessary to distinguish simple removal of raster discontinuities from multiscale locality preservation.
+No dataset or GDN-2 code is redistributed here (`THIRD_PARTY.md`).

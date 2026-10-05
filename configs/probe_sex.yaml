@@ -1,0 +1,11 @@
+# Frozen linear probe: `sfc probe configs/probe_sex.yaml --run-dir <run> [...] [--raw configs/pretrain_lejepa.yaml]`.
+# Selection (checkpoint x pooling x L2) on val only; test once, with a bootstrap 95% CI.
+# Preprocessing (target_shape, patch_size, cache) comes from the run's own config.
+# Sex is near-saturated by trivial cues (raw intensities ~0.81 AUC): a sanity check, not a ranking.
+seed: 17
+task: classification
+manifest: data/manifests/fomo300k_sex.csv
+label: sex
+batch_size: 8
+num_workers: 8
+cv_folds: 5                   # subject-grouped CV on train+val for selection (val alone is ~56-100 volumes)

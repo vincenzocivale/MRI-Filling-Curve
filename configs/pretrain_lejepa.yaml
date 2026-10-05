@@ -1,0 +1,54 @@
+# LeJEPA over groups of patches: `sfc pretrain configs/pretrain_lejepa.yaml`.
+# Per volume, groups (boxes of the patch grid); per group, views = jittered box + intensity
+# augmentation + masking, read along a random curve of `view_curves`. No held-out set:
+# checkpoints (save_every) are selected on the probe's val split.
+seed: 17
+output_root: /raid/DATASETS/MRI-US/biomed-fm-results/sfc_pretrain_v5
+
+data:
+  manifests:                  # pretraining pool = union of each manifest's `pretrain` split
+    - data/manifests/fomo300k_sex.csv     # 4366 brain T1w (every scan of every non-probe subject)
+    - data/manifests/totalseg_mri.csv     # 896 body MRI
+  splits: [pretrain]          # probe splits (train/val/test) stay disjoint by subject
+  target_shape: [128, 128, 128]  # isotropic, longest side 128, zero-padded (aspect preserved)
+  patch_size: 8               # grid 16 -> 4096 tokens
+  cache_dir: /raid/DATASETS/MRI-US/biomed-fm-results/.cache_volumes
+  num_workers: 8
+
+model:
+  d_model: 256
+  depth: 4
+  head_dim: 64
+  num_heads: 4
+  use_short_conv: true
+  grad_checkpoint: false
+
+objective:
+  view_curves: [raster, morton, hilbert]  # each view: one of these curves, in a random cube symmetry
+  groups_global: 2            # per volume: boxes spanning global_frac of the foreground bounding box
+  groups_local: 6             # per volume: boxes with edges log-uniform in local_edge patches
+  views: 2                    # K views per group
+  global_frac: [0.3, 1.0]     # volume fraction of the foreground bounding box
+  local_edge: [3, 8]          # patches per edge (27-512 tokens)
+  jitter: 0.25                # view box = group box rescaled/shifted by up to this fraction of its edge
+  mask_ratio: [0.1, 0.3]      # fraction of a view's patches replaced by the mask token
+  gamma: 0.3                  # intensity: x^exp(U(-g,g)) * U(1-scale,1+scale) + U(-shift,shift) + N(0, U(0,noise))
+  scale: 0.1
+  shift: 0.05
+  noise: 0.02
+  fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
+  proj_hidden: 1024
+  proj_dim: 128
+  lam: 0.05                   # loss = (1-lam)*invariance + lam*SIGReg
+  sigreg_slices: 256
+  sigreg_knots: 17
+
+train:
+  steps: 15000                # per GPU batch_size; effective batch = GPUs x batch_size
+  batch_size: 6                # per GPU; 5 GPUs -> effective 30 (B=8 peaks at 19.5GB, too much on shared cards)
+  lr: 0.0005
+  weight_decay: 0.05          # matrices only (see pretrain.param_groups)
+  grad_clip: 1.0              # rare single-token gradient spikes (50-1500x median) otherwise; skip non-finite steps
+  warmup_steps: 1000
+  log_every: 250
+  save_every: 2500

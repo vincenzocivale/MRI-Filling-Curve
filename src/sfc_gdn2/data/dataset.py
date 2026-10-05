@@ -1,51 +1,49 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset
+import torch
+from torch.utils.data import DataLoader, Dataset
 
-from .volume import load_volume, patchify
-
-
-def load_manifests(paths: list[str]) -> pd.DataFrame:
-    frames = [pd.read_csv(p) for p in paths]
-    return pd.concat(frames, ignore_index=True)
+from .volume import VolumeStore, patchify
 
 
-def balanced_split(df: pd.DataFrame, seed: int, max_train_per_dataset: int, max_val_per_dataset: int):
-    rng = np.random.default_rng(seed)
-    train_frames, val_frames = [], []
-    for _, group in df.groupby("dataset", sort=True):
-        subjects = sorted(group["subject"].astype(str).unique())
-        perm = rng.permutation(len(subjects))
-        subjects = [subjects[i] for i in perm]
-        n_val_subj = max(1, round(0.2 * len(subjects))) if len(subjects) > 1 else 0
-        val_subjects = set(subjects[:n_val_subj])
-        train_subjects = set(subjects) - val_subjects
-        g_train = group[group["subject"].astype(str).isin(train_subjects)].iloc[:max_train_per_dataset]
-        g_val = group[group["subject"].astype(str).isin(val_subjects)].iloc[:max_val_per_dataset]
-        if g_val.empty and len(g_train) > 1:
-            g_val = g_train.tail(1)
-            g_train = g_train.iloc[:-1]
-        train_frames.append(g_train)
-        val_frames.append(g_val)
-    tr = pd.concat(train_frames, ignore_index=True) if train_frames else df.iloc[0:0]
-    va = pd.concat(val_frames, ignore_index=True) if val_frames else df.iloc[0:0]
-    return tr, va
+def cohort_key(df: pd.DataFrame) -> pd.Series:
+    """Per-source grouping key: `cohort` when the scanner emitted one, else `dataset`."""
+    return df["cohort"] if "cohort" in df.columns else df["dataset"]
 
 
-class MRIPatchDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, target_shape, patch_size: int, cache_dir: str):
-        self.rows = df.reset_index(drop=True)
-        self.target_shape = tuple(target_shape)
-        self.patch_size = patch_size
-        self.cache_dir = cache_dir
+class PatchDataset(Dataset):
+    """Scans as [N, patch^3] float16 patch tensors in canonical raster order, with the row index
+    (callers look up per-row labels themselves) and, optionally, `target(row)` computed in the
+    worker (e.g. per-patch segmentation labels)."""
+
+    def __init__(self, rows: pd.DataFrame, store: VolumeStore, patch: int,
+                 target: Callable[[pd.Series], torch.Tensor] | None = None):
+        self.rows = rows.reset_index(drop=True)
+        self.paths = self.rows["path"].tolist()
+        self.store, self.patch, self.target = store, patch, target
 
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, idx: int) -> dict:
-        row = self.rows.iloc[idx]
-        vol = load_volume(row["path"], self.target_shape, self.cache_dir)
-        patches = patchify(vol, self.patch_size)
-        return {"patches": patches, "dataset": row["dataset"], "sample_id": row["sample_id"]}
+    def __getitem__(self, i: int) -> dict:
+        vol = torch.from_numpy(np.array(self.store.load(self.paths[i]), dtype=np.float16))
+        item = {"patches": patchify(vol, self.patch), "index": i}
+        if self.target is not None:
+            item["target"] = self.target(self.rows.iloc[i])
+        return item
+
+
+def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: int = 0,
+           **ds_kwargs) -> DataLoader:
+    """Shuffled (seeded) and worker-persistent for training, ordered for evaluation."""
+    ds = PatchDataset(rows, VolumeStore(data["cache_dir"], data["target_shape"]), data["patch_size"],
+                      **ds_kwargs)
+    workers = int(data.get("num_workers", 8))
+    return DataLoader(ds, batch_size=batch_size, shuffle=train, drop_last=train, num_workers=workers,
+                      pin_memory=True, persistent_workers=train and workers > 0,
+                      prefetch_factor=4 if workers else None,
+                      generator=torch.Generator().manual_seed(seed))

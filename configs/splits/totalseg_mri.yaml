@@ -1,0 +1,9 @@
+# TotalSegmentator MRI v3, one case = one subject. Probe splits for patch-level segmentation;
+# every remaining case joins the pretraining pool (next to FOMO300K's pretrain split).
+kind: totalseg
+name: totalseg_mri
+root: /raid/DATASETS/Totalsegmentator_dataset_v300/MRI
+output: data/manifests/totalseg_mri.csv
+seed: 17
+labels: [segmentation]
+counts: {pretrain: 896, train: 200, val: 50, test: 150}
