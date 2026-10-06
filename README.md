@@ -54,8 +54,8 @@ and saves `encoder_step*.pt` every `save_every` steps, starting with step 0 (the
 | probe | task | features | head | selected on |
 |---|---|---|---|---|
 | `probe_totalseg.yaml` | per-patch majority class, 50 classes + background | patch token: `token` (causal) / `bi` (++ backward pass) | logistic | val macro AP (fg) |
-| `probe_age.yaml` | age − cohort train mean, IXI/NKI/OASIS1 | pooled tokens (`mean`, `late`, `last`, `fg_mean`, `fg_meanstd`) | ridge | 5-fold CV R² |
-| `probe_sex.yaml` | sex (sanity check: trivial cues give AUC ~0.81) | pooled tokens | logistic | 5-fold CV AUC |
+| `probe_age.yaml` | age − cohort train mean, IXI/NKI/OASIS1 | last causal state (`last`) | ridge | 5-fold CV R² |
+| `probe_sex.yaml` | sex (sanity check: trivial cues give AUC ~0.81) | last causal state (`last`) | logistic | 5-fold CV AUC |
 
 Each probe reports, per inference curve in the run's `view_curves`, the pretrained encoder (best
 checkpoint × features × L2) and its step-0 `init`, scores test once with a volume-bootstrap 95% CI and

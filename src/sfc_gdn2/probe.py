@@ -32,7 +32,6 @@ from .io import RunDir, seed_all
 from .model import Encoder
 
 L2_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
-FG_THRESHOLD = 0.05  # foreground patch = mean intensity above this (as in LeJEPA's anchor sampling)
 # patches [B,N,V] -> {name: [B,F] (volume level) or [B,N,F] (patch level)}
 Extractor = Callable[[torch.Tensor], dict[str, torch.Tensor]]
 
@@ -223,8 +222,7 @@ def make_task(cfg: dict, data_cfg: dict) -> Task:
 
 # ------------------------------------------------------------------------------------- extractors
 def encoder_extractor(encoder: Encoder, perm: torch.Tensor, level: str) -> Extractor:
-    """volume: mean (all tokens), late (second half), last (final causal state), fg_mean / fg_meanstd
-    (mean, and mean ++ std, over foreground tokens only: background is 60-75% of the sequence).
+    """volume: `last`, the final causal state (the summary the global objective trains).
     patch: each patch's own output token (`token`, causal: it has seen only what precedes it), and
     `bi` = token ++ the token of the same curve traversed backwards, both in canonical order."""
     rank, rev = perm.argsort(), perm.flip(0)
@@ -237,12 +235,7 @@ def encoder_extractor(encoder: Encoder, perm: torch.Tensor, level: str) -> Extra
         if level == "patch":
             fwd = h[:, rank]
             return {"token": fwd, "bi": torch.cat([fwd, hb[:, rank_rev]], -1)}
-        w = (x.mean(-1) > FG_THRESHOLD)[:, perm].float()[..., None]
-        n = w.sum(1).clamp_min(1)
-        m = (h * w).sum(1) / n
-        sd = (((h - m[:, None]).square() * w).sum(1) / n).sqrt()
-        return {"mean": h.mean(1), "late": h[:, h.shape[1] // 2:].mean(1), "last": h[:, -1],
-                "fg_mean": m, "fg_meanstd": torch.cat([m, sd], -1)}
+        return {"last": h[:, -1]}
     return extract
 
 

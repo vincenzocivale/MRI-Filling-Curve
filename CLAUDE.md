@@ -5,8 +5,10 @@ Guidance for Claude Code in this repository. User-facing docs: `README.md`.
 ## What this is
 
 LeJEPA pretraining of a **causal** Gated DeltaNet-2 on 3D MRI: per volume, groups (boxes of the patch
-grid); per group, K views that differ in serialization (space-filling curve × cube symmetry), box
-jitter, intensity and masking; invariance across a group's views + SIGReg. Frozen linear probes
+grid); per group, two views that differ in serialization (space-filling curve × cube symmetry), box
+jitter and intensity; view A is masked. Global term: last forward state, invariance + SIGReg. Token
+term: bi tokens of A's masked patches and B's same patches pulled together (symmetric, no stop-grad:
+a stop-grad target without EMA drifted) + SIGReg on 64 token embeddings per volume (~1000 samples, LeJEPA's calibrated range). Frozen linear probes
 (TotalSeg segmentation, brain age, sex) per inference curve.
 
 ## Environment
@@ -24,7 +26,7 @@ Up to 4 GPUs at a time; pick ones with free memory (`nvidia-smi`), set `CUDA_VIS
 
 - `curves.py`: curve orders; `CurveViews(name, n)`: `perms`/`ranks` of the 48 cube-symmetry views (view 0 = identity).
 - `model.py`: `Encoder` (linear patch embed, mask token, causal GDN-2 stack, no coordinate embedding).
-- `lejepa.py`: `SIGReg`, `Projector`, `per_volume_centred`, `LeJEPA` (`boxes` → `jittered` → `serialize` → `embed`).
+- `lejepa.py`: `SIGReg`, `Projector`, `LeJEPA` (`boxes` → `jittered` → `serialize` → `read` (fwd + reversed pass) → glob/tok heads).
 - `pretrain.py`: `Pretrainer` (bf16, fused AdamW, decay on matrices only, warmup+cosine, grad clip,
   non-finite steps skipped, `encoder_step*.pt` incl. step 0).
 - `probe.py`: tasks, `LinearProbe` (val or subject-grouped CV selection, one test pass, bootstrap CI),
@@ -37,7 +39,10 @@ Up to 4 GPUs at a time; pick ones with free memory (`nvidia-smi`), set `CUDA_VIS
 - Model selection only on probe val / train+val CV, never on test.
 - `grad_clip: 1.0`: GDN-2 gives rare single-token gradient spikes (near-zero recurrent outputs × output RMSNorm); unclipped, one NaN'd a run.
 - Weight decay on matrices only (GDN-2 `A_log`/`dt_bias` are `_no_weight_decay`).
-- Projector BatchNorm without running stats; per-volume centring before SIGReg (needs ≥4 groups per volume).
+- Projector BatchNorm without running stats.
+- A global-only objective makes token features a per-volume code (v5: 51% of token variance between
+  volumes, dense probes decaying; SIGReg on centred or raw projector outputs did not stop it, the
+  projector absorbs it). The token term is what targets dense quality (DINOv2/iBOT pattern).
 - No coordinate embedding: the serialization is the only spatial signal (an embedding once gave every anchor one volume code).
 - Views must differ in content, not only order (bag-of-patches shortcut). Never ask two causal traversals to agree at a position: their states summarise different parts of the volume (tried: invariance stuck at correlation ~0.07).
 - Report probes next to `init`, `raw`, `position`, `chance_ap`; sex alone cannot rank encoders.

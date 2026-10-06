@@ -29,6 +29,18 @@ def test_encoder_is_causal_in_curve_order():
     assert not torch.allclose(a[:, 300:], b[:, 300:], atol=1e-4)
 
 
+def test_packed_sequences_do_not_mix():
+    """cu_seqlens packing (used for the views) must equal running each sequence on its own."""
+    torch.manual_seed(0)
+    enc, lens = encoder(), [300, 37, 129]
+    xs = [torch.randn(1, n, 64, device=DEV) for n in lens]
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0)], device=DEV, dtype=torch.int32)
+    with torch.no_grad():
+        packed = enc.run(torch.cat(xs, 1), cu)
+        alone = torch.cat([enc.run(x) for x in xs], 1)
+    assert torch.allclose(packed, alone, atol=1e-3)
+
+
 def test_masked_patch_content_is_invisible():
     torch.manual_seed(0)
     enc, perm = encoder().eval(), CurveViews("raster", 8).perms[0].to(DEV)

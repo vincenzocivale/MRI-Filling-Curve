@@ -1,6 +1,6 @@
 import torch
 
-from sfc_gdn2.lejepa import LeJEPA, Projector, SIGReg, per_volume_centred
+from sfc_gdn2.lejepa import LeJEPA, Projector, SIGReg
 
 
 def g(seed=0):
@@ -13,15 +13,6 @@ def test_sigreg_separates_gaussian_from_collapse():
     assert sig(gauss, g(1)) < 2.0
     assert sig(torch.zeros(2, 2048, 32), g(1)) > 100 * sig(gauss, g(1))
     assert sig(3 * gauss, g(1)) > 100 * sig(gauss, g(1))
-
-
-def test_per_volume_centring_kills_the_global_code_shortcut():
-    """One code per volume, shared by all its anchors: Gaussian across volumes, so raw SIGReg is
-    fooled; after per-volume centring it is all zero and SIGReg is maximal."""
-    sig, b, k, d = SIGReg(), 256, 16, 32
-    z = torch.randn(b, 1, d, generator=g()).expand(b, k, d).flatten(0, 1).expand(2, -1, -1)
-    vol = torch.arange(b).repeat_interleave(k)
-    assert sig(per_volume_centred(z, vol, b), g(1)) > 50 * sig(z, g(1))
 
 
 def test_projector_is_the_same_function_in_train_and_eval():
@@ -52,3 +43,19 @@ def test_groups_views_and_serialization():
         seq = idx[i][valid[i]]
         assert len(seq) == e[i].prod() and ((xyz[seq] >= c[i]) & (xyz[seq] < c[i] + e[i])).all()
         assert ((m.ranks[:, seq].diff(dim=1) > 0).all(1)).any()     # the order of some curve view
+
+
+def test_token_targets_are_the_same_patch_in_the_other_view():
+    """Identity encoder (token = patch content, no mixing): A's masked patches must be matched to
+    the same patches in B, through jitter, different curves and the backward pass -> zero loss."""
+    class Enc(torch.nn.Module):
+        dim, grid = 4, 16
+        tokens = staticmethod(lambda v, mask: v)
+        run = staticmethod(lambda x, cu_seqlens: x)
+        norm = staticmethod(lambda x: x)
+    m = LeJEPA(Enc(), ["raster", "hilbert"], gamma=0, scale=0, shift=0, noise=0, proj_hidden=8, proj_dim=4,
+               mask_ratio=(0.5, 0.5))
+    m.tok = torch.nn.Identity()
+    patches = torch.rand(3, 4096, 4, generator=g()) * 0.5 + 0.2
+    out = m(patches, g())
+    assert out["inv_token"] == 0 and torch.isfinite(out["loss"])

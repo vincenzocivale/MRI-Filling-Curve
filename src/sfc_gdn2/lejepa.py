@@ -1,15 +1,21 @@
-"""LeJEPA over groups of patches seen through different serializations.
+"""LeJEPA over groups of patches seen through different serializations, with a global and a
+per-token term (the DINOv2 pattern: a global loss alone lets token features drift into a per-volume
+code and dense quality decay).
 
-Per volume, N contiguous boxes of the patch grid ("groups": a few global, most local). Each group
-yields K views; a view is its box jittered (partial overlap), its voxels intensity-augmented, a
-fraction of its patches replaced by the mask token, and the rest read in the order of a curve
-drawn at random from `view_curves` (any of its 48 cube symmetries). The view embedding is the mean
-encoder output over its tokens, then a projector:
+Per volume, boxes of the patch grid ("groups": a few global, most local). Each group yields two
+views read along different curves (random curve of `view_curves` x cube symmetry), each with its own
+box jitter and intensity augmentation; view A also has `mask_ratio` of its patches replaced by the
+mask token. Each view is read forwards and backwards by the same causal encoder.
 
-    loss = (1 - lam) * invariance(views of a group) + lam * SIGReg(per-volume-centred embeddings)
-
-Views must differ in content, not only in order: with no position embedding, an encoder that
-ignores order (a bag of patches) would be invariant to serialization alone for free.
+- global: the last forward state (a summary of the whole box) -> `glob` head; invariance between
+  A and B + SIGReg (per view, over the batch).
+- token: for every masked patch of A that B also contains, the `bi` token (forward ++ backward
+  output at that patch, as in the segmentation probe) of A and of B -> `tok` head, pulled together
+  (symmetric, no stop-grad, as LeJEPA's invariance);
+  SIGReg on B's token embeddings: `tokens_per_volume` per volume, so the sample count stays in
+  LeJEPA's calibrated range (scaled by ~20k tokens it gave per-patch noise; by #volumes it let a
+  per-volume code through).
+loss = (1 - lam) * (inv_global + inv_token) / 2 + lam * (sig_global + sig_token) / 2
 """
 from __future__ import annotations
 
@@ -37,7 +43,8 @@ class SIGReg(nn.Module):
         self.register_buffer("w", w * phi, persistent=False)
 
     def forward(self, z: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-        """z: [..., M, D] -> scalar (mean over leading dims and slices)."""
+        """z: [..., M, D] -> scalar (mean over leading dims and slices). Scaled by M like a test
+        statistic: lam=0.05 assumes M in LeJEPA's range (~hundreds to ~1000 samples)."""
         with torch.autocast(z.device.type, enabled=False):  # cos/sin of bf16 projections is too coarse
             z = z.float()
             a = torch.randn(z.shape[-1], self.slices, device=z.device, generator=generator)
@@ -59,23 +66,20 @@ class Projector(nn.Sequential):
                          nn.Linear(hidden, hidden), bn(), nn.GELU(), nn.Linear(hidden, d_out))
 
 
-def per_volume_centred(z: torch.Tensor, vol: torch.Tensor, n_vol: int) -> torch.Tensor:
-    """z [K, M, D], vol [M] -> z minus the mean of its volume's samples over all K views."""
-    per_vol = torch.zeros(n_vol, z.shape[-1], device=z.device, dtype=z.dtype).index_add_(0, vol, z.sum(0))
-    return z - (per_vol / (z.shape[0] * torch.bincount(vol, minlength=n_vol).clamp_min(1))[:, None])[vol]
-
-
 class LeJEPA(nn.Module):
     def __init__(self, encoder: Encoder, view_curves: list[str], seed: int = 17, groups_global: int = 2,
-                 groups_local: int = 6, views: int = 2, global_frac: tuple = (0.3, 1.0), local_edge: tuple = (3, 8),
-                 jitter: float = 0.25, mask_ratio: tuple = (0.1, 0.3), gamma: float = 0.3, scale: float = 0.1,
+                 groups_local: int = 6, global_frac: tuple = (0.3, 1.0), local_edge: tuple = (3, 8),
+                 jitter: float = 0.25, mask_ratio: tuple = (0.2, 0.5), gamma: float = 0.3, scale: float = 0.1,
                  shift: float = 0.05, noise: float = 0.02, fg_threshold: float = 0.05, proj_hidden: int = 1024,
-                 proj_dim: int = 128, lam: float = 0.05, sigreg_slices: int = 256, sigreg_knots: int = 17):
+                 proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
+                 sigreg_knots: int = 17):
         super().__init__()
-        self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, views, lam
+        self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
+        self.tokens_per_volume = tokens_per_volume
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
-        self.projector = Projector(encoder.dim, proj_hidden, proj_dim)
+        self.glob = Projector(encoder.dim, proj_hidden, proj_dim)
+        self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
         g = encoder.grid
         ranks = torch.cat([CurveViews(c, g, seed).ranks for c in view_curves])   # every curve x symmetry
@@ -120,38 +124,80 @@ class LeJEPA(nn.Module):
         rank = self.ranks[torch.randint(len(self.ranks), (len(corner),), device=corner.device, generator=gen)]
         order = torch.where(inside, rank, rank.shape[1] + rank).argsort(1)
         n = inside.sum(1)
-        # pad to a power of two: GDN-2's Triton kernels re-tune (up to ~20 s) for every new length
-        order = order[:, : min(1 << (int(n.max()) - 1).bit_length(), order.shape[1])]
+        order = order[:, : int(n.max())]
         return order, torch.arange(order.shape[1], device=order.device) < n[:, None]
 
-    def embed(self, patches, vol, corner, edge, gen):
-        """One batch of views (vol [V] = source volume) -> projected embeddings [V,D]."""
+    def read(self, patches, vol, corner, edge, masked, gen):
+        """Views [V] -> canonical indices, valid, mask [V,L], last forward state [V,d], bi tokens [V,L,2d].
+        Masking applies only to views with `masked`; the backward pass reads each view's valid
+        tokens in reverse (padding stays at the end, zero in the outputs)."""
         idx, valid = self.serialize(corner, edge, gen)
+        n = valid.sum(1)
         v = patches[vol[:, None], idx]                                                     # [V,L,P]
         u = lambda lo, hi: self._u((len(v), 1, 1), lo, hi, gen)
         v = v.clamp_min(0) ** u(-self.gamma, self.gamma).exp() * u(1 - self.scale, 1 + self.scale)
         v = (v + u(-self.shift, self.shift) + torch.randn(v.shape, device=v.device, generator=gen)
              * u(0, self.noise)).clamp(0, 1)
-        mask = valid & (torch.rand(valid.shape, device=v.device, generator=gen) < u(*self.mask_ratio)[..., 0])
-        h = self.encoder.norm(self.encoder.run(self.encoder.tokens(v, mask)))
-        w = valid[..., None].to(h.dtype)
-        return self.projector((h * w).sum(1) / w.sum(1))
+        mask = masked[:, None] & valid & (torch.rand(valid.shape, device=v.device, generator=gen)
+                                          < u(*self.mask_ratio)[..., 0])
+        t = self.encoder.tokens(v, mask)
+        j = torch.arange(idx.shape[1], device=idx.device)
+        rev = torch.where(j < n[:, None], (n[:, None] - 1 - j).clamp_min(0), j)            # an involution
+        x, keep = torch.cat([t, t.gather(1, rev[..., None].expand_as(t))]), torch.cat([valid, valid])
+        # the encoder sees only valid tokens, packed (views differ ~10x in length: padding was ~3x the work).
+        # FLA's short conv re-tunes (~20 s) for every new ceil(T/1024): a dummy last sequence rounds T
+        # up to 8 lengths per octave (<= 12.5% extra)
+        x, total = x[keep], int(keep.sum())
+        pad = -total % (1 << max(total.bit_length() - 3, 10))
+        cu = nn.functional.pad(keep.sum(1).cumsum(0), (1, 0))
+        cu = torch.cat([cu, cu[-1:] + pad] if pad else [cu]).int()
+        out = self.encoder.norm(self.encoder.run(nn.functional.pad(x, (0, 0, 0, pad))[None], cu)[0, :total])
+        h = out.new_zeros(*keep.shape, out.shape[-1]).index_put((keep,), out)
+        fwd, bwd = h[: len(t)], h[len(t):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))
+        return idx, valid, mask, fwd[torch.arange(len(t)), n - 1], torch.cat([fwd, bwd], -1)
 
     def forward(self, patches: torch.Tensor, generator: torch.Generator) -> dict[str, torch.Tensor]:
-        b, k = len(patches), self.k
-        corner, edge = self.jittered(*self.boxes(patches.mean(-1) > self.fg_threshold, generator), generator)
-        vol = torch.arange(b, device=patches.device)[:, None, None].expand(-1, corner.shape[1], k)
-        z, lens = [], []
+        b, n_patch, gen = len(patches), patches.shape[1], generator
+        corner, edge = self.jittered(*self.boxes(patches.mean(-1) > self.fg_threshold, gen), gen)   # [B,G,2,3]
+        vol = torch.arange(b, device=patches.device)[:, None, None].expand(-1, corner.shape[1], 2)
+        zg, pred, tgt, ztok, tvol, lens = [], [], [], [], [], []
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
-            c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))
-            z.append(self.embed(patches, v, c, e, generator).float().view(b, -1, k, self.projector[-1].out_features))
+            c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
+            masked = torch.arange(len(c), device=c.device) % 2 == 0
+            idx, valid, mask, last, bi = self.read(patches, v, c, e, masked, gen)
+            zg.append(self.glob(last).float().view(b, -1, 2, self.glob[-1].out_features))
+            a, bb = masked.nonzero()[:, 0], (~masked).nonzero()[:, 0]
+            safe = torch.where(valid, idx, n_patch)                                        # padding -> dump column
+            pos_b = torch.full((len(bb), n_patch + 1), -1, device=c.device)
+            pos_b.scatter_(1, safe[bb], torch.arange(idx.shape[1], device=c.device).expand(len(bb), -1))
+            pos_b[:, -1] = -1
+            j_b = pos_b.gather(1, safe[a])                                                 # A's patch -> its position in B
+            pair = mask[a] & (j_b >= 0)
+            z_b = self.tok(bi[bb][valid[bb]]).float()                                      # B's valid tokens, flat
+            flat = valid[bb].flatten().long().cumsum(0).view_as(valid[bb]) - 1             # (row, pos) -> flat index
+            pred.append(self.tok(bi[a][pair]).float())
+            tgt.append(z_b[flat.gather(1, j_b.clamp_min(0))[pair]])
+            ztok.append(z_b)
+            tvol.append(v[bb][:, None].expand_as(valid[bb])[valid[bb]])
             lens.append(e.prod(-1).float().mean())
-        z = torch.cat(z, 1)                                                                # [B,G,K,D]
-        inv = (z - z.mean(2, keepdim=True)).square().mean()
-        zk = z.permute(2, 0, 1, 3).reshape(k, -1, z.shape[-1])                             # [K, B*G, D]
-        zc = per_volume_centred(zk, torch.arange(b, device=z.device).repeat_interleave(z.shape[1]), b)
+        zg = torch.cat(zg, 1)                                                              # [B,G,2,D]
+        inv_g = (zg - zg.mean(2, keepdim=True)).square().mean()
+        # symmetric, as LeJEPA: both tokens pulled to their mean, no stop-grad (with a stop-grad target and
+        # no EMA teacher the target drifted and inv_token grew 0.19 -> 2.7); SIGReg prevents collapse
+        inv_t = (torch.cat(pred) - torch.cat(tgt)).square().mean() / 4                     # = mean ||z - mean||^2
+        ztok, tvol = torch.cat(ztok), torch.cat(tvol)
+        # equal tokens per volume (with replacement: fixed shape for the cross-GPU gather)
+        keep = torch.cat([(i := (tvol == v).nonzero()[:, 0])[torch.randint(len(i), (self.tokens_per_volume,),
+                          device=i.device, generator=gen)] for v in range(b)])
+        sg_in, st_in = zg.permute(2, 0, 1, 3).reshape(2, -1, zg.shape[-1]), ztok[keep][None]
         if torch.distributed.is_initialized():  # SIGReg sees every rank's samples (differentiable gather)
-            zc = torch.cat(torch.distributed.nn.functional.all_gather(zc), 1)
-        sig = self.sigreg(zc, generator)
-        return {"loss": (1 - self.lam) * inv + self.lam * sig, "inv": inv, "sigreg": sig,
-                "len_global": lens[0], "len_local": lens[1]}
+            sg_in, st_in = (torch.cat(torch.distributed.nn.functional.all_gather(x), 1) for x in (sg_in, st_in))
+        sig_g, sig_t = self.sigreg(sg_in, gen), self.sigreg(st_in, gen)
+        with torch.no_grad():                                   # between-volume share of token-embedding variance
+            zt, tv = ztok[keep], tvol[keep]
+            means = torch.zeros(b, zt.shape[1], device=zt.device).index_add_(0, tv, zt)
+            means /= torch.bincount(tv, minlength=b).clamp_min(1)[:, None]
+            vol_share = 1 - (zt - means[tv]).var(0).sum() / zt.var(0).sum()
+        return {"loss": (1 - self.lam) * (inv_g + inv_t) / 2 + self.lam * (sig_g + sig_t) / 2,
+                "inv_global": inv_g, "inv_token": inv_t, "sigreg_global": sig_g, "sigreg_token": sig_t,
+                "vol_share": vol_share, "len_global": lens[0], "len_local": lens[1]}

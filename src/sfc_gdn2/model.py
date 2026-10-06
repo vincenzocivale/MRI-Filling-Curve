@@ -25,8 +25,8 @@ class GDN2Block(nn.Module):
         self.ffn_norm = nn.LayerNorm(d)
         self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.mix(self.norm(x))[0]
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.mix(self.norm(x), cu_seqlens=cu_seqlens)[0]
         return x + self.ffn(self.ffn_norm(x))
 
 
@@ -65,10 +65,12 @@ class Encoder(nn.Module):
             x = torch.where(mask[..., None], self.mask_token.to(x.dtype), x)
         return x
 
-    def run(self, x: torch.Tensor) -> torch.Tensor:
-        """[B,S,d] curve-ordered tokens -> [B,S,d] hidden states (pre final norm)."""
+    def run(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+        """[B,S,d] curve-ordered tokens -> [B,S,d] hidden states (pre final norm). With `cu_seqlens`
+        (int32 [n+1] offsets), x is [1,T,d]: n sequences packed back to back, no padding."""
         for block in self.blocks:
-            x = checkpoint(block, x, use_reentrant=False) if self.grad_checkpoint and self.training else block(x)
+            x = (checkpoint(block, x, cu_seqlens, use_reentrant=False) if self.grad_checkpoint and self.training
+                 else block(x, cu_seqlens))
         return x
 
     def forward(self, patches: torch.Tensor, perm: torch.Tensor, mask: torch.Tensor | None = None):
