@@ -31,6 +31,7 @@ conda:
 env:
   OMP_NUM_THREADS: "8"
   PYTHONNOUSERSITE: "1"     # ~/.local holds stale pip --user packages
+  TRITON_CACHE_DIR: /leonardo_work/IscrC_SFMRI/fcorrent/.cache/triton   # compiled GDN-2/FLA kernels, kept across jobs
   SFC_FM_ENVS: /leonardo_work/IscrC_SFMRI/fcorrent/envs     # `sfc fm` paths (configs/fm/leonardo.env)
   SFC_FM_REPOS: /leonardo_work/IscrC_SFMRI/fcorrent/repos
   SFC_FM_MODELS: /leonardo_work/IscrC_SFMRI/fcorrent/models

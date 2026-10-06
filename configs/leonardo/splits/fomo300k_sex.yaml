@@ -1,0 +1,9 @@
+# Leonardo copy of configs/splits/fomo300k_sex.yaml (root on $SCRATCH; FOMO300K not downloaded yet).
+# Subject-level, cohort-stratified, one scan per subject. Probe splits only draw `sex`-labelled subjects.
+manifest: data/manifests/fomo300k.csv
+kind: zip_bids
+root: /leonardo_scratch/large/userexternal/fcorrent/datasets/raw/FOMO300K
+output: data/manifests/fomo300k_sex.csv
+seed: 17
+labels: [sex, age, group]     # first one gates probe eligibility
+counts: {pretrain: all, train: 500, val: 100, test: 300}   # pretrain: every scan of every non-probe subject

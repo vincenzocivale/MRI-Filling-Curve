@@ -13,14 +13,20 @@ a stop-grad target without EMA drifted) + SIGReg on 64 token embeddings per volu
 
 ## Environment
 
+CINECA Leonardo (project IscrC_SFMRI), env `sfc-gdn2` at `/leonardo_work/IscrC_SFMRI/fcorrent/envs/sfc-gdn2`:
+
 ```bash
-/home/fcorrentio/data/MRI-US/miniconda3/envs/sfc-gdn2/bin/python -m pytest -q   # or: conda activate sfc-gdn2
-ruff check .
+source ~/mri-sfc/env.sh      # activates the env, PYTHONNOUSERSITE=1, caches on $WORK, cd repo
+python -m pytest -q && ruff check .
 ```
 
-GDN-2 is at `/raid/DATASETS/_external_deps/GatedDeltaNet-2` (on the env's path). `tests/test_model_gpu.py`
-needs CUDA + GDN-2 and is skipped otherwise; the first run spends minutes compiling Triton kernels.
-Up to 4 GPUs at a time; pick ones with free memory (`nvidia-smi`), set `CUDA_VISIBLE_DEVICES`.
+GDN-2 is at `/leonardo_work/IscrC_SFMRI/fcorrent/repos/GatedDeltaNet-2` (on the env's path via `gdn2.pth`).
+flash-attn is built from source (`slurm/build_flash_attn.sh`): the upstream wheels need GLIBC 2.32, Leonardo has 2.28.
+Configs with Leonardo paths are in `configs/leonardo/` (runs on $SCRATCH, cube cache on $FAST, raw data on $SCRATCH).
+GPU work goes through SLURM (`slurm/submit.py`, 4x A100 64GB per node; short tests on `slurm/presets/dbg.yaml`);
+compute nodes are offline, so data, weights and sdists are fetched on a login node.
+`tests/test_model_gpu.py` needs CUDA + GDN-2 and is skipped otherwise; the first run spends minutes compiling
+Triton kernels (`TRITON_CACHE_DIR` on $WORK keeps them across jobs).
 
 ## Layout (`src/sfc_gdn2/`)
 

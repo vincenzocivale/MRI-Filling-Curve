@@ -80,13 +80,16 @@ submits it; any `sfc` command or script goes after `--`:
 ```bash
 cp slurm/local.yaml.example slurm/local.yaml      # once: mail, conda base / env path
 python slurm/submit.py slurm/presets/dbg.yaml -- sfc fm configs/fm/brainiac.yaml --images a.nii.gz --out o
-python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
+python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/leonardo/pretrain_lejepa.yaml
 python slurm/submit.py slurm/presets/1gpu.yaml --dry-run --set time=02:00:00 -- sfc probe configs/probe_sex.yaml --run-dir <run>
 ```
 
 Presets: `dbg` (1 GPU, debug QOS, 30 min), `1gpu`, `4gpu` and `8gpu` (torchrun DDP, 1 and 2 nodes),
 `cpu` (`lrd_all_serial`). Under torchrun the command is `-m <module>` or a script, never `python`.
 Config: `slurm/defaults.yaml` <- `slurm/local.yaml` <- preset <- `--set key=value`; logs in `outputs/slurm/`.
+`configs/leonardo/` holds copies of the pretraining, dataset and split configs with Leonardo paths
+(runs on `$SCRATCH`, cube cache on `$FAST`); keep their non-path fields in sync with `configs/`.
+flash-attn's upstream wheels need GLIBC 2.32 (Leonardo: 2.28); build it with `slurm/build_flash_attn.sh`.
 
 ## External foundation models
 

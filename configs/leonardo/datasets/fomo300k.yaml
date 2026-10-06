@@ -1,0 +1,8 @@
+# Leonardo copy of configs/datasets/fomo300k.yaml (root on $SCRATCH; FOMO300K not downloaded yet).
+name: fomo300k
+kind: zip_bids
+root: /leonardo_scratch/large/userexternal/fcorrent/datasets/raw/FOMO300K
+output: data/manifests/fomo300k.csv
+split: train
+max_samples: 20000
+modalities: [T1w, MPRAGE, T1]
