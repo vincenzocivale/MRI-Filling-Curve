@@ -1,0 +1,11 @@
+# FOMO baseline (AMAES-pre-trained on FOMO60K / FOMO300K; fomo25/baseline-codebase, same encoders and
+# checkpoint layout as AMAES: bare state_dict or Lightning .ckpt with `model.encoder.*` keys).
+# Checkpoint: https://huggingface.co/FOMO25/baseline_pretrained_models (FOMO25 baseline); `arch` must match the file.
+# The repos document no separate FOMO26 architecture: set `arch` to the one the checkpoint was trained with.
+model: fomo26
+checkpoint: null
+model_args:
+  arch: unet_b             # unet_b | unet_xl | mednext_l3 | mednext_m3
+  input_size: 96           # FOMO baseline pre-training patch size
+  normalize: zscore_fg     # FOMO preprocessing: per-volume z-score; or unit
+  stage: -1

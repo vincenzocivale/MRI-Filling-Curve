@@ -30,7 +30,8 @@ Up to 4 GPUs at a time; pick ones with free memory (`nvidia-smi`), set `CUDA_VIS
 - `probe.py`: tasks, `LinearProbe` (val or subject-grouped CV selection, one test pass, bootstrap CI),
   `probe_run` (per inference curve: pretrained vs init), `probe_raw` (raw + position).
 - `data/`: manifests (`zip_bids`, `totalseg`), labels, subject-level splits, `VolumeStore` cube cache, loader.
-- `cli.py`: `sfc prepare|split|pretrain|probe|summarize`.
+- `fm/`: external foundation models behind one adapter interface (`base.py`), registry `MODELS` in `__init__.py`, `extract.py` (feature map -> probe features), `run.py` (`sfc fm`). Checkpoints load strictly in each repo's original format.
+- `cli.py`: `sfc prepare|split|pretrain|probe|fm|summarize`.
 
 ## Invariants (do not break)
 

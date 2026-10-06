@@ -101,3 +101,11 @@ def patchify(vol: torch.Tensor, patch: int) -> torch.Tensor:
     g = vol.shape[0] // patch
     v = vol.reshape(g, patch, g, patch, g, patch).permute(0, 2, 4, 1, 3, 5)
     return v.reshape(g ** 3, patch ** 3)
+
+
+def unpatchify(patches: torch.Tensor, grid: int) -> torch.Tensor:
+    """Inverse of `patchify`, batched: [B, grid^3, p^3] canonical-order patches -> [B, S, S, S] cubes."""
+    b, _, v = patches.shape
+    p = round(v ** (1 / 3))
+    x = patches.reshape(b, grid, grid, grid, p, p, p).permute(0, 1, 4, 2, 5, 3, 6)
+    return x.reshape(b, grid * p, grid * p, grid * p)

@@ -1,4 +1,4 @@
-"""`sfc <command> <config>`: prepare | split | pretrain | probe | summarize."""
+"""`sfc <command> <config>`: prepare | split | pretrain | probe | fm | summarize."""
 from __future__ import annotations
 
 import argparse
@@ -46,6 +46,11 @@ def probe(cfg: dict, args) -> None:
         probe_run(cfg, run_dir)
 
 
+def fm(cfg: dict, args) -> None:
+    from .fm.run import evaluate
+    evaluate(cfg, args.model, args.probe)
+
+
 def summarize(_, args) -> None:
     """One row per (run, probe, group) under <root>: pretrained/init per run, plus the raw baseline."""
     root, rows = Path(args.config), []
@@ -64,7 +69,7 @@ def summarize(_, args) -> None:
     df.to_csv(root / "probe_summary.csv", index=False)
 
 
-COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "summarize": summarize}
+COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize}
 
 
 def main() -> None:
@@ -73,7 +78,11 @@ def main() -> None:
     ap.add_argument("config", help="YAML config (for `summarize`: a pretraining output_root)")
     ap.add_argument("--run-dir", nargs="+", help="probe: pretraining run directories")
     ap.add_argument("--raw", help="probe: also run the encoder-free baseline (pass the pretrain config)")
+    ap.add_argument("--model", nargs="+", help="fm: model configs (configs/fm/*.yaml)")
+    ap.add_argument("--probe", nargs="+", help="fm: probe configs (default: `probes` of the config)")
     args = ap.parse_args()
+    if args.command == "fm" and not args.model:
+        ap.error("fm needs --model")
     COMMANDS[args.command](None if args.command == "summarize" else load_yaml(args.config), args)
 
 

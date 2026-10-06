@@ -1,0 +1,13 @@
+# Shared setup for every external foundation model:
+#   sfc fm configs/fm_eval.yaml --model configs/fm/brainiac.yaml configs/fm/nnunet.yaml [--probe configs/probe_sex.yaml]
+# Model + checkpoint come from configs/fm/<name>.yaml; the probes (manifests, splits, selection,
+# CI) are the very ones used for our encoder. Preprocessing matches configs/pretrain_lejepa.yaml so
+# patch-level probes score the same 16^3 grid of 8-voxel patches; each adapter resamples the cube to
+# its own input size and maps the feature map back onto that grid.
+output_root: /raid/DATASETS/MRI-US/biomed-fm-results/fm_eval
+probes: [configs/probe_sex.yaml, configs/probe_age.yaml, configs/probe_totalseg.yaml]
+data:
+  target_shape: [128, 128, 128]
+  patch_size: 8
+  cache_dir: /raid/DATASETS/MRI-US/biomed-fm-results/.cache_volumes
+  num_workers: 8

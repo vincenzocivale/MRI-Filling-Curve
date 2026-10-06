@@ -1,0 +1,13 @@
+# BrainSegFounder (lab-smile/BrainSegFounder): Swin-ViT encoder, SwinUNETR SSL pretraining on UK Biobank.
+# Needs `pip install monai` (not vendored).
+model: brainsegfounder
+# Pretrained models: Google Drive linked from the repo README ("Data and Models"), e.g. the stage-1
+# `model_bestValRMSE.pt` (dict with "state_dict"; SSLHead or SwinUNETR keys, `module.` prefix ok).
+# null -> random-init encoder only (the `init` baseline).
+checkpoint: null
+model_args:
+  feature_size: 48          # embed_dim (repo default; 96 for the large variant)
+  in_channels: 1            # 1 = T1w only. A 2-channel (T1+T2) checkpoint receives the T1w in both channels
+  depths: [2, 2, 2, 2]
+  num_heads: [3, 6, 12, 24]
+  input_size: 96            # the cube is resampled to input_size^3 (repo roi = 96)

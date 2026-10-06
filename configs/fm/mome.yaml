@@ -1,0 +1,17 @@
+# MoME (ZhangxinruBIT/MoME, MICCAI'24): 5 modality-expert nnU-Nets (T1, T1ce, T2, FLAIR, DWI) + an
+# aggregator nnU-Net. Features = the aggregator's deepest encoder stage. Pure torch, no extra dependency.
+model: mome
+# Released model: HF ZhangxinruBIT/MoME -> MoME_foundation/MoME_CHECKPOINT. Point at the aggregator file
+# (`checkpoint_best.pth`); the experts are read from the same folder as checkpoint_best1..5.pth (the repo's
+# own naming rule). null -> random-init encoders only (the `init` baseline).
+checkpoint: null
+model_args:
+  plans_json: null          # nnU-Net plans.json of the release (reads architecture); else `arch` / defaults
+  configuration: 3d_fullres
+  arch:                     # used when plans_json is null (nnU-Net v2 3d_fullres defaults)
+    features_per_stage: [32, 64, 128, 256, 320, 320]
+    kernel_sizes: [3, 3, 3, 3, 3, 3]
+    strides: [1, 2, 2, 2, 2, 2]
+    n_conv_per_stage: [2, 2, 2, 2, 2, 2]
+  input_size: 128           # cube resampled to input_size^3 (multiple of 32)
+  expert_checkpoints: null  # optional explicit list of 5 expert files (e.g. HF Pretrained_Experts)

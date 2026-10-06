@@ -71,3 +71,19 @@ later epochs memory-map it.
 **FOMO300K is a superset of OpenMind:** never pool them as independent cohorts.
 
 No dataset or GDN-2 code is redistributed here (`THIRD_PARTY.md`).
+
+## External foundation models
+
+One entrypoint, same probes and splits as our encoder; model and checkpoint come from a config
+(`configs/fm/<name>.yaml`: `model`, `checkpoint`, `model_args`):
+
+```bash
+pip install -e '.[fm]'
+sfc fm configs/fm_eval.yaml --model configs/fm/brainiac.yaml configs/fm/openmind.yaml [--probe configs/probe_sex.yaml]
+sfc summarize <output_root>   # rows are labelled objective=fm:<model>, groups pretrained / init
+```
+
+Models: `brainiac`, `medicalnet`, `brainsegfounder`, `brainmvp`, `mome`, `mome_plus`, `openmind`,
+`nnfoundation`, `amaes`, `fomo26`, `brainfm`, `nnunet`. Checkpoints are checked key by key against the
+architecture (a mismatch raises). `checkpoint: null` reports the random init only. Each adapter resamples the cube to
+its input size and pools its deepest feature map onto the 16^3 patch grid (patch level) or globally (volume level).

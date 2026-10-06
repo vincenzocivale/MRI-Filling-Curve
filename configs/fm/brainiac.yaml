@@ -1,0 +1,11 @@
+# BrainIAC ViT-B/16 (AIM-KannLab/BrainIAC). Needs `pip install monai`.
+model: brainiac
+# Lightning ckpt from the repo's Dropbox (see its README), e.g. BrainIAC.ckpt; keys `state_dict: {backbone.*}`.
+checkpoint: null
+model_args:
+  img_size: 96
+  patch_size: 16
+  hidden_size: 768
+  mlp_dim: 3072
+  num_layers: 12
+  num_heads: 12

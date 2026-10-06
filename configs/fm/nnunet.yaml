@@ -1,0 +1,11 @@
+# nnU-Net v2 trained model folder used as a frozen encoder. Needs `pip install dynamic-network-architectures`.
+#   <model_dir>/plans.json, dataset.json, fold_<fold>/<checkpoint_name>
+model: nnunet
+checkpoint: null          # file (…/fold_0/checkpoint_final.pth) or the model folder (resolved with fold/checkpoint_name); null = random init
+model_args:
+  model_dir: /path/to/nnUNet_results/DatasetXXX_Name/nnUNetTrainer__nnUNetPlans__3d_fullres
+  configuration: 3d_fullres
+  fold: 0                 # int or "all"
+  checkpoint_name: checkpoint_final.pth
+  stage: -1               # encoder stage used as feature map (-1 = bottleneck)
+  input_size: null        # cubic input side; null = smallest plans patch edge, rounded up to the total stride

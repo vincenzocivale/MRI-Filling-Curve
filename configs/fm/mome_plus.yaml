@@ -1,0 +1,19 @@
+# MoME+ (ZhangxinruBIT/MoME, TMI'25): 4 modality experts (T1, T1ce, T2, FLAIR) + dispatch network for
+# missing modalities + aggregator. Our single T1w goes in `modality` (MultiMod = [1,0,0,0]); the dispatch
+# net synthesises the other channels. Features = the aggregator's deepest encoder stage.
+model: mome_plus
+# Released model: HF ZhangxinruBIT/MoME -> MoME_plus/MoME_plus_CHECKPOINT. Point at `checkpoint_best.pth`
+# (aggregator); checkpoint_best1..4.pth (experts) and checkpoint_best_dispatch.pth are read from the same
+# folder (the repo's naming rule). null -> random-init only.
+checkpoint: null
+model_args:
+  plans_json: null
+  configuration: 3d_fullres
+  arch:
+    features_per_stage: [32, 64, 128, 256, 320, 320]
+    kernel_sizes: [3, 3, 3, 3, 3, 3]
+    strides: [1, 2, 2, 2, 2, 2]
+    n_conv_per_stage: [2, 2, 2, 2, 2, 2]
+  input_size: 128
+  modality: t1              # slot of our image: t1 | t1ce | t2 | flair
+  expert_checkpoints: null

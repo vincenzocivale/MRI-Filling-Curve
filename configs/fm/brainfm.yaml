@@ -1,0 +1,12 @@
+# BrainFM / Brain-ID backbone (jhuldr/BrainFM). Weights: ckp/brainfm_pretrained.pth from the project's
+# OneDrive (torch.save({"model": joiner_state_dict, ...})); only `backbone.*` is used, strictly.
+model: brainfm
+checkpoint: null          # e.g. /path/to/brainfm_pretrained.pth ; null = random init only
+model_args:
+  f_maps: 64              # default_train.yaml
+  num_groups: 8
+  num_levels: 6           # released model (cfgs/trainer/test/demo_test.yaml); 5 and 7 exist for other ckpts
+  unit_feat: true         # L2-normalise the last decoder feature, as in the repo
+  feature_level: -1       # -1 = last decoder (64 ch, repo's feature); 0 = bottleneck (2048 ch)
+  pool_to: 16             # pool the map to the patch grid inside the model (saves memory); null = full res
+  input_size: 128         # multiple of 2**(num_levels-1)

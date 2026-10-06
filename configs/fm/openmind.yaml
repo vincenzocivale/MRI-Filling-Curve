@@ -1,0 +1,13 @@
+# OpenMind (nnssl, MIC-DKFZ/nnssl): ResEnc-L / Primus-M pre-trained with MAE, VoCo, SimCLR, ... on OpenMind.
+# Checkpoint: the nnssl `checkpoint_final.pth` (keys: network_weights, nnssl_adaptation_plan, ...), e.g. from
+# https://huggingface.co/collections/MIC-DKFZ/openmind-models-6819c21c7fe6f0aaaab7dadf (AnonRes/ResEncL-OpenMind-MAE).
+# The architecture is rebuilt from the checkpoint's own adaptation plan; model_args only sets the random-init
+# baseline / plan-less checkpoints. Needs: pip install 'dynamic-network-architectures>=0.4.4,<0.5' 'timm<1.0.23' einops
+model: openmind
+checkpoint: null
+model_args:
+  arch: ResEncL            # ResEncL | NoSkipResEncL | PrimusS|B|M|L | ResidualEncoderUNet (+arch_kwargs)
+  input_size: null         # null: 160 (OpenMind patch), overridden by the checkpoint plan's patch size
+  normalize: zscore_all    # nnU-Net ZScoreNormalization over the whole volume (plan: use_mask_for_norm=false); or zscore_fg
+  stage: -1                # encoder stage used as feature map (-1 = deepest, stride 32)
+  use_plan: true           # rebuild the architecture from the checkpoint's nnssl_adaptation_plan
