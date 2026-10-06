@@ -1,0 +1,13 @@
+# BrainMVP (shaohao011/BrainMVP, CVPR 2025), unet encoder: pretraining RecModel checkpoint from the README.
+# One modality (1 channel) per image. Wrapper options in src/sfc_gdn2/fm/brainmvp.py.
+model: brainmvp
+env: ${SFC_FM_ENVS}/fm-brainmvp
+repo: ${SFC_FM_REPOS}/BrainMVP
+commit: a466bb2
+checkpoint: ${SFC_FM_MODELS}/BrainMVP/BrainMVP_unet.pt
+args:
+  arch: unet
+  mode: downstream     # downstream (Downstream/dataset/transforms.py val) | pretrain (utils/data_utils.py)
+  roi: 96              # Downstream patch_shape
+  overlap: 0.5         # Downstream/train_utils.py:110
+  amp: true            # torch.cuda.amp.autocast, Downstream/train_utils.py:112 (no-op on cpu)

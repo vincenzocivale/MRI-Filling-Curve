@@ -1,0 +1,12 @@
+# MedicalNet / Med3D 3D-ResNet-152 (Tencent/MedicalNet), weights resnet_152.pth (shortcut B, README + keys).
+# status: modality-agnostic (CT+MRI 3DSeg-8 pretraining); usable for T1w. Input = stored NIfTI array, nearest
+#   resize to input_size, nonzero z-score with N(0,1) background noise (seeded). layer4 at stride 8.
+model: medicalnet
+env: ${SFC_FM_ENVS}/fm-medicalnet
+repo: ${SFC_FM_REPOS}/MedicalNet
+commit: 20f76aa
+checkpoint: ${SFC_FM_MODELS}/MedicalNet/Resnet152/resnet_152.pth
+args:
+  depth: 152
+  input_size: [56, 448, 448]   # setting.py input_D/H/W defaults
+  seed: 1                      # background-noise RNG seed (repo leaves it unseeded)

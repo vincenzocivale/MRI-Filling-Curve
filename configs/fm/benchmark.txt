@@ -1,0 +1,16 @@
+# Models in the FM benchmark (decided 2026-10-06). One config per line; `sfc fm <config> ...` for each.
+# Wrappers/configs not listed here (BrainMVP, MoME/MoME+, BrainSegFounder BraTS/ATLAS-ft, other OpenMind
+# methods, AMAES-fomo260k, other MedicalNet depths, TotalSeg 857/872/873) stay verified but unused.
+configs/fm/brainiac.yaml                      # required
+configs/fm/openmind_resencl_mae.yaml
+configs/fm/openmind_primusm_mae.yaml
+configs/fm/openmind_resencl_simclr.yaml
+configs/fm/nnfoundation_cnn.yaml
+configs/fm/nnfoundation_vit.yaml
+configs/fm/fomo26.yaml
+configs/fm/brainfm.yaml
+configs/fm/bsf_ukb_pretrain.yaml              # barely trained, kept on purpose
+configs/fm/bsf_atlas_pretrain.yaml            # barely trained, kept on purpose
+configs/fm/medicalnet_resnet50_23dataset.yaml # legacy baseline
+configs/fm/nnunet_totalseg_mr_870.yaml        # supervised on TotalSeg MRI: upper bound on the TotalSeg test only
+configs/fm/nnunet_totalseg_mr_871.yaml        #   (organs + muscles, TotalSegmentator's default total_mr at 1.5 mm)

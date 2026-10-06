@@ -32,7 +32,8 @@ Up to 4 GPUs at a time; pick ones with free memory (`nvidia-smi`), set `CUDA_VIS
 - `probe.py`: tasks, `LinearProbe` (val or subject-grouped CV selection, one test pass, bootstrap CI),
   `probe_run` (per inference curve: pretrained vs init), `probe_raw` (raw + position).
 - `data/`: manifests (`zip_bids`, `totalseg`), labels, subject-level splits, `VolumeStore` cube cache, loader.
-- `cli.py`: `sfc prepare|split|pretrain|probe|summarize`.
+- `fm/`: external foundation models, image -> the model's own features. `api.extract` (`sfc fm`) runs `worker.py` under the model's conda env (`envs/fm/`, path in `configs/fm/*.yaml`); each wrapper (`base.Wrapper`) imports the ORIGINAL repo code for preprocessing, network, inference and outputs. Parity scripts in `tests/fm/`.
+- `cli.py`: `sfc prepare|split|pretrain|probe|fm|summarize`.
 
 ## Invariants (do not break)
 
@@ -48,3 +49,4 @@ Up to 4 GPUs at a time; pick ones with free memory (`nvidia-smi`), set `CUDA_VIS
 - Report probes next to `init`, `raw`, `position`, `chance_ap`; sex alone cannot rank encoders.
 - All randomness derives from `seed`. Volumes resampled isotropically, aspect preserved.
 - FOMO300K ⊃ OpenMind. No dataset or GDN-2 code in this repo.
+- External FMs: no re-implemented preprocessing / network / pooling. Use the original repo's code in its own env; anything we add is listed in `derived`.

@@ -1,0 +1,15 @@
+# BrainSegFounder stage-2 SSL on ATLAS v2.0 (lab-smile/BrainSegFounder).
+# status: barely trained (global_step 60, epoch 0; LayerNorms within 9e-3 of init); 2 input channels although
+#   ATLAS is T1w-only and the paper says 1 channel; the producing code is not in the repo. T1w duplicated into
+#   both channels (paper §1.3). Preprocessing = the repo's ATLAS pipeline (raw intensities, Resize 96^3, area);
+#   expects ATLAS-like input (T1w, MNI152NLin2009aSym 1 mm, defaced, not skull-stripped).
+model: brainsegfounder
+env: ${SFC_FM_ENVS}/fm-brainsegfounder
+repo: ${SFC_FM_REPOS}/BrainSegFounder
+commit: 0bbf432
+checkpoint: ${SFC_FM_MODELS}/BrainSegFounder/HF/model_weights_ATLAS-pretrain.pt
+args:
+  pipeline: atlas
+  in_channels: 2
+  depths: [2, 2, 2, 2]
+  duplicate_channels: true

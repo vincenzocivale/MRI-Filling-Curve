@@ -1,0 +1,37 @@
+# BrainFM (jhuldr/BrainFM @ f1731a1): pins from the repo's requirements.txt / README (python 3.11, torch 2.0.1).
+# torch/torchvision: CUDA 11.8 wheels of the pinned versions. h5py comes in via versioned-hdf5
+# (Trainer/models/unet3d/utils.py imports h5py but requirements.txt does not list it).
+# Create with PYTHONNOUSERSITE=1 so pip does not count ~/.local packages as installed.
+name: fm-brainfm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.0.1+cu118
+      - torchvision==0.15.2+cu118
+      - typing-extensions  # torch deps: pip may skip them when ~/.local already has them
+      - filelock
+      - requests
+      - versioned-hdf5==1.6.0
+      - iopath==0.1.10
+      - matplotlib==3.7.1
+      - nibabel==5.2.0
+      - numpy==1.24.3
+      - pandas==1.5.3
+      - Pillow==9.4.0
+      - pytest==7.4.0
+      - pytorch_msssim==1.0.0
+      - pytz==2022.7
+      - PyYAML==6.0
+      - scipy==1.10.1
+      - seaborn==0.13.0
+      - setuptools==68.0.0
+      - SimpleITK==2.3.0
+      - simplejson==3.19.1
+      - scikit-image==0.20.0
+      - tabulate==0.8.10
+      - tqdm==4.65.0
+      - visdom==0.2.4

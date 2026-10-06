@@ -1,0 +1,26 @@
+# Create with PYTHONNOUSERSITE=1 (otherwise pip treats packages in ~/.local as installed and skips them).
+# Asparagus / FOMO26 (Sllambias/asparagus @ 16e00d7, v0.4.6; fomo26/fomo-lp @ f915d5a): pins from
+# asparagus/pyproject.toml (python>=3.11, torch==2.6.0, torchvision==0.21.0, lightning==2.4.0,
+# gardening_tools>=0.3.5) and fomo-lp/requirements.txt (numpy, scikit-learn, pyyaml).
+# asparagus is installed editable from the clone at 16e00d7 (main): fomo-lp's embed_all calls `late_fusion` /
+# `_encode` (embed_all.py:51-56,117), which do not exist at 72f333b, the commit the HF model cards link.
+name: fm-asparagus
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+      - torchvision==0.21.0+cu124
+      - lightning==2.4.0
+      - gardening_tools==0.3.5
+      - scikit-image
+      - nibabel
+      - scikit-learn
+      - pyyaml
+      - tqdm
+      - monai==1.5.2       # asparagus dcai group; transforms/presets/__init__.py imports the DINOv2 preset (monai)
+      - timm<=1.0.14       # asparagus extras
+      - -e /leonardo_work/IscrC_SFMRI/fcorrent/repos/asparagus

@@ -1,0 +1,17 @@
+# MoME (ZhangxinruBIT/MoME, MICCAI'24): 5 modality-expert nnU-Nets + gating aggregator, nnU-Net v2.2 fork
+# MoME_foundation. One image of any modality. Wrapper: src/sfc_gdn2/fm/mome.py.
+model: mome
+env: ${SFC_FM_ENVS}/fm-mome
+repo: ${SFC_FM_REPOS}/MoME
+commit: 337a0ab
+# HF ZhangxinruBIT/MoME MoME_foundation/MoME_CHECKPOINT: aggregator; checkpoint_best1..5.pth (experts),
+# nnUNetPlans.json and dataset.json are read from the same folder.
+checkpoint: ${SFC_FM_MODELS}/MoME/MoME_foundation/MoME_CHECKPOINT/checkpoint_best.pth
+args:
+  prepro: true          # Codes_prepro (ANTs to MNI152, template skull mask, crop); false = input already in that space
+  skull: true           # input still has the skull (Codes_prepro `-ss`); false for skull-stripped inputs
+  ants_seed: 1          # ANTS_RANDOM_SEED (with 1 ITK thread) for deterministic registration
+  tile_step_size: 0.5   # nnUNetv2_predict default
+  use_mirroring: true   # 8x mirroring TTA as nnUNetv2_predict (no --disable_tta)
+  skip_stages: [4, 5]   # aggregator encoder stages kept per tile x mirror pass (5 = bottleneck, always kept)
+  dense: true           # stitched full-resolution aggregator decoder features (32 ch)

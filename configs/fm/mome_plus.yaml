@@ -1,0 +1,18 @@
+# MoME+ (ZhangxinruBIT/MoME, TMI'25): dispatch network + 4 BraTS modality experts + aggregator, nnU-Net v2.2
+# fork MoME_plus. Input: {t1, t1ce, t2, flair}, any non-empty subset (MultiMod = keys present). CUDA only.
+# Wrapper: src/sfc_gdn2/fm/mome.py.
+model: mome_plus
+env: ${SFC_FM_ENVS}/fm-mome
+repo: ${SFC_FM_REPOS}/MoME
+commit: 337a0ab
+# HF ZhangxinruBIT/MoME MoME_plus/MoME_plus_CHECKPOINT: aggregator; checkpoint_best1..4.pth (experts),
+# checkpoint_best_dispatch.pth, nnUNetPlans.json and dataset.json are read from the same folder.
+checkpoint: ${SFC_FM_MODELS}/MoME/MoME_plus/MoME_plus_CHECKPOINT/checkpoint_best.pth
+args:
+  prepro: true          # Codes_prepro per modality (ANTs to MNI152, template skull mask, crop); false = already done
+  skull: false          # BraTS-style inputs are skull-stripped; true = Codes_prepro `-ss`
+  ants_seed: 1
+  tile_step_size: 0.5
+  use_mirroring: true
+  skip_stages: [4, 5]
+  dense: true

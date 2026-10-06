@@ -1,0 +1,16 @@
+# nnU-Net v2 (MIC-DKFZ/nnUNet @ 2edf346, nnunetv2 2.8.1) + TotalSegmentator (wasserth/TotalSegmentator @ 2af6a1e,
+# 2.18.0), both installed editable from the original clones so their own pins (pyproject.toml / setup.py) apply.
+# nnunetv2 requires python>=3.10 and torch>=2.1.2,!=2.9.*; 2.8.0+cu128 is the build the project env already
+# runs on the A100 nodes. Create with PYTHONNOUSERSITE=1 (else pip skips deps found in ~/.local).
+name: fm-nnunet
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.8.0+cu128
+      - -e /leonardo_work/IscrC_SFMRI/fcorrent/repos/nnUNet
+      - -e /leonardo_work/IscrC_SFMRI/fcorrent/repos/TotalSegmentator
+      - pyyaml

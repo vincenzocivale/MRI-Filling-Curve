@@ -1,4 +1,4 @@
-"""`sfc <command> <config>`: prepare | split | pretrain | probe | summarize."""
+"""`sfc <command> <config>`: prepare | split | pretrain | probe | fm | summarize."""
 from __future__ import annotations
 
 import argparse
@@ -46,6 +46,20 @@ def probe(cfg: dict, args) -> None:
         probe_run(cfg, run_dir)
 
 
+def fm(_, args) -> None:
+    """Features of one external model for a list of images (`--images`, or `--csv` with an `id` column
+    plus one column per modality for multi-modal models)."""
+    from .fm.api import extract
+    if args.csv:
+        df = pd.read_csv(args.csv)
+        mods = [c for c in df.columns if c != "id"]
+        images = df[mods[0]].tolist() if len(mods) == 1 else df[mods].to_dict("records")
+        ids = df["id"].astype(str).tolist() if "id" in df else None
+    else:
+        images, ids = args.images, None
+    extract(args.config, images, args.out, device=args.device, overwrite=args.overwrite, ids=ids)
+
+
 def summarize(_, args) -> None:
     """One row per (run, probe, group) under <root>: pretrained/init per run, plus the raw baseline."""
     root, rows = Path(args.config), []
@@ -64,7 +78,7 @@ def summarize(_, args) -> None:
     df.to_csv(root / "probe_summary.csv", index=False)
 
 
-COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "summarize": summarize}
+COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize}
 
 
 def main() -> None:
@@ -73,8 +87,16 @@ def main() -> None:
     ap.add_argument("config", help="YAML config (for `summarize`: a pretraining output_root)")
     ap.add_argument("--run-dir", nargs="+", help="probe: pretraining run directories")
     ap.add_argument("--raw", help="probe: also run the encoder-free baseline (pass the pretrain config)")
+    ap.add_argument("--images", nargs="+", help="fm: image files (single-modality models)")
+    ap.add_argument("--csv", help="fm: CSV with `id` + one column per modality")
+    ap.add_argument("--out", help="fm: output directory (one <id>.pt per image)")
+    ap.add_argument("--device", default="cuda", help="fm: cuda | cpu")
+    ap.add_argument("--overwrite", action="store_true", help="fm: recompute existing outputs")
     args = ap.parse_args()
-    COMMANDS[args.command](None if args.command == "summarize" else load_yaml(args.config), args)
+    if args.command == "fm" and not ((args.images or args.csv) and args.out):
+        ap.error("fm needs --images or --csv, and --out")
+    raw = args.command in ("summarize", "fm")  # fm: the config is resolved (env vars) by fm.api
+    COMMANDS[args.command](None if raw else load_yaml(args.config), args)
 
 
 if __name__ == "__main__":

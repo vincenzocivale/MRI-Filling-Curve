@@ -1,0 +1,19 @@
+# TotalSegmentator MRI nnU-Net (Dataset870_TotalSegMRI_part1_organs_1751subj) as a frozen encoder, run exactly as TotalSegmentator runs
+# task total_mr (default: part1 organs, TS task 850 slot): TotalSegmentator/totalsegmentator/map_tasks_config.py (resample), nnunet.py:597-600 (step size),
+# python_api.py (tta=False). TotalSegmentator verified at 2af6a1e. Configuration (3d_fullres_15mm) and trainer come from the checkpoint.
+model: nnunet
+env: ${SFC_FM_ENVS}/fm-nnunet
+repo: ${SFC_FM_REPOS}/nnUNet
+commit: 2edf346
+checkpoint: ${SFC_FM_MODELS}/TotalSegmentatorMRI/Dataset870_TotalSegMRI_part1_organs_1751subj/nnUNetTrainer_2000epochs_NoMirroring__nnUNetPlans__3d_fullres_15mm
+args:
+  fold: 0
+  checkpoint_name: checkpoint_final.pth
+  tile_step_size: 0.8
+  use_mirroring: false          # TotalSegmentator default tta=False (the checkpoint allows no mirroring anyway)
+  stages: null                  # all encoder stages
+  return_logits: true
+  totalseg_repo: ${SFC_FM_REPOS}/TotalSegmentator
+  totalseg_resample: 1.5
+  totalseg_resampling_order: 1  # TotalSegmentator default resampling_order
+  totalseg_multimodel: true

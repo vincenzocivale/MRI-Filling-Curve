@@ -1,0 +1,13 @@
+# nnFoundationCNN (ResEnc-L, 102M) (MIC-DKFZ/nnssl, HF MIC-DKFZ/nnFoundationCNN, branch nnFoundation); wrapper: src/sfc_gdn2/fm/nnssl.py. nnssl preprocessing from the checkpoint's own plan,
+# official nnU-Net downstream builder + load_pretrained_weights (nnUNet @ 2edf346), sliding window at the
+# recommended patch size; volume embedding = SSL3D_classification linear-probe definition (@ 848e22e).
+model: nnfoundation
+env: ${SFC_FM_ENVS}/fm-nnssl
+repo: ${SFC_FM_REPOS}/nnssl
+commit: 94fe12d
+checkpoint: ${SFC_FM_MODELS}/nnFoundation/CNN/checkpoint_final.pth
+args:
+  nnunet_repo: ${SFC_FM_REPOS}/nnUNet         # commit 2edf346
+  ssl3d_repo: ${SFC_FM_REPOS}/SSL3D_classification  # commit 848e22e
+  stages: [3, 4, 5]    # ResEnc-L levels kept (strides 8/16/32); ignored for Primus
+  keep_tiles: true     # store per-tile maps of every kept level (else only the last level)

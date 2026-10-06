@@ -1,0 +1,13 @@
+# AMAES ResEnc-U-Net-B pretrained on FOMO260K (FOMO-MRI/AMAES_resenc_b_fomo260k, asparagus run 349177,
+# configs/projects/datapaper/pretrain/resenc_12m_amaes.yaml).
+# Run with the official FOMO26 embedding pipeline fomo26/fomo-lp pipeline/embed_all.py on asparagus @ 16e00d7
+# (editable in the env) + gardening_tools 0.3.5. Canonical: 320-d `embedding`. See src/sfc_gdn2/fm/asparagus.py.
+model: amaes_fomo260k
+env: ${SFC_FM_ENVS}/fm-asparagus
+repo: ${SFC_FM_REPOS}/fomo26-fomo-lp
+commit: f915d5a
+checkpoint: ${SFC_FM_MODELS}/AMAES/fomo260k/resenc_unet_b.ckpt
+args:
+  encoder: official     # official = embed_all's CLSREG encoder (MaxPool shortcuts); pretrain = pretraining encoder (AvgPool)
+  reorient_ras: true    # reproduces the organisers' RAS delivery of the challenge data (only if the file is not RAS)
+  target_size: 160      # embed_all default

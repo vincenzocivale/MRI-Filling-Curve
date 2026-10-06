@@ -71,3 +71,22 @@ later epochs memory-map it.
 **FOMO300K is a superset of OpenMind:** never pool them as independent cohorts.
 
 No dataset or GDN-2 code is redistributed here (`THIRD_PARTY.md`).
+
+## External foundation models
+
+One entrypoint for every model: given image files, each model returns **its own** features, computed by
+the original repo's code (preprocessing, network, inference procedure, feature output) in a dedicated
+conda env. Nothing of ours sits between the NIfTI and the model.
+
+```bash
+source configs/fm/leonardo.env        # SFC_FM_ENVS / SFC_FM_REPOS / SFC_FM_MODELS (see configs/fm/README.md)
+conda env create -p $SFC_FM_ENVS/fm-<family> -f envs/fm/fm-<family>.yml     # once per family
+sfc fm configs/fm/<name>.yaml --images a.nii.gz b.nii.gz --out feats/<name> [--device cpu]
+sfc fm configs/fm/mome_plus.yaml --csv cases.csv --out feats/mome_plus   # multi-modal: id,<modality>,...
+```
+
+Each image gives `<out>/<id>.pt` = `{features: {name: tensor}, canonical, derived, meta, provenance}`:
+`canonical` names the embedding the repo itself uses, `derived` lists anything we added (e.g. a pooling
+the repo does not define), `meta` maps the feature grid back to the image (for voxel/patch probes).
+`tests/fm/<family>_parity.py` (run in the model's env) checks a wrapper against the untouched original
+pipeline. Linear probing on these features is not wired yet.

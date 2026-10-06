@@ -1,0 +1,11 @@
+# BrainFM (jhuldr/BrainFM), released multi-task checkpoint (epoch 1854, UNet3D 6 levels, 64-ch unit features).
+# Weights: ckp/brainfm_pretrained.pth from the project's OneDrive (README "Pretrained weights").
+model: brainfm
+env: ${SFC_FM_ENVS}/fm-brainfm
+repo: ${SFC_FM_REPOS}/BrainFM
+commit: f1731a1
+checkpoint: ${SFC_FM_MODELS}/BrainFM/assets/brainfm_pretrained.pth
+args:
+  is_ct: false          # true: CT clamp to [0, 80] HU before min-max (prepare_image is_CT)
+  levels: true          # also return the coarser decoder levels feat_0..feat_4
+  task_outputs: false   # also return the trained task heads' outputs (large: 56-ch segmentation at 1 mm)
