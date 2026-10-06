@@ -1,0 +1,13 @@
+# 2 nodes x 4 GPUs, DDP via torchrun + c10d rendezvous on the first node.
+job_name: sfc_8gpu
+time: "24:00:00"
+nodes: 2
+mem: 480G
+cpus_per_task: 32
+gres: "gpu:4"
+env:
+  OMP_NUM_THREADS: "8"
+launch:
+  type: torchrun
+  nproc_per_node: 4
+  nnodes: 2

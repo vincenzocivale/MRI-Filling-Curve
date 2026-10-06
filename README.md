@@ -72,6 +72,22 @@ later epochs memory-map it.
 
 No dataset or GDN-2 code is redistributed here (`THIRD_PARTY.md`).
 
+## SLURM (CINECA Leonardo)
+
+`slurm/submit.py` turns a YAML preset into a batch script (repo root as cwd, conda env active) and
+submits it; any `sfc` command or script goes after `--`:
+
+```bash
+cp slurm/local.yaml.example slurm/local.yaml      # once: mail, conda base / env path
+python slurm/submit.py slurm/presets/dbg.yaml -- sfc fm configs/fm/brainiac.yaml --images a.nii.gz --out o
+python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
+python slurm/submit.py slurm/presets/1gpu.yaml --dry-run --set time=02:00:00 -- sfc probe configs/probe_sex.yaml --run-dir <run>
+```
+
+Presets: `dbg` (1 GPU, debug QOS, 30 min), `1gpu`, `4gpu` and `8gpu` (torchrun DDP, 1 and 2 nodes),
+`cpu` (`lrd_all_serial`). Under torchrun the command is `-m <module>` or a script, never `python`.
+Config: `slurm/defaults.yaml` <- `slurm/local.yaml` <- preset <- `--set key=value`; logs in `outputs/slurm/`.
+
 ## External foundation models
 
 One entrypoint for every model: given image files, each model returns **its own** features, computed by

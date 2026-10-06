@@ -1,0 +1,44 @@
+# Shared SLURM defaults (CINECA Leonardo). Presets in slurm/presets/ override single fields;
+# per-user values (mail, conda env path) go in slurm/local.yaml (gitignored, see local.yaml.example).
+account: IscrC_SFMRI
+partition: boost_usr_prod   # booster nodes: 4x A100 64GB, 32 cores, ~480GB RAM
+qos: null                   # e.g. boost_qos_dbg (30 min, 2 jobs) | boost_qos_lprod (long)
+
+job_name: sfc
+time: "04:00:00"
+mem: 120G
+nodes: 1
+ntasks_per_node: 1
+cpus_per_task: 8
+gres: "gpu:1"
+
+mail:
+  type: "END,FAIL"
+  user: null
+
+logs:
+  dir: "{repo}/outputs/slurm"   # outputs/ is gitignored
+  output: "{logs_dir}/%x_%j.out"
+  error: "{logs_dir}/%x_%j.err"
+
+modules:                    # gcc for Triton (GDN-2 / FLA kernels compile at first run)
+  - gcc/12.2.0
+
+conda:
+  base: null                # auto: `conda info --base`
+  env: sfc-gdn2             # name or absolute prefix
+
+env:
+  OMP_NUM_THREADS: "8"
+  PYTHONNOUSERSITE: "1"     # ~/.local holds stale pip --user packages
+  SFC_FM_ENVS: /leonardo_work/IscrC_SFMRI/fcorrent/envs     # `sfc fm` paths (configs/fm/leonardo.env)
+  SFC_FM_REPOS: /leonardo_work/IscrC_SFMRI/fcorrent/repos
+  SFC_FM_MODELS: /leonardo_work/IscrC_SFMRI/fcorrent/models
+
+launch:
+  type: single              # single: `srun <cmd>` | torchrun: `srun torchrun ... <cmd>`
+  nproc_per_node: 1
+  nnodes: 1
+  rdzv_port: 29500
+
+setup: []                   # extra bash lines before the command

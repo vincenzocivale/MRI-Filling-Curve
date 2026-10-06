@@ -1,0 +1,7 @@
+# CPU only (lrd_all_serial: login-like nodes with internet, max 8 cores per user in total, 4h).
+# Downloads, preprocessing, CPU parity checks.
+job_name: sfc_cpu
+partition: lrd_all_serial
+gres: null
+mem: 30G
+time: "04:00:00"

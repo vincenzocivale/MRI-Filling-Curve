@@ -1,0 +1,11 @@
+# 1 node x 4 GPUs, DDP via torchrun. Command: `-m sfc_gdn2.cli pretrain <config>` (torchrun runs python itself).
+job_name: sfc_4gpu
+time: "24:00:00"
+mem: 480G
+cpus_per_task: 32
+gres: "gpu:4"
+env:
+  OMP_NUM_THREADS: "8"
+launch:
+  type: torchrun
+  nproc_per_node: 4

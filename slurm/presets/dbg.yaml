@@ -1,0 +1,4 @@
+# 1 GPU, debug QOS: starts within minutes, max 30 min and 2 jobs per user. Smoke tests, parity checks.
+job_name: sfc_dbg
+qos: boost_qos_dbg
+time: "00:30:00"

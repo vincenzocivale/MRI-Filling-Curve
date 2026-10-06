@@ -34,6 +34,7 @@ Up to 4 GPUs at a time; pick ones with free memory (`nvidia-smi`), set `CUDA_VIS
 - `data/`: manifests (`zip_bids`, `totalseg`), labels, subject-level splits, `VolumeStore` cube cache, loader.
 - `fm/`: external foundation models, image -> the model's own features. `api.extract` (`sfc fm`) runs `worker.py` under the model's conda env (`envs/fm/`, path in `configs/fm/*.yaml`); each wrapper (`base.Wrapper`) imports the ORIGINAL repo code for preprocessing, network, inference and outputs. Parity scripts in `tests/fm/`.
 - `cli.py`: `sfc prepare|split|pretrain|probe|fm|summarize`.
+- `slurm/`: `submit.py` + YAML presets to sbatch any command on Leonardo (`python slurm/submit.py slurm/presets/<p>.yaml -- <cmd>`).
 
 ## Invariants (do not break)
 
