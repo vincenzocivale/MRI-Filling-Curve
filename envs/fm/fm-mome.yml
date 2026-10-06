@@ -1,0 +1,35 @@
+# MoME / MoME+ (ZhangxinruBIT/MoME @ 337a0ab): README (python 3.9.18, `pip install -e .` of the nnU-Net v2.2
+# fork), MoME_*/pyproject.toml dependencies, MoME_plus/nnunetv2/dynamic_network_architectures/requirements.txt
+# (torch==2.2.1, numpy==1.26.4). python 3.10 per project decision. The forks are NOT installed: both are packages
+# named `nnunetv2` and each ships its own patched dynamic_network_architectures, so the wrapper puts exactly one
+# fork on sys.path per process. Stock dynamic-network-architectures must NOT be installed here (it would shadow
+# the MoME+ fork copy). `ants` = antsRegistration / antsApplyTransforms called by Codes_prepro/AffineRegPrepro.py.
+name: fm-mome
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - ants=2.5.4
+  - libitk=5.4.0         # ants 2.5.4 with the solver's libitk 5.4.7 segfaults in antsRegistration
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.2.1+cu121
+      - numpy==1.26.4
+      - acvl-utils==0.2
+      - batchgenerators==0.25
+      - SimpleITK==2.3.1
+      - nibabel==5.2.1
+      - scipy==1.11.4
+      - scikit-image==0.22.0
+      - scikit-learn==1.3.2
+      - pandas<2.2
+      - tqdm
+      - dicom2nifti
+      - graphviz
+      - tifffile
+      - requests
+      - imagecodecs
+      - yacs
+      - matplotlib
+      - seaborn

@@ -1,0 +1,14 @@
+# BrainSegFounder fine-tuned on ATLAS v2.0 stroke-lesion segmentation (lab-smile/BrainSegFounder).
+# status: the only well-trained single-T1w checkpoint (supervised on lesions, epoch 89). Pickled
+#   DDP(ATLASPredictor(SwinUNETR)); ATLASPredictor is not in the repo -> unpickled into shells, its base_model used.
+#   Preprocessing = the repo's ATLAS pipeline (raw intensities, Resize 96^3, area, single forward);
+#   expects ATLAS-like input (T1w, MNI152NLin2009aSym 1 mm, defaced, not skull-stripped).
+model: brainsegfounder
+env: ${SFC_FM_ENVS}/fm-brainsegfounder
+repo: ${SFC_FM_REPOS}/BrainSegFounder
+commit: 0bbf432
+checkpoint: ${SFC_FM_MODELS}/BrainSegFounder/HF/model_weights_ATLAS-finetune.pt
+args:
+  pipeline: atlas
+  pickled: true
+  in_channels: 1

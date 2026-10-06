@@ -1,129 +1,142 @@
-"""BrainFM / Brain-ID (jhuldr/BrainFM, Apache-2.0) as a frozen feature extractor.
+"""BrainFM (jhuldr/BrainFM): modality-agnostic multi-task 3D U-Net, run with the repo's own code.
 
-The released model is a 3D U-Net backbone (`Trainer/models/unet3d/model.py::UNet3D`, DoubleConv
-blocks with GroupNorm + conv + LeakyReLU, nearest upsampling, concatenation skips) followed by task
-heads. The repo is not pip-installable and its imports pull in training-only dependencies (h5py,
-visdom, iopath, ...), so the backbone is re-implemented below in pure torch with the *same module
-names*, hence the same state_dict keys.
-
-Checkpoint (`ckp/brainfm_pretrained.pth`, from the project's OneDrive): `torch.save({"model": joiner.state_dict(),
-"epoch": ..., ...})` (scripts/train.py:207); the repo reads the first key containing "model"
-(utils/checkpoint.py:430-452). Backbone weights sit under `backbone.`, task heads under `head.` /
-`head_dict.` (ignored here). The backbone is loaded strictly.
-
-Repo conventions reproduced (scripts/demo_get_feature.py, utils/test_utils.py::evaluate_image,
-cfgs/trainer/default_train.yaml, cfgs/trainer/test/demo_test.yaml): 1 input channel min-max scaled
-to [0, 1] (= our cube, so no normalisation), `f_maps=64`, `num_groups=8`, `layer_order='gcl'`,
-`num_levels=6` for the released model, `unit_feat=True`. The repo's feature is the last decoder
-output (64 channels, full resolution, L2-normalised over channels); `feature_level` selects another
-element of `backbone.get_feature` (0 = bottleneck ... -1 = last decoder). The input side must be a
-multiple of 2**(num_levels-1) = 32; the default 128 matches our cube.
+All references are to the original repo (`cfg["repo"]`, verified at f1731a1):
+- preprocessing: `utils/test_utils.py:235` `prepare_image` with the arguments of `scripts/demo_test.py:46`
+  (win_size=None, zero_crop_first=True, spacing=None, add_bf=False): nibabel read + nan_to_num (:238-240),
+  CT clamp to [0, 80] only if `args.is_ct` (:246), min-max to [0, 1] (:249-251), `utils/misc.py:1117`
+  `torch_resize` to 1 mm isotropic (Gaussian anti-aliasing when downsampling), `misc.py:1207`
+  `align_volume_to_ref` to the identity (RAS) orientation, then `zero_crop` (:60) to the bounding box of
+  voxels > 0. We call prepare_image with zero_crop_first=False and apply the repo's `zero_crop` with the
+  same bbox ourselves -- `center_crop(win_size=None, zero_crop_first=True)` (:155-165) does exactly this --
+  only to record the bbox: the repo does not shift the returned affine by the crop offset (bug at
+  :155-165 / :258), `meta["affine"]` is the corrected one. The tensor is unchanged (see the parity script).
+- network: `Trainer/models/__init__.py:404` `build_model` from `cfgs/generator/default.yaml` +
+  `cfgs/generator/test/demo_test.yaml` and `cfgs/trainer/default_train.yaml` + `default_val.yaml` +
+  `cfgs/trainer/test/demo_test.yaml` (UNet3D, f_maps 64, 6 levels, 'gcl', unit_feat). The repo's own
+  default paths are broken (`test_utils.py:28-37` -> `cfg/defaults/*`, and `utils/process_cfg.py:60`
+  rejects relative paths with cfg_dir=''), so the same files are passed with absolute paths.
+- checkpoint: `utils/checkpoint.py:409` `load_checkpoint` (strict=False with suffix matching); we then
+  assert every checkpoint tensor landed in the model. The only model tensors not in the checkpoint are
+  `head.final_conv_high_res_residual.*`: the demo config enables super_resolution but the released model
+  was trained without it, so that head is random and `high_res*` outputs are never returned.
+- inference: the body of `test_utils.py:290` `evaluate_image` (forward, processors, postprocessor; fp32,
+  no_grad, whole volume, no TTA), split so the model is built once instead of per image.
+- features: `outputs['feat']` = `Trainer/models/unet3d/model.py:195` `get_feature`, the decoder pyramid
+  [bottleneck 2048 ch @ /32, 1024 @ /16, 512 @ /8, 256 @ /4, 128 @ /2, 64 @ 1 mm]; the last one is
+  L2-normalised over channels (:207) and is what `scripts/demo_get_feature.py:31` returns and what every
+  task head (1x1 convs, `Trainer/models/head.py:40`) consumes -> canonical `feat_last`.
+  The repo defines no volume-level embedding (its age head was never released), so
+  `feat_last_fgmean` (mean of feat_last over input > 0, the repo's mask convention `demo_test.py:53`)
+  is ours and listed in `derived`.
 """
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
+import nibabel as nib
+import numpy as np
 import torch
-import torch.nn.functional as F
-from torch import nn
 
-from .base import FoundationEncoder, load_checked, pick, read_checkpoint, select_prefix, strip_prefix
+from .base import Image, Wrapper, add_to_path
 
-
-class SingleConv(nn.Sequential):
-    """order 'gcl' = GroupNorm(in) -> Conv3d(no bias) -> LeakyReLU (buildingblocks.py::create_conv)."""
-
-    def __init__(self, cin: int, cout: int, num_groups: int):
-        super().__init__()
-        self.add_module("groupnorm", nn.GroupNorm(1 if cin < num_groups else num_groups, cin))
-        self.add_module("conv", nn.Conv3d(cin, cout, 3, padding=1, bias=False))
-        self.add_module("LeakyReLU", nn.LeakyReLU(inplace=True))
+GEN_CFGS = ("cfgs/generator/default.yaml", "cfgs/generator/test/demo_test.yaml")
+TRAIN_CFGS = ("cfgs/trainer/default_train.yaml", "cfgs/trainer/default_val.yaml", "cfgs/trainer/test/demo_test.yaml")
+UNTRAINED = ("head.final_conv_high_res_residual.",)
+UNTRAINED_OUTPUTS = ("high_res", "high_res_residual")
 
 
-class DoubleConv(nn.Sequential):
-    def __init__(self, cin: int, cout: int, encoder: bool, num_groups: int):
-        super().__init__()
-        mid = max(cout // 2, cin) if encoder else cout
-        self.add_module("SingleConv1", SingleConv(cin, mid, num_groups))
-        self.add_module("SingleConv2", SingleConv(mid, cout, num_groups))
+class BrainFM(Wrapper):
+    """args: is_ct (bool, default False: CT clamp in prepare_image), levels (bool, default True: also
+    return feat_0..feat_4), task_outputs (bool, default False: also return the trained task heads'
+    outputs -- synthesised T1/T2/FLAIR/CT, segmentation probabilities + label, distance maps, bias
+    field, atlas coordinates regx/y/z -- all at the feat_last grid)."""
 
-
-class Encoder(nn.Module):
-    def __init__(self, cin: int, cout: int, pool: bool, num_groups: int):
-        super().__init__()
-        self.pooling = nn.MaxPool3d(2) if pool else None
-        self.basic_module = DoubleConv(cin, cout, True, num_groups)
-
-    def forward(self, x):
-        return self.basic_module(x if self.pooling is None else self.pooling(x))
-
-
-class Decoder(nn.Module):
-    def __init__(self, cin: int, cout: int, num_groups: int):
-        super().__init__()
-        self.basic_module = DoubleConv(cin, cout, False, num_groups)
-
-    def forward(self, skip, x):
-        x = F.interpolate(x, size=skip.shape[2:], mode="nearest")
-        return self.basic_module(torch.cat((skip, x), dim=1))
-
-
-class UNet3D(nn.Module):
-    """`UNet3D(in_channels, f_maps, 'gcl', num_groups, num_levels, is_unit_vector)`."""
-
-    def __init__(self, in_channels: int = 1, f_maps: int = 64, num_groups: int = 8, num_levels: int = 6,
-                 is_unit_vector: bool = True):
-        super().__init__()
-        fm = [f_maps * 2 ** k for k in range(num_levels)]
-        self.encoders = nn.ModuleList(Encoder(in_channels if i == 0 else fm[i - 1], c, i > 0, num_groups)
-                                      for i, c in enumerate(fm))
-        rev = fm[::-1]
-        self.decoders = nn.ModuleList(Decoder(rev[i] + rev[i + 1], rev[i + 1], num_groups)
-                                      for i in range(len(rev) - 1))
-        self.is_unit_vector = is_unit_vector
-
-    def get_feature(self, x: torch.Tensor) -> list[torch.Tensor]:
-        """AbstractUNet.get_feature: [bottleneck, decoder_1, ..., decoder_last]."""
-        skips = []
-        for enc in self.encoders:
-            x = enc(x)
-            skips.insert(0, x)
-        feats = [x]
-        for dec, skip in zip(self.decoders, skips[1:]):
-            x = dec(skip, x)
-            feats.append(x)
-        if self.is_unit_vector:
-            feats[-1] = F.normalize(feats[-1], dim=1)
-        return feats
-
-
-class BrainFMEncoder(FoundationEncoder):
     name = "brainfm"
-    input_size = 128
 
-    def __init__(self, f_maps: int = 64, num_groups: int = 8, num_levels: int = 6, unit_feat: bool = True,
-                 feature_level: int = -1, pool_to: int | None = None, input_size: int = 128):
-        super().__init__()
-        if input_size % 2 ** (num_levels - 1):
-            raise ValueError(f"input_size must be a multiple of {2 ** (num_levels - 1)}.")
-        self.input_size, self.feature_level, self.pool_to = input_size, feature_level, pool_to
-        self.backbone = UNet3D(1, f_maps, num_groups, num_levels, unit_feat).requires_grad_(False)
+    def __init__(self, cfg: dict, device: str):
+        super().__init__(cfg, device)
+        self.repo = Path(cfg["repo"]).resolve()
+        add_to_path(self.repo)
+        with contextlib.chdir(self.repo):  # test_utils reads files/gca.mgz relative to the cwd at import (:40)
+            import utils.test_utils as tu
+        from Trainer.models import build_model
+        from utils import misc
+        from utils.checkpoint import load_checkpoint
 
-    def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return x  # the repo min-max scales to [0, 1], which is already our cube
+        self.tu = tu
+        self.gen_args = misc.preprocess_cfg([str(self.repo / p) for p in GEN_CFGS])
+        self.train_args = misc.preprocess_cfg([str(self.repo / p) for p in TRAIN_CFGS])
+        self.gen_args, self.train_args, self.model, self.processors, _, self.postprocessor = build_model(
+            self.gen_args, self.train_args, device)
+        load_checkpoint(cfg["checkpoint"], [self.model], model_keys=["model"], to_print=False)
+        self._check_loaded(cfg["checkpoint"])
+        self.is_ct = bool(self.args.get("is_ct", False))
+        self.levels = bool(self.args.get("levels", True))
+        self.task_outputs = bool(self.args.get("task_outputs", False))
 
-    def load_checkpoint(self, path: str | Path) -> dict:
-        ckpt = read_checkpoint(path)
-        model_keys = [k for k in ckpt if "model" in k]  # utils/checkpoint.py::find_model_key
-        sd = strip_prefix(pick(ckpt, model_keys[:1]), "module.")
-        return load_checked(self.backbone, select_prefix(sd, "backbone."), what="BrainFM checkpoint")
+    def _check_loaded(self, path: str) -> None:
+        """load_checkpoint is strict=False: make sure every model tensor (but the untrained SR head) is the
+        checkpoint's."""
+        sd = torch.load(path, map_location="cpu")["model"]
+        model_sd = self.model.state_dict()
+        missing = [k for k in model_sd if k not in sd and not k.startswith(UNTRAINED)]
+        differ = [k for k, v in sd.items() if k not in model_sd or not torch.equal(model_sd[k].cpu(), v)]
+        if missing or differ:
+            raise RuntimeError(f"brainfm: checkpoint not fully loaded: missing {missing[:4]}, differing {differ[:4]}")
 
-    def features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        fmap = self.backbone.get_feature(x)[self.feature_level]
-        if self.pool_to:  # full-resolution 64-ch maps are large; pooling to the patch grid loses nothing downstream
-            fmap = F.adaptive_avg_pool3d(fmap, self.pool_to)
-        return {"map": fmap}
+    def preprocess(self, image: Image) -> dict:
+        if not isinstance(image, str):
+            raise TypeError("brainfm is single-modality: pass a NIfTI path")
+        final, _, _, _, aff, _, _ = self.tu.prepare_image(image, win_size=None, zero_crop_first=False, spacing=None,
+                                                          add_bf=False, is_CT=self.is_ct, device=self.device)
+        vol = final[0, 0]
+        coords = torch.argwhere(vol > 0)  # zero_crop's own bbox rule (tol=0), test_utils.py:69-77
+        lo, hi = coords.min(0)[0].tolist(), (coords.max(0)[0] + 1).tolist()
+        x = self.tu.zero_crop(vol, crop_range_lst=[lo, hi])[None, None]
+        corrected = np.array(aff, dtype=np.float64)
+        corrected[:3, 3] += corrected[:3, :3] @ np.asarray(lo, dtype=np.float64)
+        src = nib.load(image)
+        meta = {
+            "input_path": image,
+            "source_shape": tuple(int(s) for s in src.shape),
+            "source_affine": torch.as_tensor(src.affine, dtype=torch.float64),
+            "aligned_shape": tuple(vol.shape),               # 1 mm RAS grid before the zero crop
+            "aligned_affine": torch.as_tensor(np.asarray(aff, dtype=np.float64)),
+            "bbox": [lo, hi],                                # zero crop in aligned voxels, [start, stop)
+            "input_shape": tuple(x.shape[2:]),
+            "affine": torch.as_tensor(corrected),            # input / feat_last voxel -> world (mm)
+            "spacing": (1.0, 1.0, 1.0),
+            "is_ct": self.is_ct,
+        }
+        return {"input": x, "meta": meta}
+
+    @torch.no_grad()
+    def features(self, prepared: dict) -> dict:
+        x = prepared["input"]
+        samples = [{"input": x}]
+        outputs, _ = self.model(samples)                     # evaluate_image, test_utils.py:302-307
+        for processor in self.processors:
+            outputs = processor(outputs, samples)
+        outputs, _, _ = self.postprocessor(self.gen_args, self.train_args, outputs, samples, target=None,
+                                           feats=None, tasks=self.gen_args.tasks)
+        out = outputs[0]
+        feat = out["feat"]
+        feats = {"feat_last": feat[-1][0]}
+        if self.levels:
+            feats |= {f"feat_{i}": f[0] for i, f in enumerate(feat[:-1])}
+        if self.task_outputs:
+            feats |= {f"task_{k}": v[0] for k, v in out.items()
+                      if k != "feat" and k not in UNTRAINED_OUTPUTS and isinstance(v, torch.Tensor)}
+        fg = (x[0, 0] > 0).to(feats["feat_last"].dtype)
+        feats["feat_last_fgmean"] = (feats["feat_last"] * fg).sum((1, 2, 3)) / fg.sum()
+        meta = prepared["meta"] | {
+            "levels": {f"feat_{i}": tuple(f.shape[1:]) for i, f in enumerate(feat)},
+            "level_note": "feat_i (i<5) is at stride 2**(5-i) of the input grid via floor MaxPool3d(2); "
+                          "feat_last == feat_5 is on the input grid (meta['affine'])",
+        }
+        return {"features": feats, "canonical": "feat_last", "meta": meta, "derived": ["feat_last_fgmean"]}
 
 
-def build(name: str, model_args: dict) -> FoundationEncoder:
-    return BrainFMEncoder(**model_args)
+def build(cfg: dict, device: str) -> BrainFM:
+    return BrainFM(cfg, device)

@@ -1,111 +1,211 @@
-"""nnU-Net (MIC-DKFZ/nnUNet, Apache-2.0) as a frozen encoder.
+"""Trained nnU-Net v2 model folder (MIC-DKFZ/nnUNet) as a frozen encoder, run by nnU-Net's own predictor.
 
-Works on any trained nnU-Net v2 model folder, i.e. also on models pretrained with nnU-Net
-(e.g. self-supervised / foundation checkpoints exported as a model folder):
+Paths are relative to the nnUNet clone (`cfg["repo"]`); `TS/` = the TotalSegmentator clone (`args.totalseg_repo`).
 
-    <model_dir>/plans.json  dataset.json  fold_<f>/checkpoint_final.pth
+- Model: `nnUNetPredictor.initialize_from_trained_model_folder` (nnunetv2/inference/predict_from_raw_data.py:68-131)
+  reads trainer, configuration and mirroring axes from the checkpoint, builds the net with the trainer's
+  `build_network_architecture` (old-format plans converted by plans_handling/plans_handler.py:36-97) and loads it.
+  `cfg["checkpoint"]` is the model folder; one fold (feature spaces of different folds are not comparable).
+- Optional TotalSegmentator pre-steps (`args.totalseg_resample` = TotalSegmentator's `resample` of the task), as in
+  TS/totalsegmentator/nnunet.py:497-561: first volume of 4D input, float copy, `as_closest_canonical`,
+  `change_spacing(order=resampling_order, dtype=int32)` (TS/totalsegmentator/resampling.py:194-294), saved as the
+  `*_0000.nii.gz` that nnU-Net reads. These lines are glue around TS's own functions (`nnUNet_predict_image` also
+  predicts, so it cannot be called for the input alone); equality with TS's file is checked in tests/fm/nnunet_parity.py.
+- Preprocessing: the plans' preprocessor `run_case` (preprocessing/preprocessors/default_preprocessor.py:115-143:
+  plans reader, transpose_forward, crop to nonzero, per-channel normalisation, resampling), converted exactly like
+  inference/data_iterators.py:29-41.
+- Inference: `predict_logits_from_preprocessed_data` (predict_from_raw_data.py:501-535) untouched: padding to the
+  patch, sliding window, Gaussian, mirroring per checkpoint, CUDA autocast. A forward hook on `network.encoder`
+  records the per-stage maps of every network call (tile x mirror) in call order.
+- Stitching: each recorded stage map is replayed, nearest-upsampled by the stage stride to the patch grid, through
+  nnU-Net's own `predict_sliding_window_return_logits` (:667-713), i.e. the same tiles, mirror flips, Gaussian
+  weights, fp16 accumulation and padding removal as the logits. The resulting voxel field (on the preprocessed
+  grid) is stored block-averaged over the stage stride (grid origin = preprocessed voxel 0).
 
-Architecture: exactly what nnU-Net does in `get_network_from_plans` (class + kwargs from
-`plans['configurations'][configuration]['architecture']`, built by `dynamic_network_architectures`),
-re-implemented here in ~15 lines so that the heavy `nnunetv2` dependency tree (batchgenerators,
-acvl_utils, ...) is not needed -- only `pip install dynamic-network-architectures`.
-
-Checkpoint: `torch.save` dict written by `nnUNetTrainer.save_checkpoint`
-(nnunetv2/training/nnUNetTrainer/nnUNetTrainer.py:1242-1250); weights under `network_weights`,
-possibly with `module.` (DataParallel) or `_orig_mod.` (torch.compile) key prefixes, which
-`nnUNetTrainer.load_checkpoint` (same file, :1259-1289) strips the same way. The *whole* network
-is loaded strictly (decoder included) so a plans/checkpoint mismatch cannot pass silently; only the
-encoder is then used.
-
-Features: `network.encoder(x)` returns one map per stage; `stage` (default -1 = bottleneck) picks one.
+Features: `stage{k}` stitched map [C, ceil(shape/stride)], `tiles_stage{k}` raw per-call maps [n_calls, C, patch/stride],
+`logits` [classes, *preprocessed shape] (fp16, nnU-Net's buffer dtype). Canonical: the stitched bottleneck.
+Derived (ours): `fg_mean_stage{k}`, the mean of the voxel-level stitched field over nnU-Net's nonzero mask.
 """
 from __future__ import annotations
 
-import json
-import math
-import pydoc
+import itertools
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
+import numpy as np
 import torch
+import torch.nn.functional as F
+from torch import nn
 
-from .base import FoundationEncoder, load_checked, pick, read_checkpoint, require, strip_prefix
+from .base import Wrapper, add_to_path
 
-
-def _locate(s):
-    obj = pydoc.locate(s)
-    if obj is None:
-        raise ImportError(f"nnU-Net plans reference {s!r}, which cannot be imported.")
-    return obj
+TS_TRIPLE_SPLIT_VOXELS = 512 * 512 * 900  # TS/totalsegmentator/nnunet.py:569
 
 
-def resolve_configuration(plans: dict, name: str) -> dict:
-    """`PlansManager.get_configuration` inheritance (plans_handler.py:237): child keys override parent."""
-    cfg = dict(plans["configurations"][name])
-    if parent := cfg.pop("inherits_from", None):
-        return {**resolve_configuration(plans, parent), **cfg}
-    return cfg
+class _Replay(nn.Module):
+    """Stands in for the network inside nnU-Net's sliding window: returns the encoder map recorded at the same
+    call of the real run, repeated `stride` times per axis so it covers the patch like the logits do."""
+
+    def __init__(self, maps: list[torch.Tensor], stride: list[int]):
+        super().__init__()
+        self.maps, self.stride, self.calls = maps, stride, 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.calls >= len(self.maps):
+            raise RuntimeError("nnU-Net made more network calls than were recorded (OOM fallback?).")
+        m = self.maps[self.calls].to(x.device)
+        self.calls += 1
+        for d, s in enumerate(self.stride):
+            m = m.repeat_interleave(s, dim=2 + d)
+        return m
 
 
-def network_from_plans(arch: dict, in_channels: int, n_classes: int) -> torch.nn.Module:
-    """nnunetv2/utilities/get_network_from_plans.py:9-60 without the nnunetv2 import."""
-    require("dynamic_network_architectures", "dynamic-network-architectures", "nnU-Net networks")
-    kwargs = dict(arch["arch_kwargs"])
-    for k in arch.get("_kw_requires_import", ()):
-        v = kwargs.get(k)
-        if v is not None:
-            kwargs[k] = [_locate(i) for i in v] if isinstance(v, (list, tuple)) else _locate(v)
-    net = _locate(arch["network_class_name"])(input_channels=in_channels, num_classes=n_classes, **kwargs)
-    if hasattr(net, "initialize"):
-        net.apply(net.initialize)
-    return net
+def _plain(x: Any) -> Any:
+    """numpy / tuples / slices -> python lists, so the result loads with torch.load(weights_only=True)."""
+    if isinstance(x, dict):
+        return {k: _plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_plain(v) for v in x]
+    if isinstance(x, slice):
+        return [_plain(x.start), _plain(x.stop)]
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
 
 
-def num_heads(dataset: dict) -> int:
-    """LabelManager.num_segmentation_heads (label_handling.py:259): regions or classes (no ignore label)."""
-    labels = dataset["labels"]
-    if any(isinstance(v, (list, tuple)) for v in labels.values()):
-        return len([k for k, v in labels.items() if k != "background" and v is not None])
-    return len([v for k, v in labels.items() if k != "ignore"])
+class NNUNet(Wrapper):
+    """args: fold (0), checkpoint_name (checkpoint_final.pth), tile_step_size (0.5), use_mirroring (True; nnU-Net
+    then mirrors only if the checkpoint allows it), stages (null = all encoder stages), return_logits (True),
+    totalseg_repo / totalseg_resample (null = plain nnU-Net) / totalseg_resampling_order (1) /
+    totalseg_multimodel (False; TS splits huge images only for multi-model tasks)."""
 
-
-class NNUNetEncoder(FoundationEncoder):
     name = "nnunet"
 
-    def __init__(self, model_dir: str, configuration: str = "3d_fullres", fold: int | str = 0,
-                 checkpoint_name: str = "checkpoint_final.pth", stage: int = -1,
-                 input_size: int | None = None):
-        super().__init__()
-        self.model_dir, self.fold, self.checkpoint_name, self.stage = Path(model_dir), fold, checkpoint_name, stage
-        plans = json.loads((self.model_dir / "plans.json").read_text())
-        dataset = json.loads((self.model_dir / "dataset.json").read_text())
-        cfg = resolve_configuration(plans, configuration)
-        if "architecture" not in cfg:
-            raise ValueError("plans.json has no 'architecture' entry (nnU-Net < 2.4 plans are not supported).")
-        channels = dataset.get("channel_names") or dataset["modality"]
-        self.in_channels = len(channels)
-        self.net = network_from_plans(cfg["architecture"], self.in_channels, num_heads(dataset))
-        self.net.requires_grad_(False)
-        # cubic input: the plans' patch edge (smallest, if anisotropic), rounded up to the total stride
-        total = [1, 1, 1]
-        for st in cfg["architecture"]["arch_kwargs"]["strides"]:
-            total = [t * k for t, k in zip(total, (st,) * 3 if isinstance(st, int) else st)]
-        total = max(total)
-        base = int(input_size or min(cfg["patch_size"]))
-        self.input_size = math.ceil(base / total) * total
+    def __init__(self, cfg: dict, device: str):
+        super().__init__(cfg, device)
+        add_to_path(cfg["repo"], *([self.args["totalseg_repo"]] if self.args.get("totalseg_repo") else []))
+        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
-    def checkpoint_path(self, path: str | Path | None = None) -> Path:
-        p = Path(path) if path else self.model_dir
-        return p / f"fold_{self.fold}" / self.checkpoint_name if p.is_dir() else p
+        a = self.args
+        self.predictor = nnUNetPredictor(tile_step_size=a.get("tile_step_size", 0.5), use_gaussian=True,
+                                         use_mirroring=a.get("use_mirroring", True), perform_everything_on_device=True,
+                                         device=torch.device(device), verbose=False, allow_tqdm=False)
+        self.predictor.initialize_from_trained_model_folder(cfg["checkpoint"], use_folds=(a.get("fold", 0),),
+                                                            checkpoint_name=a.get("checkpoint_name",
+                                                                                  "checkpoint_final.pth"))
+        strides = self.predictor.configuration_manager.network_arch_init_kwargs["strides"]
+        dim = len(self.predictor.configuration_manager.patch_size)
+        total, self.strides = [1] * dim, []
+        for st in strides:
+            total = [t * s for t, s in zip(total, [st] * dim if isinstance(st, int) else st)]
+            self.strides.append(total)
+        pm = self.predictor.plans_manager  # get_configuration is lru-cached: identity gives the checkpoint's name
+        self.configuration = next(c for c in pm.plans["configurations"]
+                                  if pm.get_configuration(c) is self.predictor.configuration_manager)
+        n = len(self.strides)
+        self.stages = sorted({s % n for s in (a.get("stages") or range(n))})
 
-    def load_checkpoint(self, path: str | Path | None = None) -> dict:
-        ckpt = read_checkpoint(self.checkpoint_path(path))
-        sd = pick(ckpt, ["network_weights"])
-        sd = strip_prefix(strip_prefix(sd, "module."), "_orig_mod.")  # DDP, then torch.compile
-        return load_checked(self.net, sd, what="nnU-Net checkpoint")
+    def totalseg_input(self, image: str, out_dir: Path) -> tuple[Path, dict]:
+        """TotalSegmentator's steps before nnU-Net (TS/totalsegmentator/nnunet.py:497-561), with TS's functions."""
+        import nibabel as nib
+        from totalsegmentator.alignment import as_closest_canonical
+        from totalsegmentator.resampling import change_spacing
 
-    def features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {"map": self.net.encoder(x)[self.stage]}
+        resample = self.args["totalseg_resample"]
+        resample = [resample] * 3 if isinstance(resample, (int, float)) else resample
+        img_in_orig = nib.load(image)
+        if len(img_in_orig.shape) > 3:
+            img_in_orig = nib.Nifti1Image(img_in_orig.get_fdata()[:, :, :, 0], img_in_orig.affine)
+        img_in = as_closest_canonical(nib.Nifti1Image(img_in_orig.get_fdata(), img_in_orig.affine))
+        img_rsp = change_spacing(img_in, resample, order=self.args.get("totalseg_resampling_order", 1),
+                                 dtype=np.int32, nr_cpus=1, use_gpu=self.device.startswith("cuda"))
+        if (self.args.get("totalseg_multimodel") and np.prod(img_rsp.shape) > TS_TRIPLE_SPLIT_VOXELS
+                and img_rsp.shape[2] > 200):
+            raise NotImplementedError("TotalSegmentator would split this image into 3 parts (nnunet.py:573).")
+        path = out_dir / "s01_0000.nii.gz"
+        nib.save(img_rsp, path)
+        geo = {"original_affine": img_in_orig.affine, "original_shape": img_in_orig.shape[:3],
+               "canonical_affine": img_in.affine, "canonical_shape": img_in.shape,
+               "resampled_affine": img_rsp.affine, "resampled_shape": img_rsp.shape, "resample": resample}
+        return path, geo
+
+    def preprocess(self, image: str) -> dict:
+        p = self.predictor
+        with tempfile.TemporaryDirectory(prefix="nnunet_tmp_") as tmp:
+            path, geo = Path(image), {}
+            if self.args.get("totalseg_resample") is not None:
+                path, geo = self.totalseg_input(image, Path(tmp))
+            pre = p.configuration_manager.preprocessor_class(verbose=False)
+            data, seg, props = pre.run_case([str(path)], None, p.plans_manager, p.configuration_manager,
+                                            p.dataset_json)
+        data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
+        return {"data": data, "seg": seg, "properties": props, "totalseg": geo}
+
+    def _stitch(self, maps: list[torch.Tensor], stride: list[int], data: torch.Tensor) -> torch.Tensor:
+        """nnU-Net's own sliding-window aggregation applied to the recorded maps -> [C, *data.shape[1:]]."""
+        p = self.predictor
+        net, lm = p.network, p.label_manager
+        p.network = _Replay(maps, stride)
+        p.label_manager = SimpleNamespace(num_segmentation_heads=maps[0].shape[1])
+        try:
+            return p.predict_sliding_window_return_logits(data)
+        finally:
+            p.network, p.label_manager = net, lm
+
+    @torch.inference_mode()
+    def features(self, prepared: dict) -> dict:
+        p, data = self.predictor, prepared["data"]
+        records: list[list[torch.Tensor]] = []
+        hook = p.network.encoder.register_forward_hook(
+            lambda _m, _i, out: records.append([out[k].detach().cpu() for k in self.stages]))
+        try:
+            logits = p.predict_logits_from_preprocessed_data(data)
+        finally:
+            hook.remove()
+
+        mask = torch.from_numpy(prepared["seg"][0] >= 0)
+        feats: dict[str, torch.Tensor] = {}
+        for j, k in enumerate(self.stages):
+            maps, stride = [r[j] for r in records], self.strides[k]
+            field = self._stitch(maps, stride, data)  # [C, *shape] on the results device, fp16
+            m = mask.to(field.device)
+            feats[f"fg_mean_stage{k}"] = (field * m).flatten(1).float().sum(1).cpu() / m.sum().clamp_min(1).cpu()
+            feats[f"stage{k}"] = F.avg_pool3d(field[None].float(), stride, stride, ceil_mode=True)[0].cpu() \
+                if len(stride) == 3 else F.avg_pool2d(field[None].float(), stride, stride, ceil_mode=True)[0].cpu()
+            feats[f"tiles_stage{k}"] = torch.cat(maps)
+            del field
+        if self.args.get("return_logits", True):
+            feats["logits"] = logits
+
+        cm, patch = p.configuration_manager, p.configuration_manager.patch_size
+        from acvl_utils.cropping_and_padding.padding import pad_nd_image
+        padded, revert = pad_nd_image(data, patch, "constant", {"value": 0}, True, None)
+        mirror = p.allowed_mirroring_axes if p.use_mirroring else None
+        combos = [c for i in range(len(mirror)) for c in itertools.combinations(mirror, i + 1)] if mirror else []
+        bottleneck = len(self.strides) - 1
+        meta = {
+            "totalseg": prepared["totalseg"],
+            "nnunet_properties": prepared["properties"],  # spacing (zyx), affines, crop bbox, shapes
+            "transpose_forward": p.plans_manager.transpose_forward,
+            "configuration": self.configuration, "trainer": p.trainer_name, "fold": self.args.get("fold", 0),
+            "spacing": cm.spacing, "preprocessed_shape": list(data.shape[1:]),
+            "nonzero_mask": mask,
+            "patch_size": patch, "tile_step_size": p.tile_step_size, "padded_shape": list(padded.shape[1:]),
+            "padding_revert": revert[1:],
+            "tile_slicers": [s[1:] for s in p._internal_get_sliding_window_slicers(padded.shape[1:])],
+            "mirror_axes": mirror, "calls_per_tile": 1 + len(combos), "mirror_combos": [[]] + [list(c) for c in combos],
+            "stage_strides": {k: self.strides[k] for k in self.stages},
+            "stitched_map": "nnU-Net Gaussian stitching on the preprocessed voxel grid, block mean over stride",
+            "autocast": "cuda fp16" if p.device.type == "cuda" else None,
+        }
+        canonical = f"stage{bottleneck}" if bottleneck in self.stages else f"stage{self.stages[-1]}"
+        return {"features": feats, "canonical": canonical, "meta": _plain(meta),
+                "derived": [f"fg_mean_stage{k}" for k in self.stages]}
 
 
-def build(name: str, model_args: dict) -> FoundationEncoder:
-    return NNUNetEncoder(**model_args)
+def build(cfg: dict, device: str) -> NNUNet:
+    return NNUNet(cfg, device)

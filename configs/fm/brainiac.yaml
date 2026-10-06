@@ -1,11 +1,10 @@
-# BrainIAC ViT-B/16 (AIM-KannLab/BrainIAC). Needs `pip install monai`.
+# BrainIAC ViT-B/16 foundation backbone (AIM-KannLab/BrainIAC). Other ckpts in the Dropbox are downstream heads.
 model: brainiac
-# Lightning ckpt from the repo's Dropbox (see its README), e.g. BrainIAC.ckpt; keys `state_dict: {backbone.*}`.
-checkpoint: null
-model_args:
-  img_size: 96
-  patch_size: 16
-  hidden_size: 768
-  mlp_dim: 3072
-  num_layers: 12
-  num_heads: 12
+env: ${SFC_FM_ENVS}/fm-brainiac
+repo: ${SFC_FM_REPOS}/BrainIAC
+commit: ba60f45
+checkpoint: ${SFC_FM_MODELS}/BrainIAC/BrainIAC.ckpt
+args:
+  preprocessed: false   # true: input already through the repo's N4 + temp_head registration + HD-BET pipeline
+  # template: <path>    # default: <repo>/src/preprocessing/atlases/temp_head.nii.gz (quickstart.ipynb cell 4)
+  # keep_dir: <dir>     # keep the preprocessed (template-space) NIfTI

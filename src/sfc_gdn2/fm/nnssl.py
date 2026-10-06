@@ -1,196 +1,252 @@
-"""OpenMind and nnFoundation checkpoints (MIC-DKFZ/nnssl, branch nnFoundation).
+"""OpenMind (ResEnc-L / Primus-M x MAE, MG, S3D, SimCLR, SimMIM, SwinUNETR, VF, VoCo) and nnFoundation (CNN = ResEnc-L,
+ViT = Primus-X) checkpoints of MIC-DKFZ/nnssl @ 94fe12d (branch nnFoundation), run through the official nnssl
+preprocessing and the official nnU-Net downstream-adaptation code (MIC-DKFZ/nnUNet @ 2edf346).
 
-Both are nnssl self-supervised pre-trainings, so they share one on-disk format
-(`nnssl/training/nnsslTrainer/AbstractTrainer.py::save_checkpoint`, `utilities/add_adaptation_plan.py`):
+Every step is the original code (`cfg["repo"]` = nnssl clone, `args.nnunet_repo`, `args.ssl3d_repo`):
 
-    checkpoint_final.pth = {"network_weights": state_dict of the whole pre-training network,
-                            "nnssl_adaptation_plan": serialized `AdaptationPlan`, "trainer_name", ...}
+- preprocess: the checkpoint's own embedded plan (`nnssl_adaptation_plan.pretrain_plan`, `Plan.from_dict`,
+  experiment_planning/experiment_planners/plan.py:139) -> its reader (SimpleITKIO, no reorientation,
+  imageio/simpleitk_reader_writer.py:33-46) -> `preprocess_case` (OpenMind `onemmiso`: crop to nonzero, z-score of
+  the whole crop with use_mask_for_norm=False, cubic resampling to 1 mm; preprocessing/preprocessors/
+  default_preprocessor.py:40-108) or `no_resample_preprocess_case` (nnFoundation `noresample`,
+  no_resampling_preprocessor.py:23-71); dispatch as default_preprocessor.py:223-229. We pass `masks=[]` instead of
+  None: crop_to_nonzero then returns its own nonzero mask resampled with the plan's mask resampler
+  (cropping/cropping.py:41-47, default_preprocessor.py:95-100); the image is bit-identical (asserted in the parity
+  script) and the mask is only used to centre the SSL3D crop and returned in `meta`.
+- network: the official downstream builders at the plan's `recommended_downstream_patchsize` (160^3 OpenMind,
+  192^3 nnFoundation): `PretrainedTrainer.build_network_architecture` for ResEnc-L, `PretrainedTrainer_Primusx`'s for
+  Primus (nnunetv2/training/nnUNetTrainer/pretraining/pretrainedTrainer.py:344-397, thrp_primusx_finetuning.py:
+  131-173), with `num_output_channels=1` (only the decoder head, which we never use, depends on it).
+- weights: `PretrainedTrainer.load_pretrained_weights` (pretrainedTrainer.py:151-342) with the plan's keys, exactly
+  as `nnUNetv2_preprocess_like_nnssl` + `nnUNetv2_train_pretrained` pass them (like_nnssl.py:131-145, pretrainedTrainer
+  .py:106-117). It handles the `encoder.`-prefixed Primus-M SimCLR/VoCo/SwinUNETR checkpoints and trilinearly
+  interpolates the 64^3-trained SimCLR/VoCo pos-embed to 20^3 tokens (l.229-233, 304-313). Two fixes, both forced:
+  (a) it calls `torch.load(path, weights_only=True)` without map_location (l.204) and the OpenMind files hold CUDA
+  tensors, so `torch.load` gets map_location="cpu" during the call (network moved to `device` after);
+  (b) the plan EMBEDDED in PrimusM-SimCLR / PrimusM-VoCo states the pre-training patch [192,192,64] / [256,256,64]
+  (the trainer's sampling patch) while their pos-embed has 512 = (64/8)^3 tokens; like_nnssl.py:139 forwards that
+  value and the resize then raises (load_weights_utils.py:212; SSL3D eva_mae_openneuro.py:249-264 would too). The
+  `adaptation_plan.json` published next to each checkpoint (HF) states [64,64,64]; the pre-training patch is taken
+  from it when present (the two plans differ in nothing else for all 16 checkpoints, checked in the parity script).
+- inference: nnU-Net's sliding window (`nnUNetPredictor` with tile_step_size=0.5, Gaussian, `pad_nd_image` with 0,
+  `_internal_get_sliding_window_slicers`, fp16 autocast on CUDA / fp32 on CPU; inference/predict_from_raw_data.py:
+  537-571, 666-711). No mirroring TTA: flipped feature maps are not channel-equivariant, the flip-averaging is only
+  defined for logits. Encoder outputs: ResEnc-L `network.encoder(x)` = all 6 stages (strides 1..32); Primus the
+  `eva` output (final LayerNorm'ed tokens, captured with a forward hook during the original `Primus.forward`,
+  dynamic_network_architectures primus.py:163-185) reshaped `b (w h d) c -> b c w h d` as at primus.py:185.
+- volume embedding: the OpenMind linear-probe definition of constantinulrich/SSL3D_classification @ 848e22e (the
+  classification framework linked from nnssl documentation/openmind.md): frozen encoder, ONE crop of the
+  recommended size centred on the mask (`get_mask_center`, `crop_center_with_padding_np`, datasets/
+  preprocess_3D_data/crop_to_mask.py:18-59), mean over space of the last stage (models/resenc.py:62) / over all
+  tokens (models/classification_head.py:37; its `x[:, 1:]` drops a token only because primus.yaml sets
+  cls_token_available although EvaEncoder has none). SSL3D's own HD-BET/1 mm/brain-mask z-score preprocessing
+  (template_brain_preprocessing.py:45-107) is NOT used: the input is nnssl's preprocessing above.
 
-`network_weights` holds encoder *and* decoder. We keep only the encoder:
-- CNN (ResEnc-L, `ResidualEncoderUNet`): keys `encoder.stem.*`, `encoder.stages.*`
-  (plan: key_to_stem="encoder.stem", key_to_encoder="encoder.stages");
-- ViT (Primus / EvaMAE): keys `down_projection.*` and `eva.*`
-  (plan: key_to_stem="down_projection", key_to_encoder="eva"); `up_projection`, `decoder`,
-  `mask_token` are the MAE decoder and are ignored.
-
-The architecture is rebuilt from the checkpoint's own `nnssl_adaptation_plan` when present (so any
-OpenMind / nnFoundation release loads without further configuration); `model_args` only
-decides the architecture of the random-init baseline and of plan-less checkpoints.
-
-Needs `dynamic-network-architectures>=0.4.4,<0.5` (Apache-2.0) and its deps (timm, einops); the
-`nnssl` package itself is NOT needed (it requires python>=3.12) and its code is not vendored.
-Weights: OpenMind `AnonRes/ResEncL-OpenMind-MAE` etc. and `MIC-DKFZ/nnFoundationCNN|ViT` on
-Hugging Face (nnssl is CC-BY-SA-4.0; the checkpoints carry their own model cards).
-
-Features: deepest encoder stage (`stage: -1`; stride 32 for ResEnc-L -> 6^3 at 192^3, 5^3 at 160^3)
-or, for Primus, the token grid (stride 8). Our isotropic cube is resampled to `input_size`.
+Outputs (`features`):
+  crop_last [C,h,w,d], crop_gap_last [C]       -> SSL3D linear-probe input; `canonical` = crop_gap_last for every
+                                                  checkpoint. SSL3D defines it for OpenMind; nnFoundation has no
+                                                  official volume-level probe yet (model card: "Classification: TBA"),
+                                                  the same definition is applied at its recommended 192^3 patch.
+  tiles_<lvl> [T,C,h,w,d] (args.keep_tiles)    -> raw sliding-window encoder outputs (nnU-Net procedure).
+  stitched_<lvl> [C,H,W,D], gap_last [C]       -> derived (ours): Gaussian-weighted stitching of tile maps on the
+                                                  padded volume's feature grid (ceil(size/stride)), tile voxel
+                                                  offsets mapped linearly onto [0, grid - tile] and rounded (so the
+                                                  last tile ends on the last cell); mean over tiles of the per-tile GAP.
+  <lvl> = stage{i} (ResEnc-L, args.stages, default [3, 4, 5] = strides 8/16/32) or tokens (Primus, stride 8).
 """
 from __future__ import annotations
 
+import contextlib
 import json
-import pydoc
+from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import torch
-from torch import nn
+from einops import rearrange
 
-from .base import FoundationEncoder, load_checked, pick, read_checkpoint, require, strip_prefix
-
-# nnssl/architectures/architecture_registry.py::get_res_enc_l (the "ResEncL" preset)
-_RESENC_L = {
-    "n_stages": 6, "features_per_stage": [32, 64, 128, 256, 320, 320],
-    "kernel_sizes": [[3, 3, 3]] * 6, "strides": [[1, 1, 1]] + [[2, 2, 2]] * 5,
-    "n_blocks_per_stage": [1, 3, 4, 6, 6, 6], "n_conv_per_stage_decoder": [1] * 5, "conv_bias": True,
-    "norm_op_kwargs": {"eps": 1e-5, "affine": True}, "nonlin_kwargs": {"inplace": True},
-}
-# dynamic_network_architectures.architectures.primus._PRIMUS_CONFIGS (+ nnFoundationViT = "X")
-_PRIMUS = {"S": (396, 12, 6), "B": (792, 12, 12), "M": (864, 16, 12), "L": (1056, 24, 16),
-           "X": (1056, 40, 16)}  # (embed_dim, depth, heads); X: nnFoundationViT trainer
-_RESENC_NAMES = ("ResEncL", "NoSkipResEncL", "ResidualEncoderUNet")
+from .base import Image, Wrapper, add_to_path
 
 
-def _resenc_encoder(kw: dict, in_ch: int) -> nn.Module:
-    unet = require("dynamic_network_architectures.architectures.unet", "'dynamic-network-architectures>=0.4.4,<0.5'",
-                   "nnssl ResEnc checkpoints")
-    kw = dict(kw)
-    kw.setdefault("conv_op", nn.Conv3d)
-    kw.setdefault("norm_op", nn.InstanceNorm3d)
-    kw.setdefault("nonlin", nn.LeakyReLU)
-    for k in ("conv_op", "norm_op", "nonlin", "dropout_op"):  # plans store these as dotted names
-        if isinstance(kw.get(k), str):
-            kw[k] = pydoc.locate(kw[k])
-    return unet.ResidualEncoderUNet(input_channels=in_ch, num_classes=1, deep_supervision=False, **kw).encoder
+@contextlib.contextmanager
+def _torch_load_on_cpu():
+    """pretrainedTrainer.py:204 loads without map_location; the OpenMind checkpoints store CUDA tensors."""
+    orig = torch.load
+
+    def load(*a, **kw):
+        kw.setdefault("map_location", "cpu")
+        return orig(*a, **kw)
+
+    torch.load = load
+    try:
+        yield
+    finally:
+        torch.load = orig
 
 
-class PrimusEncoder(nn.Module):
-    """`down_projection` + `eva` of Primus / nnssl EvaMAE with identical state_dict keys, no decoder."""
-
-    def __init__(self, in_ch: int, embed_dim: int, depth: int, heads: int, patch_embed_size, input_shape,
-                 init_values=0.1, scale_attn_inner=True):
-        super().__init__()
-        require("timm", "'timm<1.0.23'", "Primus / EVA")
-        from dynamic_network_architectures.building_blocks.eva import Eva
-        from dynamic_network_architectures.building_blocks.patch_encode_decode import PatchEmbed
-        self.down_projection = PatchEmbed(tuple(patch_embed_size), in_ch, embed_dim)
-        self.eva = Eva(embed_dim=embed_dim, depth=depth, num_heads=heads, init_values=init_values,
-                       scale_attn_inner=scale_attn_inner,
-                       ref_feat_shape=tuple(i // p for i, p in zip(input_shape, patch_embed_size)))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.down_projection(x)                       # [B,C,w,h,d]
-        b, c, *g = x.shape
-        tokens, _ = self.eva(x.flatten(2).transpose(1, 2))  # no patch drop at inference -> keep_indices None
-        return tokens.transpose(1, 2).reshape(b, c, *g)
+def _plain(x):
+    """numpy scalars / arrays -> python types, so the result loads with torch.load(weights_only=True)."""
+    if isinstance(x, dict):
+        return {k: _plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(_plain(v) for v in x)
+    return x.tolist() if isinstance(x, (np.generic, np.ndarray)) else x
 
 
-def _make(spec: dict) -> nn.Module:
-    if spec["kind"] == "resenc":
-        return _resenc_encoder(spec["kwargs"], spec["in_ch"])
-    return PrimusEncoder(spec["in_ch"], **spec["kwargs"])
+class NnsslWrapper(Wrapper):
+    """args: nnunet_repo, ssl3d_repo, stages (ResEnc levels kept, default [3,4,5]), keep_tiles (default true)."""
+
+    def __init__(self, cfg: dict, device: str):
+        super().__init__(cfg, device)
+        self.name = cfg["model"]
+        add_to_path(Path(cfg["repo"]) / "src", self.args["nnunet_repo"], self.args["ssl3d_repo"])
+        from nnssl.experiment_planning.experiment_planners.plan import Plan
+        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+        from nnunetv2.training.nnUNetTrainer.pretraining.pretrainedTrainer import PretrainedTrainer
+        from nnunetv2.training.nnUNetTrainer.pretraining.thrp_primusx_finetuning import (
+            PretrainedTrainer_Primusx,
+        )
+        from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager
+
+        with _torch_load_on_cpu():
+            ckpt = torch.load(cfg["checkpoint"], weights_only=True)
+        ap = ckpt["nnssl_adaptation_plan"]
+        self.plan = Plan.from_dict(deepcopy(ap["pretrain_plan"]))
+        (self.config_name, self.config_plan), = self.plan.configurations.items()
+        self.patch = list(ap["recommended_downstream_patchsize"])
+        shipped = Path(cfg["checkpoint"]).with_name("adaptation_plan.json")
+        self.pt_patch_source = str(shipped) if shipped.exists() else "checkpoint['nnssl_adaptation_plan']"
+        src_plan = json.loads(shipped.read_text())["pretrain_plan"] if shipped.exists() else ap["pretrain_plan"]
+        self.pt_patch = list(next(iter(src_plan["configurations"].values()))["patch_size"])
+        arch = ap["architecture_plans"]
+        self.arch = arch["arch_class_name"]
+        self.is_primus = self.arch.startswith("Primus")
+        trainer = PretrainedTrainer_Primusx if self.is_primus else PretrainedTrainer
+        # like_nnssl.py:124-126,169-172 -> ConfigurationManager.network_arch_* -> pretrainedTrainer.py:88-96
+        self.arch_details = {"network_class_name": self.arch, "arch_kwargs": arch["arch_kwargs"],
+                             "_kw_requires_import": arch["arch_kwargs_requiring_import"]}
+        net = trainer.build_network_architecture(
+            architecture_class_name=self.arch, arch_init_kwargs=deepcopy(arch["arch_kwargs"]),
+            arch_init_kwargs_req_import=arch["arch_kwargs_requiring_import"], input_patch_size=self.patch,
+            num_input_channels=1, num_output_channels=1, enable_deep_supervision=False)
+        with _torch_load_on_cpu():
+            net, _ = trainer.load_pretrained_weights(
+                net, pretrained_weights_path=cfg["checkpoint"], pt_input_channels=ap["pretrain_num_input_channels"],
+                downstream_input_channels=1, pt_input_patchsize=self.pt_patch,
+                downstream_input_patchsize=self.patch, pt_key_to_encoder=ap["key_to_encoder"],
+                pt_key_to_stem=ap["key_to_stem"], pt_keys_to_in_proj=tuple(ap["keys_to_in_proj"]),
+                pt_key_to_lpe=ap["key_to_lpe"])
+        self.network = net.to(device).eval()
+        self.adaptation_plan, self.trainer_name = ap, ckpt.get("trainer_name")
+        self.predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=False,
+                                         device=torch.device(device), allow_tqdm=False)
+        self.predictor.configuration_manager = ConfigurationManager(
+            {"patch_size": self.patch, "architecture": self.arch_details})
+        self.stages = [int(s) for s in self.args.get("stages", [3, 4, 5])]
+        self.keep_tiles = bool(self.args.get("keep_tiles", True))
+        if self.is_primus:
+            self._tokens = None
+            self.network.eva.register_forward_hook(lambda m, i, o: setattr(self, "_tokens", o[0]))
+
+    # ------------------------------------------------------------------ preprocessing (nnssl)
+    def preprocess(self, image: Image) -> dict:
+        from nnssl.preprocessing.preprocessors.default_preprocessor import preprocess_case
+        from nnssl.preprocessing.preprocessors.no_resampling_preprocessor import no_resample_preprocess_case
+
+        path = image if isinstance(image, str) else image["image"]
+        data, props = self.plan.image_reader_writer_class()().read_images([path])
+        if self.config_plan.spacing_style == "noresample":
+            fn = no_resample_preprocess_case
+        elif self.config_plan.spacing_style in ("onemmiso", "median"):
+            fn = preprocess_case
+        else:
+            raise NotImplementedError(self.config_plan.spacing_style)
+        data, masks = fn(data, [], props, self.plan, self.config_plan, False)
+        return {"data": data, "nonzero": masks[0][0] >= 0, "props": props}
+
+    # ------------------------------------------------------------------ network
+    def _encode(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Original forward on one [1,1,*patch] input -> {level: [C,h,w,d]}."""
+        if self.is_primus:
+            self.network(x)
+            w, h, d = (s // p for s, p in zip(x.shape[2:], self.network.down_projection.proj.kernel_size))
+            return {"tokens": rearrange(self._tokens, "b (w h d) c -> b c w h d", w=w, h=h, d=d)[0]}
+        skips = self.network.encoder(x)
+        return {f"stage{i}": skips[i][0] for i in sorted({*self.stages, len(skips) - 1})}
+
+    @torch.inference_mode()
+    def features(self, prepared: dict) -> dict:
+        from acvl_utils.cropping_and_padding.padding import pad_nd_image
+        from datasets.preprocess_3D_data.crop_to_mask import crop_center_with_padding_np, get_mask_center
+        from nnunetv2.inference.sliding_window_prediction import compute_gaussian
+        from nnunetv2.utilities.helpers import dummy_context
+
+        dev = torch.device(self.device)
+        amp = torch.autocast(dev.type, enabled=True) if dev.type == "cuda" else dummy_context()
+        vol = torch.from_numpy(prepared["data"])
+        # predict_from_raw_data.py:690-694
+        padded, revert = pad_nd_image(vol, self.patch, "constant", {"value": 0}, True, None)
+        slicers = self.predictor._internal_get_sliding_window_slicers(padded.shape[1:])
+        tiles: dict[str, list[torch.Tensor]] = {}
+        with amp:
+            for sl in slicers:
+                for k, v in self._encode(padded[sl][None].to(dev)).items():
+                    tiles.setdefault(k, []).append(v.float().cpu())
+            center = get_mask_center(prepared["nonzero"].astype(np.uint8))
+            crop = crop_center_with_padding_np(prepared["data"][0], center, tuple(self.patch))
+            crop_out = self._encode(torch.from_numpy(crop)[None, None].to(dev))
+        last = "tokens" if self.is_primus else f"stage{max(int(k[5:]) for k in tiles)}"
+
+        feats, strides = {}, {}
+        for k, ts in tiles.items():
+            t = torch.stack(ts)                                         # [T,C,h,w,d]
+            stride = [p // f for p, f in zip(self.patch, t.shape[2:])]
+            strides[k] = stride
+            grid = [-(-s // st) for s, st in zip(padded.shape[1:], stride)]
+            acc, wsum = torch.zeros(t.shape[1], *grid), torch.zeros(grid)
+            g = compute_gaussian(tuple(t.shape[2:]), sigma_scale=1. / 8, value_scaling_factor=10,
+                                 dtype=torch.float32, device=torch.device("cpu"))
+            for ti, sl in zip(t, slicers):
+                o = [round(s.start * (n - f) / (v - p)) if v > p else 0
+                     for s, n, f, v, p in zip(sl[1:], grid, t.shape[2:], padded.shape[1:], self.patch)]
+                win = tuple(slice(a, a + f) for a, f in zip(o, t.shape[2:]))
+                acc[(slice(None), *win)] += ti * g
+                wsum[win] += g
+            feats[f"stitched_{k}"] = acc / wsum
+            if self.keep_tiles or k == last:
+                feats[f"tiles_{k}"] = t
+        feats["gap_last"] = feats[f"tiles_{last}"].mean((2, 3, 4)).mean(0)
+        feats["crop_last"] = crop_out[last].float().cpu()
+        feats["crop_gap_last"] = feats["crop_last"].mean((1, 2, 3))
+
+        derived = [k for k in feats if k.startswith("stitched_")] + ["gap_last"]
+        canonical = "crop_gap_last"
+        props = prepared["props"]
+        meta = {
+            "arch": self.arch, "trainer": self.trainer_name,
+            "plan_config": self.config_name, "spacing_style": self.config_plan.spacing_style,
+            "target_spacing": self.config_plan.spacing, "transpose_forward": self.plan.transpose_forward,
+            "normalization": self.config_plan.normalization_schemes,
+            "use_mask_for_norm": self.config_plan.use_mask_for_norm,
+            # SimpleITK array axes (z, y, x); spacing / origin / direction in that order as nnssl stores them
+            "sitk_stuff": props["sitk_stuff"], "spacing": props["spacing"],
+            "shape_before_cropping": tuple(props["shape_before_cropping"]),
+            "bbox_used_for_cropping": props["bbox_used_for_cropping"],
+            "shape_after_cropping_and_before_resampling": tuple(props["shape_after_cropping_and_before_resampling"]),
+            "preprocessed_shape": tuple(prepared["data"].shape[1:]),
+            "pretrain_patch_size": self.pt_patch, "pretrain_patch_source": self.pt_patch_source,
+            "patch_size": self.patch, "tile_step_size": self.predictor.tile_step_size,
+            "padded_shape": tuple(padded.shape[1:]), "revert_padding": [(s.start, s.stop) for s in revert[1:]],
+            "tile_starts": [tuple(s.start for s in sl[1:]) for sl in slicers], "strides": strides,
+            "crop_center": tuple(int(c) for c in center),
+            "precision": "fp16-autocast" if dev.type == "cuda" else "fp32",
+            "canonical_definition": "SSL3D_classification linear probe: GAP of the last encoder stage / all tokens "
+                                    "on one recommended-size crop centred on the nonzero mask"
+                                    + ("" if self.name == "openmind" else " (applied by analogy: no official "
+                                       "nnFoundation probe)"),
+        }
+        return {"features": feats, "canonical": canonical, "meta": _plain(meta), "derived": derived}
 
 
-def _spec_from_arch(arch: str, in_ch: int, input_size: int, arch_kwargs: dict | None) -> dict:
-    if arch in ("ResEncL", "NoSkipResEncL"):  # NoSkip only changes the decoder
-        return {"kind": "resenc", "in_ch": in_ch, "kwargs": _RESENC_L}
-    if arch == "ResidualEncoderUNet":
-        if not arch_kwargs:
-            raise ValueError("arch ResidualEncoderUNet needs model_args.arch_kwargs (nnssl DynamicArchitecturePlans).")
-        return {"kind": "resenc", "in_ch": in_ch, "kwargs": arch_kwargs}
-    if arch.startswith("Primus"):
-        scale = arch.removeprefix("Primus")
-        if arch == "PrimusX" and arch_kwargs:  # EvaMAE-style dict from the nnFoundationViT trainer / plan
-            a = arch_kwargs
-            return {"kind": "primus", "in_ch": in_ch, "kwargs": {
-                "embed_dim": a["embed_dim"], "depth": a["encoder_eva_depth"], "heads": a["encoder_eva_numheads"],
-                "patch_embed_size": a["patch_embed_size"], "input_shape": a["input_shape"],
-                "init_values": a.get("init_values"), "scale_attn_inner": a.get("scale_attn_inner", False)}}
-        if scale not in _PRIMUS:
-            raise ValueError(f"Unknown Primus scale {arch!r}; expected one of {sorted(_PRIMUS)}.")
-        d, depth, heads = _PRIMUS[scale]
-        return {"kind": "primus", "in_ch": in_ch, "kwargs": {
-            "embed_dim": d, "depth": depth, "heads": heads, "patch_embed_size": (8, 8, 8),
-            "input_shape": (input_size,) * 3}}
-    raise ValueError(f"Unsupported nnssl architecture {arch!r}; supported: ResEncL, NoSkipResEncL, "
-                     f"ResidualEncoderUNet, Primus[S|B|M|L|X].")
-
-
-def spec_from_plan(plan: dict) -> tuple[dict, int | None]:
-    """Serialized `nnssl_adaptation_plan` -> (encoder spec, pre-training patch side or None)."""
-    ap = plan["architecture_plans"]
-    cfgs = plan.get("pretrain_plan", {}).get("configurations", {})
-    patch = next((c.get("patch_size") for c in cfgs.values() if c.get("patch_size")), None) \
-        or plan.get("recommended_downstream_patchsize")
-    side = int(patch[0]) if patch and len(set(patch)) == 1 else None
-    return _spec_from_arch(ap["arch_class_name"], plan.get("pretrain_num_input_channels", 1), side or 160,
-                           ap.get("arch_kwargs")), side
-
-
-class NnsslEncoder(FoundationEncoder):
-    """normalize: `zscore_all` (nnU-Net ZScoreNormalization over the whole volume, as in the nnssl plans
-    with use_mask_for_norm=False; our zero padding is part of the volume) or `zscore_fg`."""
-
-    def __init__(self, name: str, arch: str, input_size: int | None, default_size: int, normalize: str,
-                 stage: int, arch_kwargs: dict | None, use_plan: bool):
-        super().__init__()
-        self.name, self.stage, self.norm_mode, self.use_plan = name, stage, normalize, use_plan
-        self.input_size, self._size_fixed = input_size or default_size, input_size is not None
-        self.arch, self.arch_kwargs = arch, arch_kwargs
-        self.spec = _spec_from_arch(arch, 1, self.input_size, arch_kwargs)
-        self.net = _make(self.spec)
-        self.eval().requires_grad_(False)
-
-    def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        if self.norm_mode == "zscore_fg":
-            return super().normalize(x)
-        m, s = x.mean((1, 2, 3, 4), keepdim=True), x.std((1, 2, 3, 4), keepdim=True).clamp_min(1e-6)
-        return (x - m) / s
-
-    def features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        out = self.net(x)
-        return {"map": out[self.stage] if isinstance(out, list) else out}
-
-    def load_checkpoint(self, path: str | Path) -> dict:
-        ckpt = read_checkpoint(path)
-        sd = pick(ckpt, ("network_weights", "state_dict"))
-        for _ in range(2):  # DDP `module.`, torch.compile `_orig_mod.`
-            sd = strip_prefix(sd, "module.", "_orig_mod.")
-        plan = ckpt.get("nnssl_adaptation_plan") if isinstance(ckpt, dict) else None
-        if plan and self.use_plan:
-            spec, side = spec_from_plan(plan)
-            if spec["in_ch"] != 1:
-                raise NotImplementedError(f"Checkpoint was pre-trained on {spec['in_ch']} channels.")
-            if json.dumps(spec, sort_keys=True, default=str) != json.dumps(self.spec, sort_keys=True, default=str):
-                device = next(self.net.parameters()).device
-                self.spec, self.net = spec, _make(spec).to(device).eval().requires_grad_(False)
-            if side and not self._size_fixed:
-                self.input_size = side
-        root = ("encoder.",) if self.spec["kind"] == "resenc" else ("down_projection.", "eva.")
-        enc = {k.removeprefix("encoder.") if root == ("encoder.",) else k: v
-               for k, v in sd.items() if k.startswith(root)}
-        if not enc:
-            raise RuntimeError(f"{path}: no encoder keys found (got e.g. {list(sd)[:4]}).")
-        dropped = [k for k in sd if not k.startswith(root)]
-        info = load_checked(self.net, enc, what=f"{self.name} checkpoint {path}")
-        return {**info, "ignored": dropped, "arch": self.spec["kind"], "input_size": self.input_size,
-                "trainer": ckpt.get("trainer_name") if isinstance(ckpt, dict) else None}
-
-
-# nnFoundationViT_trainer: BaseEvaMAETrainer_BS96_192ps_2500ep_40_16_8_16_1056_lr2e3
-_NNFOUNDATION_VIT = {"embed_dim": 1056, "encoder_eva_depth": 40, "encoder_eva_numheads": 16,
-                     "patch_embed_size": (8, 8, 8), "input_shape": (192, 192, 192), "init_values": 0.1,
-                     "scale_attn_inner": True}
-
-
-def build(name: str, a: dict) -> NnsslEncoder:
-    """model_args: arch (ResEncL | NoSkipResEncL | ResidualEncoderUNet | Primus{S,B,M,L,X}),
-    variant (nnfoundation only: cnn | vit), input_size, normalize (zscore_all | zscore_fg), stage (-1),
-    arch_kwargs, use_plan (default true: rebuild the architecture from the checkpoint's plan)."""
-    if name == "nnfoundation":  # nnFoundationCNN = ResEnc-L, nnFoundationViT = Primus-X; both 192^3
-        arch, size = a.get("arch", "PrimusX" if a.get("variant", "cnn") == "vit" else "ResEncL"), 192
-        kw = a.get("arch_kwargs", _NNFOUNDATION_VIT if arch == "PrimusX" else None)
-    else:                       # openmind: ResEnc-L (or Primus-M), pre-trained on 160^3 patches
-        arch, size, kw = a.get("arch", "ResEncL"), 160, a.get("arch_kwargs")
-    if arch == "PrimusX" and kw:
-        kw = {**kw, "input_shape": (a.get("input_size") or size,) * 3}
-    return NnsslEncoder(name, arch, a.get("input_size"), size, a.get("normalize", "zscore_all"),
-                        int(a.get("stage", -1)), kw, bool(a.get("use_plan", True)))
+def build(cfg: dict, device: str) -> NnsslWrapper:
+    return NnsslWrapper(cfg, device)

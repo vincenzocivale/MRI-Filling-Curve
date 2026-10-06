@@ -1,11 +1,13 @@
-# FOMO baseline (AMAES-pre-trained on FOMO60K / FOMO300K; fomo25/baseline-codebase, same encoders and
-# checkpoint layout as AMAES: bare state_dict or Lightning .ckpt with `model.encoder.*` keys).
-# Checkpoint: https://huggingface.co/FOMO25/baseline_pretrained_models (FOMO25 baseline); `arch` must match the file.
-# The repos document no separate FOMO26 architecture: set `arch` to the one the checkpoint was trained with.
+# FOMO26 challenge baseline: ResEnc-U-Net-B, AMAES-pretrained on FOMO300K (FOMO26BrainAI/fomo26-baseline
+# baselines/resenc_unet_b.ckpt, HF sha 84347c8; identical tensors to FOMO-MRI/AMAES_resenc_b_fomo300k).
+# Run with the official FOMO26 embedding pipeline fomo26/fomo-lp pipeline/embed_all.py on asparagus @ 16e00d7
+# (editable in the env) + gardening_tools 0.3.5. Canonical: 320-d `embedding`. See src/sfc_gdn2/fm/asparagus.py.
 model: fomo26
-checkpoint: null
-model_args:
-  arch: unet_b             # unet_b | unet_xl | mednext_l3 | mednext_m3
-  input_size: 96           # FOMO baseline pre-training patch size
-  normalize: zscore_fg     # FOMO preprocessing: per-volume z-score; or unit
-  stage: -1
+env: ${SFC_FM_ENVS}/fm-asparagus
+repo: ${SFC_FM_REPOS}/fomo26-fomo-lp
+commit: f915d5a
+checkpoint: ${SFC_FM_MODELS}/FOMO26-baseline/baselines/resenc_unet_b.ckpt
+args:
+  encoder: official     # official = embed_all's CLSREG encoder (MaxPool shortcuts); pretrain = pretraining encoder (AvgPool)
+  reorient_ras: true    # reproduces the organisers' RAS delivery of the challenge data (only if the file is not RAS)
+  target_size: 160      # embed_all default

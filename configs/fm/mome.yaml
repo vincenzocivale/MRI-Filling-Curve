@@ -1,17 +1,17 @@
-# MoME (ZhangxinruBIT/MoME, MICCAI'24): 5 modality-expert nnU-Nets (T1, T1ce, T2, FLAIR, DWI) + an
-# aggregator nnU-Net. Features = the aggregator's deepest encoder stage. Pure torch, no extra dependency.
+# MoME (ZhangxinruBIT/MoME, MICCAI'24): 5 modality-expert nnU-Nets + gating aggregator, nnU-Net v2.2 fork
+# MoME_foundation. One image of any modality. Wrapper: src/sfc_gdn2/fm/mome.py.
 model: mome
-# Released model: HF ZhangxinruBIT/MoME -> MoME_foundation/MoME_CHECKPOINT. Point at the aggregator file
-# (`checkpoint_best.pth`); the experts are read from the same folder as checkpoint_best1..5.pth (the repo's
-# own naming rule). null -> random-init encoders only (the `init` baseline).
-checkpoint: null
-model_args:
-  plans_json: null          # nnU-Net plans.json of the release (reads architecture); else `arch` / defaults
-  configuration: 3d_fullres
-  arch:                     # used when plans_json is null (nnU-Net v2 3d_fullres defaults)
-    features_per_stage: [32, 64, 128, 256, 320, 320]
-    kernel_sizes: [3, 3, 3, 3, 3, 3]
-    strides: [1, 2, 2, 2, 2, 2]
-    n_conv_per_stage: [2, 2, 2, 2, 2, 2]
-  input_size: 128           # cube resampled to input_size^3 (multiple of 32)
-  expert_checkpoints: null  # optional explicit list of 5 expert files (e.g. HF Pretrained_Experts)
+env: ${SFC_FM_ENVS}/fm-mome
+repo: ${SFC_FM_REPOS}/MoME
+commit: 337a0ab
+# HF ZhangxinruBIT/MoME MoME_foundation/MoME_CHECKPOINT: aggregator; checkpoint_best1..5.pth (experts),
+# nnUNetPlans.json and dataset.json are read from the same folder.
+checkpoint: ${SFC_FM_MODELS}/MoME/MoME_foundation/MoME_CHECKPOINT/checkpoint_best.pth
+args:
+  prepro: true          # Codes_prepro (ANTs to MNI152, template skull mask, crop); false = input already in that space
+  skull: true           # input still has the skull (Codes_prepro `-ss`); false for skull-stripped inputs
+  ants_seed: 1          # ANTS_RANDOM_SEED (with 1 ITK thread) for deterministic registration
+  tile_step_size: 0.5   # nnUNetv2_predict default
+  use_mirroring: true   # 8x mirroring TTA as nnUNetv2_predict (no --disable_tta)
+  skip_stages: [4, 5]   # aggregator encoder stages kept per tile x mirror pass (5 = bottleneck, always kept)
+  dense: true           # stitched full-resolution aggregator decoder features (32 ch)

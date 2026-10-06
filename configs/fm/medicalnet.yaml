@@ -1,8 +1,0 @@
-# MedicalNet 3D ResNet (Tencent/MedicalNet); pure torch, no extra deps.
-model: medicalnet
-# resnet_<depth>*.pth from the repo's release (e.g. resnet_50_23dataset.pth): {"state_dict": {"module.*"}}.
-checkpoint: null
-model_args:
-  depth: 50              # 10 | 18 | 34 | 50 | 101 | 152 | 200 (must match the checkpoint)
-  shortcut_type: null    # null -> A for depth <= 34, B otherwise (as released)
-  input_size: 128        # cube side fed to the network; feature map = input_size / 8

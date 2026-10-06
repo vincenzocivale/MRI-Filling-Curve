@@ -1,170 +1,152 @@
-"""BrainMVP (shaohao011/BrainMVP): UniFormer-small 3D encoder pretrained on 16k multi-parametric MRI.
+"""BrainMVP (shaohao011/BrainMVP, CVPR 2025): multi-modal MRI pretraining, UniFormer-S or 3D U-Net encoder.
 
-The UniFormer is re-implemented here in pure torch with the state_dict keys of the repo
-(`models/uniformer_blocks.py` / `Downstream/model/uniformer.py`), so the released checkpoint loads
-strictly without the repo, timm or MONAI. Output: stage-4 map `[B, 512, L/16, L/16, L/16]`
-(after the final BatchNorm, as `UniFormer.forward` returns it), in canonical (x, y, z) order.
+Everything below is the original repo's code, imported from `cfg["repo"]` (refs @ a466bb2):
 
-Checkpoint (Downstream/train_script.py:67-80, main.py:141): `{"state_dict": ...}` of the pretraining
-`RecModel`: `encoder.uniformer.<k>` (DDP: `module.` in front), plus `decoder.*` and `rep_template`
-(the learned modality templates). The repo's own transfer code strips `module.` and `uniformer.`;
-we do the same and keep `encoder.*` -> our keys. Decoder / templates are ignored.
+- Network = the pretraining `RecModel` the released checkpoints were saved from (`main.py:217-222`):
+  `arch: uniformer` -> `models/Uniformer.py:RecModel` (encoder `uniformer_small(in_chans=1)`,
+  `models/uniformer_blocks.py:336`); `arch: unet` -> `models/Unet.py:RecModel` (residual GroupNorm U-Net,
+  `init_channels=32`, `Unet.py:134,155-177`). Constructor args are the pretraining ones
+  (`main.py:23,25`, `do_pretrain.sh`: 8 templates `flair t1 t1c t2 mra pd dwi adc`, template 240x240x155);
+  they only shape `rep_template` / the decoder, which are loaded but unused.
+- Checkpoint: `{"state_dict": module.*}` (DDP), loaded strictly after the repo's own `module.` strip
+  (`main.py:266-270`, there with `strict=False` only because `rep_template` is deleted for resume).
+- Input: ONE modality, one channel. Pretraining feeds a single (masked) modality per pass
+  (`main.py:23`, `utils/ops.py:70-97`); the 4-channel fine-tuning model drops the pretrained stem
+  (`Downstream/train_script.py:75-78`), so the pretrained-stem encoder is the 1-channel one.
+- Preprocessing, `mode: downstream` (default): the repo's validation/test transform
+  `Downstream/dataset/transforms.py:41-49` (`custom_transform(mode="val")`, imported): LoadImaged,
+  ScaleIntensityRangePercentilesd(5, 95 -> 0, 1, channel_wise, no clip; on the raw grid), Orientationd(RAS),
+  Spacingd(1 mm, bilinear), CropForegroundd(margin=1). Label-only steps are dropped and the image-only
+  steps get `allow_missing_keys`. One addition: `EnsureChannelFirstd` after LoadImaged -- the repo always
+  loads a LIST of >=2 modality files, which MONAI stacks into a channel axis; a single file gets none.
+  `mode: pretrain`: the pretraining transform `utils/data_utils.py:104-113` (inline in `get_loader`, so
+  restated here with the repo's `CenterCropForegroundd`, `utils/custom_trans.py:95`): LoadImaged,
+  EnsureChannelFirstd, RAS, 1 mm bilinear, CenterCropForeground, percentiles 5/95 clip=True,
+  CenterCropForeground (the random 96^3 crop / pad of training is replaced by the sliding window).
+- Inference: the repo's procedure `Downstream/train_utils.py:103-113`: sliding window, roi 96^3
+  (`patch_shape`), overlap 0.5, sw_batch_size 1, constant blending, under `torch.cuda.amp.autocast()`.
+  The repo's own `Downstream/inference_util.py` assumes output size == window size, so for the
+  multi-resolution feature maps MONAI's `sliding_window_inference` (which rescales outputs) is used.
+  Caveat (MONAI): the last window of an axis starts at `size - 96`, not on the 16-voxel grid; its outputs
+  are written at floor(start / stride).
 
-Modalities: pretraining feeds ONE modality at a time to a 1-channel encoder (`--in_channels 1`,
-main.py:23; each step reconstructs `x[:, index]`), so the released weights take a single channel and a
-T1w volume goes in as-is: `in_channels` stays 1. (The 4-channel downstream model discards
-`patch_embed1` and re-learns it, Downstream/train_script.py:73-76; there is no pretrained 4-ch stem.)
-
-Intensity: repo uses `ScaleIntensityRangePercentiles(5, 95 -> 0, 1, clip=True)` per channel; done here
-over the foreground voxels of each volume, background stays 0. Input 96^3 (roi_x/y/z default).
+Output (`features`, all [1, C, h, w, d] on the preprocessed RAS grid, axes (x, y, z) as the repo's decoder
+permutes them back, `Downstream/model/Uni_unet.py:68-71`):
+- uniformer: `x1` 64@/2, `x2` 128@/4, `x3` 320@/8, `x4` 512@/16 (after the final BatchNorm),
+  = `UniFormer.forward` outputs (`Downstream/model/uniformer.py:278-304`) used by the segmentation decoder.
+- unet: `c1d` 64@/2, `c2d` 128@/4, `c3d` 256@/8, `c4d` 256@/8 (`models/Unet.py:210-228`).
+`canonical` = deepest map (x4 / c4d): the repo defines no volume embedding (no classification code;
+the paper resizes to 128x128x64 for classification, without a head spec). `global` (mean of the canonical
+map) is ours -> `derived`.
 """
 from __future__ import annotations
 
+import types
+from pathlib import Path
+
 import torch
-import torch.nn.functional as F
-from torch import nn
 
-from .base import FoundationEncoder, load_checked, pick, read_checkpoint
+from .base import Image, Wrapper, add_to_path
 
-
-class CMlp(nn.Module):
-    def __init__(self, dim: int, hidden: int):
-        super().__init__()
-        self.fc1, self.act, self.fc2 = nn.Conv3d(dim, hidden, 1), nn.GELU(), nn.Conv3d(hidden, dim, 1)
-
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
+PRETRAIN_ARGS = {"in_channels": 1, "roi_x": 96, "initial_checkpoint": "",
+                 "template_index": ["flair", "t1", "t1c", "t2", "mra", "pd", "dwi", "adc"],
+                 "dst_h": 240, "dst_w": 240, "dst_d": 155}
+STRIDES = {"uniformer": {"x1": 2, "x2": 4, "x3": 8, "x4": 16}, "unet": {"c1d": 2, "c2d": 4, "c3d": 8, "c4d": 8}}
 
 
-class Mlp(nn.Module):
-    def __init__(self, dim: int, hidden: int):
-        super().__init__()
-        self.fc1, self.act, self.fc2 = nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim)
-
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
-
-
-class Attention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
-        super().__init__()
-        self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        b, n, c = x.shape
-        q, k, v = self.qkv(x).reshape(b, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
-        return self.proj(F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, n, c))
+def build_recmodel(repo: str | Path, arch: str, checkpoint: str | Path | None) -> torch.nn.Module:
+    """The pretraining RecModel (main.py:217-222), strictly loaded from a released checkpoint."""
+    add_to_path(repo)
+    if arch == "uniformer":
+        from models.Uniformer import RecModel
+    elif arch == "unet":
+        from models.Unet import RecModel
+    else:
+        raise ValueError(f"brainmvp: arch must be uniformer|unet, got {arch!r}")
+    model = RecModel(types.SimpleNamespace(device="cpu", **PRETRAIN_ARGS), dim=512)
+    if checkpoint:
+        sd = torch.load(checkpoint, map_location="cpu")["state_dict"]
+        torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(sd, "module.")
+        model.load_state_dict(sd, strict=True)
+    return model.eval()
 
 
-class CBlock(nn.Module):
-    def __init__(self, dim: int, mlp_ratio: float = 4.0):
-        super().__init__()
-        self.pos_embed = nn.Conv3d(dim, dim, 3, padding=1, groups=dim)
-        self.norm1 = nn.BatchNorm3d(dim)
-        self.conv1 = nn.Conv3d(dim, dim, 1)
-        self.conv2 = nn.Conv3d(dim, dim, 1)
-        self.attn = nn.Conv3d(dim, dim, 5, padding=2, groups=dim)
-        self.norm2 = nn.BatchNorm3d(dim)
-        self.mlp = CMlp(dim, int(dim * mlp_ratio))
-
-    def forward(self, x):
-        x = x + self.pos_embed(x)
-        x = x + self.conv2(self.attn(self.conv1(self.norm1(x))))
-        return x + self.mlp(self.norm2(x))
+def encoder_maps(model: torch.nn.Module, arch: str, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    """RecModel.encoder on one window -> named maps in (x, y, z) order."""
+    if arch == "uniformer":
+        _, x1, x2, x3, x4 = model.encoder(x)  # (D, H, W) order inside UniFormer (uniformer_blocks.py:304)
+        return {k: v.permute(0, 1, 3, 4, 2) for k, v in zip(STRIDES[arch], (x1, x2, x3, x4))}
+    return dict(zip(STRIDES[arch], model.encoder(x)))
 
 
-class SABlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0):
-        super().__init__()
-        self.pos_embed = nn.Conv3d(dim, dim, 3, padding=1, groups=dim)
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = Attention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = Mlp(dim, int(dim * mlp_ratio))
-
-    def forward(self, x):
-        x = x + self.pos_embed(x)
-        b, c, *spatial = x.shape
-        t = x.flatten(2).transpose(1, 2)
-        t = t + self.attn(self.norm1(t))
-        t = t + self.mlp(self.norm2(t))
-        return t.transpose(1, 2).reshape(b, c, *spatial)
-
-
-class PatchEmbed(nn.Module):
-    def __init__(self, in_chans: int, embed_dim: int, patch_size: int = 2):
-        super().__init__()
-        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        x = self.proj(x)
-        b, c, *spatial = x.shape
-        x = self.norm(x.flatten(2).transpose(1, 2))
-        return x.transpose(1, 2).reshape(b, c, *spatial)
+def preprocess_transform(repo: str | Path, mode: str):
+    import monai.transforms as T
+    add_to_path(repo, Path(repo) / "Downstream")
+    if mode == "downstream":
+        from dataset.transforms import custom_transform
+        steps = []
+        for t in custom_transform(patch_shape=96, mode="val").transforms:
+            if "image" not in t.keys:
+                continue  # label-only: EnsureChannelFirstd(label), ConvertToMultiChannelBasedOnBratsClassesd
+            t.allow_missing_keys = True
+            steps.append(t)
+            if isinstance(t, T.LoadImaged):
+                steps.append(T.EnsureChannelFirstd(keys=["image"]))
+        return T.Compose(steps)
+    if mode == "pretrain":
+        from utils.custom_trans import CenterCropForegroundd
+        return T.Compose([
+            T.LoadImaged(keys=["image"]),
+            T.EnsureChannelFirstd(keys=["image"]),
+            T.Orientationd(keys=["image"], axcodes="RAS"),
+            T.Spacingd(keys=["image"], pixdim=(1.0, 1.0, 1.0), mode="bilinear"),
+            CenterCropForegroundd(keys=["image"], source_key="image"),
+            T.ScaleIntensityRangePercentilesd(keys=["image"], lower=5, upper=95, b_min=0.0, b_max=1.0, clip=True,
+                                              channel_wise=True),
+            CenterCropForegroundd(keys=["image"], source_key="image"),
+        ])
+    raise ValueError(f"brainmvp: mode must be downstream|pretrain, got {mode!r}")
 
 
-class UniFormer(nn.Module):
-    """uniformer_small: depth [3,4,8,3], dims [64,128,320,512], head_dim 64 (CBlock x2 stages, SABlock x2)."""
+class BrainMVP(Wrapper):
+    """args: arch (uniformer|unet), mode (downstream|pretrain), roi (96), overlap (0.5), amp (true)."""
 
-    def __init__(self, in_chans: int = 1, depth=(3, 4, 8, 3), embed_dim=(64, 128, 320, 512), head_dim: int = 64):
-        super().__init__()
-        dims = (in_chans, *embed_dim)
-        for i in range(4):
-            setattr(self, f"patch_embed{i + 1}", PatchEmbed(dims[i], dims[i + 1]))
-        for i in range(4):
-            heads = embed_dim[i] // head_dim
-            blocks = [CBlock(embed_dim[i]) if i < 2 else SABlock(embed_dim[i], heads) for _ in range(depth[i])]
-            setattr(self, f"blocks{i + 1}", nn.ModuleList(blocks))
-        self.norm = nn.BatchNorm3d(embed_dim[-1])
-
-    def forward(self, x):
-        x = x.permute(0, 1, 4, 2, 3)  # repo: "change C*H*W*D to C*D*H*W" (kernels are not axis-symmetric)
-        for i in range(1, 5):
-            x = getattr(self, f"patch_embed{i}")(x)
-            for blk in getattr(self, f"blocks{i}"):
-                x = blk(x)
-        return self.norm(x).permute(0, 1, 3, 4, 2)  # back to (x, y, z), as the repo's decoder does
-
-
-class BrainMVP(FoundationEncoder):
     name = "brainmvp"
 
-    def __init__(self, in_channels: int = 1, input_size: int = 96, pct: tuple[float, float] = (5.0, 95.0)):
-        super().__init__()
-        self.in_channels, self.input_size, self.pct = in_channels, input_size, pct
-        self.uniformer = UniFormer(in_chans=in_channels)
+    def __init__(self, cfg: dict, device: str):
+        super().__init__(cfg, device)
+        self.arch, self.mode = self.args.get("arch", "uniformer"), self.args.get("mode", "downstream")
+        self.roi, self.overlap = int(self.args.get("roi", 96)), float(self.args.get("overlap", 0.5))
+        self.amp = bool(self.args.get("amp", True))
+        self.transform = preprocess_transform(cfg["repo"], self.mode)
+        self.model = build_recmodel(cfg["repo"], self.arch, cfg.get("checkpoint")).to(device)
 
-    def normalize(self, x):
-        """Per-volume 5-95 percentile of the foreground -> [0, 1], clipped; background 0."""
-        out = torch.zeros_like(x)
-        for i, v in enumerate(x):
-            fg = v > 0
-            if fg.any():
-                lo, hi = torch.quantile(v[fg].flatten().float(), torch.tensor(self.pct, device=v.device) / 100)
-                out[i] = torch.where(fg, ((v - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1), v)
-        return out
+    def preprocess(self, image: Image) -> dict:
+        return self.transform({"image": [str(image)]})
 
-    def features(self, x):
-        fmap = self.uniformer(x)
-        return {"map": fmap, "global": fmap.mean((2, 3, 4))}
-
-    def load_checkpoint(self, path):
-        sd = pick(read_checkpoint(path), ("state_dict", "model"))
-        out = {}
-        for k, v in sd.items():
-            k = k.removeprefix("module.")
-            if k.startswith("encoder.uniformer."):
-                out[k[len("encoder.uniformer."):]] = v
-            elif k.startswith("encoder."):
-                out[k[len("encoder."):]] = v
-            else:
-                out[k] = v
-        return load_checked(self.uniformer, out, ignore_unexpected=("decoder.", "rep_template", "kl_loss.",
-                            "recon_loss."), what="BrainMVP checkpoint")
+    @torch.no_grad()
+    def features(self, prepared: dict) -> dict:
+        from monai.inferers import sliding_window_inference
+        img = prepared["image"]
+        x = img.as_tensor()[None].float().to(self.device)
+        with torch.cuda.amp.autocast(enabled=self.amp):  # Downstream/train_utils.py:112
+            maps = sliding_window_inference(x, roi_size=(self.roi,) * 3, sw_batch_size=1, overlap=self.overlap,
+                                            mode="constant", predictor=lambda w: encoder_maps(self.model, self.arch, w))
+        maps = {k: v.float() for k, v in maps.items()}
+        canonical = list(STRIDES[self.arch])[-1]
+        feats = maps | {"global": maps[canonical].mean((2, 3, 4))}
+        meta = {
+            "affine": img.affine.clone(),                 # voxel -> world (RAS) of the preprocessed input
+            "input_shape": tuple(img.shape[1:]),
+            "original_affine": torch.as_tensor(img.meta["original_affine"]),
+            "spatial_shape": tuple(int(s) for s in img.meta["spatial_shape"]),
+            "strides": STRIDES[self.arch],                # input voxels per feature voxel, per axis
+            "axes": "x,y,z of the preprocessed RAS 1 mm grid",
+            "mode": self.mode, "arch": self.arch,
+            "sliding_window": {"roi": self.roi, "overlap": self.overlap, "blend": "constant", "amp": self.amp},
+        }
+        return {"features": feats, "canonical": canonical, "meta": meta, "derived": ["global"]}
 
 
-def build(name: str, model_args: dict) -> BrainMVP:
-    return BrainMVP(**model_args)
+def build(cfg: dict, device: str) -> BrainMVP:
+    return BrainMVP(cfg, device)

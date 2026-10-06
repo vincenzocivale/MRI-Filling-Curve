@@ -1,0 +1,18 @@
+# BrainSegFounder stage-1 SSL on UK Biobank (lab-smile/BrainSegFounder; HF smilelab/BrainSegFounder).
+# status: EFFECTIVELY UNTRAINED -- global_step 75 / epoch 0, every LayerNorm within 4e-5 of init and no Linear
+#   weight outside PyTorch's default init bound; use as a random-init baseline, not as a pretrained encoder.
+#   1 input channel (paper says T1+T2-FLAIR 2-ch; modality of this file unknown, fed T1w).
+#   Expects UKB T1_brain_to_MNI-like input (skull-stripped, MNI152 1 mm); the repo ships no such preprocessing.
+#   FLAG: stage-1 ScaleIntensityRanged a_min/a_max never shipped -> repo argparse defaults -1000/1000 (CT values).
+model: brainsegfounder
+env: ${SFC_FM_ENVS}/fm-brainsegfounder
+repo: ${SFC_FM_REPOS}/BrainSegFounder
+commit: 0bbf432
+checkpoint: ${SFC_FM_MODELS}/BrainSegFounder/HF/model_weights_UKB-pretrain.pt
+args:
+  pipeline: ukb          # pretrain/utils/data_utils.py transforms, sliding window roi 96
+  in_channels: 1
+  depths: [2, 2, 2, 2]
+  a_min: -1000.0         # unknown upstream; shipped default
+  a_max: 1000.0
+  overlap: 0.5

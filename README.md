@@ -74,16 +74,19 @@ No dataset or GDN-2 code is redistributed here (`THIRD_PARTY.md`).
 
 ## External foundation models
 
-One entrypoint, same probes and splits as our encoder; model and checkpoint come from a config
-(`configs/fm/<name>.yaml`: `model`, `checkpoint`, `model_args`):
+One entrypoint for every model: given image files, each model returns **its own** features, computed by
+the original repo's code (preprocessing, network, inference procedure, feature output) in a dedicated
+conda env. Nothing of ours sits between the NIfTI and the model.
 
 ```bash
-pip install -e '.[fm]'
-sfc fm configs/fm_eval.yaml --model configs/fm/brainiac.yaml configs/fm/openmind.yaml [--probe configs/probe_sex.yaml]
-sfc summarize <output_root>   # rows are labelled objective=fm:<model>, groups pretrained / init
+source configs/fm/leonardo.env        # SFC_FM_ENVS / SFC_FM_REPOS / SFC_FM_MODELS (see configs/fm/README.md)
+conda env create -p $SFC_FM_ENVS/fm-<family> -f envs/fm/fm-<family>.yml     # once per family
+sfc fm configs/fm/<name>.yaml --images a.nii.gz b.nii.gz --out feats/<name> [--device cpu]
+sfc fm configs/fm/mome_plus.yaml --csv cases.csv --out feats/mome_plus   # multi-modal: id,<modality>,...
 ```
 
-Models: `brainiac`, `medicalnet`, `brainsegfounder`, `brainmvp`, `mome`, `mome_plus`, `openmind`,
-`nnfoundation`, `amaes`, `fomo26`, `brainfm`, `nnunet`. Checkpoints are checked key by key against the
-architecture (a mismatch raises). `checkpoint: null` reports the random init only. Each adapter resamples the cube to
-its input size and pools its deepest feature map onto the 16^3 patch grid (patch level) or globally (volume level).
+Each image gives `<out>/<id>.pt` = `{features: {name: tensor}, canonical, derived, meta, provenance}`:
+`canonical` names the embedding the repo itself uses, `derived` lists anything we added (e.g. a pooling
+the repo does not define), `meta` maps the feature grid back to the image (for voxel/patch probes).
+`tests/fm/<family>_parity.py` (run in the model's env) checks a wrapper against the untouched original
+pipeline. Linear probing on these features is not wired yet.

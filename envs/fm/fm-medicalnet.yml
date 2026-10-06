@@ -1,0 +1,17 @@
+# MedicalNet (Tencent/MedicalNet @ 20f76aa). requirements.txt pins torch>=2.6.0 together with numpy==1.15.4,
+# nibabel==2.4.1, scipy==1.1.0 (no python>=3.8 wheels); we keep torch 2.6 and take the oldest numpy/scipy with
+# py3.10 wheels, and nibabel 4.0.2 = the last release where `img.get_data()` (datasets/brains18.py:172,193)
+# still exists, so the repo's own data processing runs unmodified. scipy 1.13 keeps `ndimage.interpolation`.
+name: fm-medicalnet
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch==2.6.0+cu124
+      - numpy==1.26.4
+      - scipy==1.13.1
+      - nibabel==4.0.2
+      - pyyaml

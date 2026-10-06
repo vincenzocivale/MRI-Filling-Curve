@@ -1,0 +1,16 @@
+# BrainSegFounder stage-2 SSL on BraTS21 (UKB+BraTS; lab-smile/BrainSegFounder), BrainSegFounder-Small.
+# status: needs all 4 BraTS modalities [flair, t1ce, t1, t2] (SRI24 1 mm, skull-stripped); not usable with
+#   T1w alone. depths [2,2,6,2]. FLAG: a_min/a_max not passed by launch.sh -> shipped defaults -1000/1000.
+#   The shipped launch.sh calls main_T1T2_Stage2.py, which is not in the repo.
+model: brainsegfounder
+env: ${SFC_FM_ENVS}/fm-brainsegfounder
+repo: ${SFC_FM_REPOS}/BrainSegFounder
+commit: 0bbf432
+checkpoint: ${SFC_FM_MODELS}/BrainSegFounder/HF/model_weights_BRATS-pretrain.pt
+args:
+  pipeline: brats_ssl    # downstream/BraTS/ssl/utils/data_utils.py transforms, sliding window roi 96
+  in_channels: 4
+  depths: [2, 2, 6, 2]
+  a_min: -1000.0
+  a_max: 1000.0
+  overlap: 0.5

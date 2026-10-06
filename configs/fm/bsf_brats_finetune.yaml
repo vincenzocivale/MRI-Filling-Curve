@@ -1,0 +1,15 @@
+# BrainSegFounder fine-tuned on BraTS21 tumour segmentation, fold 0 (lab-smile/BrainSegFounder).
+# status: needs all 4 BraTS modalities [flair, t1ce, t1, t2] (SRI24 1 mm, skull-stripped); not usable with
+#   T1w alone. depths [2,2,2,2] (not initialised from BRATS-pretrain, which is [2,2,6,2]); patch embedding was
+#   re-initialised for fine-tuning (main_FinetuningSwinUNETR_4Channels.py:157-194).
+model: brainsegfounder
+env: ${SFC_FM_ENVS}/fm-brainsegfounder
+repo: ${SFC_FM_REPOS}/BrainSegFounder
+commit: 0bbf432
+checkpoint: ${SFC_FM_MODELS}/BrainSegFounder/HF/model_weights_BRATS-finetune.pt
+args:
+  pipeline: brats_ft     # finetuning test transform, sliding window roi 128, overlap 0.6 (test.py)
+  in_channels: 4
+  depths: [2, 2, 2, 2]
+  roi: 128
+  overlap: 0.6
