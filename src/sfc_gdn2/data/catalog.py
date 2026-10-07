@@ -1,6 +1,6 @@
 """One table of every raw MRI volume we have, with standardized labels (NaN = not available).
 
-`python -m sfc_gdn2.data.catalog <raw_root> <mrrate_root> <mrrate_body_region.csv> <out.csv.gz>`
+`python -m sfc_gdn2.data.catalog <raw_root> <mrrate_root> <mrrate_body_region.csv> <out.csv.gz> [brats_duplicates.csv]`
 
 Row = one volume: `dataset`, `cohort`, `subject` (global, `<source>:<id>`), `session`, `modality`
 (canonical, see `modality`), `variant` (source file entities), `path` (file or `zip://archive::member`),
@@ -14,7 +14,8 @@ parkinson / adhd / autism / epilepsy / psychosis / depression / ms / tbi / other
 FOMO300K repackages several datasets we also hold in their original form (IXI, OASIS-1/2, CoRR NYU_2,
 Calgary, and OpenNeuro Pixar/AOMIC/Long579/DLBS/SOOP). Their FOMO subjects are mapped back to the
 original IDs (FOMO `mapping.tsv`), FOMO labels fill what the original lacks, and the FOMO rows are
-dropped: one copy per subject. Not deduplicable by ID: BraTS-GEN / MSD (FOMO) vs UCSF-PDGM / UPENN-GBM.
+dropped: one copy per subject. BraTS-GEN / MSD (FOMO) share no IDs with UCSF-PDGM / UPENN-GBM nor with each
+other: their copies are found by image fingerprint (datasets-meta/scripts/brats_dedup.py) and dropped here.
 Left out: HaN-Seg (head-neck), ATLAS (encrypted).
 """
 from __future__ import annotations
@@ -379,5 +380,7 @@ def build(raw: Path, mrrate_root: Path, region_csv: Path) -> pd.DataFrame:
 if __name__ == "__main__":
     raw, mr, region, out = (Path(a) for a in sys.argv[1:5])
     df = build(raw, mr, region)
+    if len(sys.argv) > 5:  # brats_duplicates.csv: FOMO BraTS copies found by image fingerprint (no shared IDs)
+        df = df[~df.subject.isin(pd.read_csv(sys.argv[5])["drop"])]
     df.to_csv(out, index=False)
     print(df.groupby("dataset").agg(volumes=("path", "size"), subjects=("subject", "nunique")).to_string())
