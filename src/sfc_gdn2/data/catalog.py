@@ -39,7 +39,7 @@ _DX_GROUP = [  # coarse diagnosis shared across sources; `dx` keeps the source w
                  r"never-depressed control|typically developing|td)$")),
     ("tumor", (r"tumou?r|gliom|glioblastoma|gmb|astrocytom|oligodendro|oligoastro|meningiom|ependymom|medulloblastom|"
                r"lymphoma|metasta|adenoma|dnet|ganglioglioma|neuroectodermal|glioneuronal")),
-    ("stroke", r"stroke|infarct"), ("dementia", r"dementia|demented|^ad$|ftd|alzheimer|converted"),
+    ("stroke", r"stroke|infarct"), ("dementia", r"dementia|^demented|^ad$|ftd|alzheimer"),
     ("parkinson", r"parkinson|^pd$"), ("adhd", r"adhd|attention"), ("autism", r"autis"),
     ("epilepsy", r"epilep|cortical dysplasia"), ("psychosis", r"schiz|schz|psychos"), ("depression", r"depress"),
     ("ms", r"^ms$|multiple sclerosis"), ("tbi", r"^tbi$|traumatic brain"),
@@ -190,12 +190,15 @@ def unlabelled(raw: Path, name: str) -> pd.DataFrame:  # SALD, Petfrog
 
 # ---- non-BIDS datasets
 
-def ixi(raw: Path) -> pd.DataFrame:  # labels: IXI.xls needs xlrd; FOMO300K's copy has age/sex
+def ixi(raw: Path) -> pd.DataFrame:  # labels: IXI.csv (= IXI.xls converted with xlrd; SEX_ID 1=m, 2=f)
     rows = [{"dataset": "IXI", "cohort": "IXI", "_id": (i := p.name.split("-")[0]), "subject": f"IXI:{i}",
              "session": "", "modality": modality(p.name.split(".nii")[0].rsplit("-", 1)[1]),
              "variant": p.name.split(".nii")[0].rsplit("-", 1)[1], "path": str(p)}
             for p in sorted((raw / "IXI").glob("IXI-*/*.nii.gz"))]
-    return pd.DataFrame(rows)
+    m = pd.read_csv(raw / "IXI/IXI.csv").dropna(subset=["AGE"]).drop_duplicates("IXI_ID")
+    meta = pd.DataFrame({"_id": "IXI" + m.IXI_ID.astype(int).astype(str).str.zfill(3), "age": _num(m.AGE),
+                         "sex": m["SEX_ID (1=m, 2=f)"].map({1: "M", 2: "F"})})
+    return _join(pd.DataFrame(rows), meta, ["_id"])
 
 
 def oasis1(raw: Path) -> pd.DataFrame:
@@ -214,12 +217,19 @@ def oasis1(raw: Path) -> pd.DataFrame:
     return df
 
 
-def oasis2(raw: Path) -> pd.DataFrame:  # no labels downloaded; FOMO300K's copy has age/sex/group
+def oasis2(raw: Path) -> pd.DataFrame:
+    """Labels per visit: oasis_longitudinal_demographics (OASIS site xlsx, converted to csv). `dx` per visit from
+    CDR (Group "Converted" subjects are nondemented at their first visits)."""
     rows = [{"dataset": "OASIS-2", "cohort": "OASIS-2", "_id": (s := img.parts[-3].rsplit("_", 1))[0],
              "subject": f"OASIS-2:{s[0]}", "session": s[1], "modality": "T1w",
              "variant": img.name.split(".")[0], "path": str(img)}
             for img in sorted((raw / "OASIS-2").glob("OAS2_RAW_PART*/OAS2_*_MR*/RAW/mpr-*.nifti.img"))]
-    return pd.DataFrame(rows)
+    m = pd.read_csv(raw / "OASIS-2/oasis_longitudinal_demographics.csv")
+    meta = pd.DataFrame({"_id": m["Subject ID"], "session": m["MRI ID"].str.rsplit("_", n=1).str[1],
+                         "age": _num(m.Age), "sex": m["M/F"].map(sex), "handedness": m.Hand.map(hand),
+                         "cdr": _num(m.CDR), "mmse": _num(m.MMSE),
+                         "dx": np.where(m.CDR > 0, "demented", np.where(m.CDR == 0, "nondemented", None))})
+    return _join(pd.DataFrame(rows), meta, ["_id", "session"])
 
 
 def ucsf_pdgm(raw: Path) -> pd.DataFrame:
@@ -297,6 +307,10 @@ def mrrate(root: Path) -> pd.DataFrame:
         "brain_mask": zp + "/seg/" + meta.study_uid + "_" + meta.series_id + "_brain-mask.nii.gz",
         "age": meta["Patient'sAge"].map(dicom_age), "sex": meta["Patient'sSex"].map(sex),
         "patient_uid": meta.patient_uid, "study_uid": meta.study_uid, "series_id": meta.series_id})
+    # a few patient_uids carry two sexes or ages > 15 y apart (header errors): drop those labels
+    g = df.groupby("subject").agg(ns=("sex", "nunique"), lo=("age", "min"), hi=("age", "max"))
+    df.loc[df.subject.isin(g.index[g.ns > 1]), "sex"] = np.nan
+    df.loc[df.subject.isin(g.index[(g.hi - g.lo) > 15]), "age"] = np.nan
     return df
 
 
@@ -343,8 +357,16 @@ def fomo300k(root: Path) -> pd.DataFrame:
                        "path": "zip://" + archive + "::" + rest, "old_path": m.old_path, "_fsub": m.participant_id,
                        "_fses": m.session_id, "_exists": archive.map(exists)})
     p = pd.read_csv(root / "participants.tsv", sep="\t", dtype=str)
-    lab = pd.DataFrame({"cohort": p.dataset, "_fsub": p.participant_id, "_fses": p.session_id, "age": _num(p.age),
-                        "sex": p.sex.map(sex), "handedness": p.handedness.map(hand), "dx": p.group.map(dx)})
+    a = p.age.str.strip().str.replace(",", ".").str.removesuffix("y")  # "39,5", "38y"; ranges/"Young"/"89+" -> NaN
+    swapped = a.isin(["M", "F"]) & p.sex.isna()  # 6 OpenNeuro sets: sex written in the age column
+    lab = pd.DataFrame({"cohort": p.dataset, "_fsub": p.participant_id, "_fses": p.session_id, "age": _num(a.mask(swapped)),
+                        "sex": p.sex.where(~swapped, a).map(sex), "handedness": p.handedness.map(hand),
+                        "dx": p.group.map(dx)})
+    # FOMO gives every session of a subject the same age (checked: DLBS off by up to 11 y, Calgary 4 y, OASIS-2 all
+    # visits): flag multi-session subjects with one age; their age is dropped after the original datasets are filled
+    g = lab.dropna(subset=["age"]).groupby(["cohort", "_fsub"]).agg(n=("_fses", "nunique"), k=("age", "nunique"))
+    const = g[(g.n > 1) & (g.k == 1)].index
+    lab["_age_const"] = pd.MultiIndex.from_frame(lab[["cohort", "_fsub"]]).isin(const)
     return _join(df, lab, ["cohort", "_fsub", "_fses"]).drop(columns=["_fsub", "_fses"])
 
 
@@ -362,7 +384,9 @@ def dedup(fomo: pd.DataFrame, orig: pd.DataFrame, raw: Path) -> tuple[pd.DataFra
         src[sel] = (name + ":" + ids[0]).where(ids[0].notna())
         ses[sel] = ids[1].map(calgary_ses.to_dict().get) if name == "Calgary" else ids[1].map(lambda s: _ses(s) if isinstance(s, str) and s else "")
     dup = src.isin(held)
-    fill = fomo[dup].assign(subject=src[dup], session=ses[dup])[["subject", "session", "age", "sex", "handedness", "dx"]]
+    ok_age = ~fomo._age_const.fillna(False).astype(bool) | (fomo.cohort == "PT014_CoRR")  # NYU_2: scans < 1 h apart
+    fill = fomo[dup].assign(subject=src[dup], session=ses[dup], age=fomo.age.where(ok_age))[
+        ["subject", "session", "age", "sex", "handedness", "dx"]]
     by_ses = fill.groupby(["subject", "session"]).first()
     by_sub = fill.groupby("subject")[["sex", "dx"]].first()  # session-invariant labels only
     key = pd.MultiIndex.from_frame(orig[["subject", "session"]])
@@ -372,7 +396,9 @@ def dedup(fomo: pd.DataFrame, orig: pd.DataFrame, raw: Path) -> tuple[pd.DataFra
         orig[c] = orig[c].where(orig[c].notna(), pd.Series(by_ses[c].reindex(key).to_numpy(), index=orig.index))
         if c in by_sub:
             orig[c] = orig[c].where(orig[c].notna(), orig.subject.map(by_sub[c]))
-    return fomo[~dup & fomo._exists].drop(columns=["old_path", "_exists"]), orig
+    kept = fomo[~dup & fomo._exists]
+    kept = kept.assign(age=kept.age.mask(kept._age_const.fillna(False).astype(bool)))
+    return kept.drop(columns=["old_path", "_exists", "_age_const"]), orig
 
 
 def build(raw: Path, mrrate_root: Path, region_csv: Path) -> pd.DataFrame:
