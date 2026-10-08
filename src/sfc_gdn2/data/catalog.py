@@ -1,6 +1,7 @@
 """One table of every raw MRI volume we have, with standardized labels (NaN = not available).
 
-`python -m sfc_gdn2.data.catalog <raw_root> <mrrate_root> <mrrate_body_region.csv> <out.csv.gz> [brats_duplicates*.csv ...]`
+`python -m sfc_gdn2.data.catalog <raw_root> <mrrate_root> <mrrate_body_region.csv> <out.csv.gz> [identity csv ...]`
+(identity csvs: `drop` column = FOMO copies to remove, `subject,same_as` = same person across datasets)
 
 Row = one volume: `dataset`, `cohort`, `subject` (global, `<source>:<id>`), `session`, `modality`
 (canonical, see `modality`), `variant` (source file entities), `path` (file or `zip://archive::member`),
@@ -418,7 +419,11 @@ def build(raw: Path, mrrate_root: Path, region_csv: Path) -> pd.DataFrame:
 if __name__ == "__main__":
     raw, mr, region, out = (Path(a) for a in sys.argv[1:5])
     df = build(raw, mr, region)
-    for f in sys.argv[5:]:  # brats_duplicates*.csv: FOMO BraTS copies found by image fingerprint (no shared IDs)
-        df = df[~df.subject.isin(pd.read_csv(f)["drop"])]
+    for f in sys.argv[5:]:  # cross-dataset identities found by image (datasets-meta/manifests/{brats_dedup,identity})
+        t = pd.read_csv(f)
+        if "same_as" in t:  # same person in two downstream datasets: one subject id, so splits keep them together
+            df["subject"] = df.subject.replace(dict(zip(t.subject, t.same_as)))
+        else:  # FOMO copy of a subject held in original form: drop it
+            df = df[~df.subject.isin(t["drop"])]
     df.to_csv(out, index=False)
     print(df.groupby("dataset").agg(volumes=("path", "size"), subjects=("subject", "nunique")).to_string())
