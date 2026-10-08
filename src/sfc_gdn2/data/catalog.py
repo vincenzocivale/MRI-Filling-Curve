@@ -423,6 +423,8 @@ if __name__ == "__main__":
         t = pd.read_csv(f)
         if "same_as" in t:  # same person in two downstream datasets: one subject id, so splits keep them together
             df["subject"] = df.subject.replace(dict(zip(t.subject, t.same_as)))
+        elif "path" in t:  # byte-identical files released under two IDs (TotalSegmentator, CoRR-NYU2): keep one
+            df = df[~df.path.isin(t.path)]
         elif "session" in t:  # the same scan released twice (OASIS-1 MR1 = an OASIS-2 visit): drop one row set
             df = df[~pd.MultiIndex.from_frame(df[["subject", "session"]]).isin(list(zip(t["drop"], t.session)))]
         else:  # FOMO copy of a subject held in original form: drop it
