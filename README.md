@@ -11,7 +11,7 @@ B volumes:
 1. **Groups.** N boxes of the patch grid per volume, centred on foreground patches: `groups_global`
    spanning `global_frac` of the foreground bounding box, `groups_local` with `local_edge` patches per edge.
 2. **Views.** K per group. A view is the group box rescaled/shifted by up to `jitter` (partial
-   overlap), intensity-augmented (gamma, scale, shift, noise), with `mask_ratio` of its patches set to
+   overlap), intensity-augmented (gamma, scale, shift, noise), with `mask_ratio` of its foreground patches set to
    the mask token, read along a curve drawn from `view_curves` in a random cube symmetry.
 3. **Loss.** View embedding = mean encoder output over its tokens → projector;
    `(1-λ)·invariance(views of a group) + λ·SIGReg(per-volume-centred embeddings)`.

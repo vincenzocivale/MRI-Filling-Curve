@@ -7,7 +7,7 @@ Guidance for Claude Code in this repository. User-facing docs: `README.md`.
 LeJEPA pretraining of a **causal** Gated DeltaNet-2 on 3D MRI: per volume, groups (boxes of the patch
 grid); per group, two views that differ in serialization (space-filling curve × cube symmetry), box
 jitter and intensity; view A is masked. Global term: last forward state, invariance + SIGReg. Token
-term: bi tokens of A's masked patches and B's same patches pulled together (symmetric, no stop-grad:
+term: bi tokens of A's masked (foreground-only) patches and B's same patches pulled together (symmetric, no stop-grad:
 a stop-grad target without EMA drifted) + SIGReg on 64 token embeddings per volume (~1000 samples, LeJEPA's calibrated range). Frozen linear probes
 (TotalSeg segmentation, brain age, sex) per inference curve.
 

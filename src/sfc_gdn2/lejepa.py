@@ -4,15 +4,18 @@ code and dense quality decay).
 
 Per volume, boxes of the patch grid ("groups": a few global, most local). Each group yields two
 views read along different curves (random curve of `view_curves` x cube symmetry), each with its own
-box jitter and intensity augmentation; view A also has `mask_ratio` of its patches replaced by the
-mask token. Each view is read forwards and backwards by the same causal encoder.
+box jitter and intensity augmentation; view A also has `mask_ratio` of its foreground patches replaced
+by the mask token. Each view is read forwards and backwards by the same causal encoder.
 
 - global: the last forward state (a summary of the whole box) -> `glob` head; invariance between
   A and B + SIGReg (per view, over the batch).
 - token: for every masked patch of A that B also contains, the `bi` token (forward ++ backward
   output at that patch, as in the segmentation probe) of A and of B -> `tok` head, pulled together
   (symmetric, no stop-grad, as LeJEPA's invariance);
-  SIGReg on B's token embeddings: `tokens_per_volume` per volume, so the sample count stays in
+  Token targets are foreground only (as Vol-JEPA's head mask): background patches stay in the
+  sequence (with no position embedding their count is spatial signal) but are never masked, paired or
+  sampled for SIGReg, so near-identical air tokens neither give free pairs nor a degenerate mass.
+  SIGReg on B's foreground token embeddings: `tokens_per_volume` per volume, so the sample count stays in
   LeJEPA's calibrated range (scaled by ~20k tokens it gave per-patch noise; by #volumes it let a
   per-volume code through).
 loss = (1 - lam) * (inv_global + inv_token) / 2 + lam * (sig_global + sig_token) / 2
@@ -127,18 +130,19 @@ class LeJEPA(nn.Module):
         order = order[:, : int(n.max())]
         return order, torch.arange(order.shape[1], device=order.device) < n[:, None]
 
-    def read(self, patches, vol, corner, edge, masked, gen):
-        """Views [V] -> canonical indices, valid, mask [V,L], last forward state [V,d], bi tokens [V,L,2d].
-        Masking applies only to views with `masked`; the backward pass reads each view's valid
-        tokens in reverse (padding stays at the end, zero in the outputs)."""
+    def read(self, patches, fg, vol, corner, edge, masked, gen):
+        """Views [V] -> canonical indices, valid, foreground, mask [V,L], last forward state [V,d],
+        bi tokens [V,L,2d]. Masking applies only to foreground patches of views with `masked`; the
+        backward pass reads each view's valid tokens in reverse (padding stays at the end, zero in the outputs)."""
         idx, valid = self.serialize(corner, edge, gen)
+        fgv = valid & fg[vol[:, None], idx]
         n = valid.sum(1)
         v = patches[vol[:, None], idx]                                                     # [V,L,P]
         u = lambda lo, hi: self._u((len(v), 1, 1), lo, hi, gen)
         v = v.clamp_min(0) ** u(-self.gamma, self.gamma).exp() * u(1 - self.scale, 1 + self.scale)
         v = (v + u(-self.shift, self.shift) + torch.randn(v.shape, device=v.device, generator=gen)
              * u(0, self.noise)).clamp(0, 1)
-        mask = masked[:, None] & valid & (torch.rand(valid.shape, device=v.device, generator=gen)
+        mask = masked[:, None] & fgv & (torch.rand(valid.shape, device=v.device, generator=gen)
                                           < u(*self.mask_ratio)[..., 0])
         t = self.encoder.tokens(v, mask)
         j = torch.arange(idx.shape[1], device=idx.device)
@@ -154,17 +158,18 @@ class LeJEPA(nn.Module):
         out = self.encoder.norm(self.encoder.run(nn.functional.pad(x, (0, 0, 0, pad))[None], cu)[0, :total])
         h = out.new_zeros(*keep.shape, out.shape[-1]).index_put((keep,), out)
         fwd, bwd = h[: len(t)], h[len(t):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))
-        return idx, valid, mask, fwd[torch.arange(len(t)), n - 1], torch.cat([fwd, bwd], -1)
+        return idx, valid, fgv, mask, fwd[torch.arange(len(t)), n - 1], torch.cat([fwd, bwd], -1)
 
     def forward(self, patches: torch.Tensor, generator: torch.Generator) -> dict[str, torch.Tensor]:
         b, n_patch, gen = len(patches), patches.shape[1], generator
-        corner, edge = self.jittered(*self.boxes(patches.mean(-1) > self.fg_threshold, gen), gen)   # [B,G,2,3]
+        fg = patches.mean(-1) > self.fg_threshold                                           # [B,N]
+        corner, edge = self.jittered(*self.boxes(fg, gen), gen)                            # [B,G,2,3]
         vol = torch.arange(b, device=patches.device)[:, None, None].expand(-1, corner.shape[1], 2)
-        zg, pred, tgt, ztok, tvol, lens = [], [], [], [], [], []
+        zg, pred, tgt, ztok, tvol, tfg, lens = [], [], [], [], [], [], []
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
             c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
             masked = torch.arange(len(c), device=c.device) % 2 == 0
-            idx, valid, mask, last, bi = self.read(patches, v, c, e, masked, gen)
+            idx, valid, fgv, mask, last, bi = self.read(patches, fg, v, c, e, masked, gen)
             zg.append(self.glob(last).float().view(b, -1, 2, self.glob[-1].out_features))
             a, bb = masked.nonzero()[:, 0], (~masked).nonzero()[:, 0]
             safe = torch.where(valid, idx, n_patch)                                        # padding -> dump column
@@ -172,23 +177,29 @@ class LeJEPA(nn.Module):
             pos_b.scatter_(1, safe[bb], torch.arange(idx.shape[1], device=c.device).expand(len(bb), -1))
             pos_b[:, -1] = -1
             j_b = pos_b.gather(1, safe[a])                                                 # A's patch -> its position in B
-            pair = mask[a] & (j_b >= 0)
+            pair = mask[a] & (j_b >= 0)                                                    # mask is foreground only
             z_b = self.tok(bi[bb][valid[bb]]).float()                                      # B's valid tokens, flat
             flat = valid[bb].flatten().long().cumsum(0).view_as(valid[bb]) - 1             # (row, pos) -> flat index
             pred.append(self.tok(bi[a][pair]).float())
             tgt.append(z_b[flat.gather(1, j_b.clamp_min(0))[pair]])
             ztok.append(z_b)
             tvol.append(v[bb][:, None].expand_as(valid[bb])[valid[bb]])
+            tfg.append(fgv[bb][valid[bb]])
             lens.append(e.prod(-1).float().mean())
         zg = torch.cat(zg, 1)                                                              # [B,G,2,D]
         inv_g = (zg - zg.mean(2, keepdim=True)).square().mean()
         # symmetric, as LeJEPA: both tokens pulled to their mean, no stop-grad (with a stop-grad target and
         # no EMA teacher the target drifted and inv_token grew 0.19 -> 2.7); SIGReg prevents collapse
         inv_t = (torch.cat(pred) - torch.cat(tgt)).square().mean() / 4                     # = mean ||z - mean||^2
-        ztok, tvol = torch.cat(ztok), torch.cat(tvol)
-        # equal tokens per volume (with replacement: fixed shape for the cross-GPU gather)
-        keep = torch.cat([(i := (tvol == v).nonzero()[:, 0])[torch.randint(len(i), (self.tokens_per_volume,),
-                          device=i.device, generator=gen)] for v in range(b)])
+        ztok, tvol, tfg = torch.cat(ztok), torch.cat(tvol), torch.cat(tfg)
+        # equal foreground tokens per volume (with replacement: fixed shape for the cross-GPU gather); a
+        # volume whose B views hold no foreground (boxes are centred on it, so only after jitter) falls back to all
+        keep = []
+        for v in range(b):
+            i = ((tvol == v) & tfg).nonzero()[:, 0]
+            i = i if len(i) else (tvol == v).nonzero()[:, 0]
+            keep.append(i[torch.randint(len(i), (self.tokens_per_volume,), device=i.device, generator=gen)])
+        keep = torch.cat(keep)
         sg_in, st_in = zg.permute(2, 0, 1, 3).reshape(2, -1, zg.shape[-1]), ztok[keep][None]
         if torch.distributed.is_initialized():  # SIGReg sees every rank's samples (differentiable gather)
             sg_in, st_in = (torch.cat(torch.distributed.nn.functional.all_gather(x), 1) for x in (sg_in, st_in))

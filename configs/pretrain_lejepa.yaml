@@ -31,7 +31,7 @@ objective:
   global_frac: [0.3, 1.0]     # volume fraction of the foreground bounding box
   local_edge: [3, 8]          # patches per edge (27-512 tokens)
   jitter: 0.25                # view box = group box rescaled/shifted by up to this fraction of its edge
-  mask_ratio: [0.2, 0.5]      # fraction of view A's patches replaced by the mask token (token term targets)
+  mask_ratio: [0.2, 0.5]      # fraction of view A's foreground patches replaced by the mask token (token term targets)
   gamma: 0.3                  # intensity: x^exp(U(-g,g)) * U(1-scale,1+scale) + U(-shift,shift) + N(0, U(0,noise))
   scale: 0.1
   shift: 0.05
@@ -39,7 +39,7 @@ objective:
   fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
   proj_hidden: 1024
   proj_dim: 64                # both heads: glob (last forward state) and tok (bi token); LeJEPA Tab. 1d: small is better
-  tokens_per_volume: 32       # B tokens per volume fed to the token SIGReg (6 GPUs x 6 vols x 32 = 1152 samples)
+  tokens_per_volume: 32       # B foreground tokens per volume fed to the token SIGReg (6 GPUs x 6 vols x 32 = 1152 samples)
   lam: 0.05                   # loss = (1-lam)*invariance + lam*SIGReg
   sigreg_slices: 256
   sigreg_knots: 17

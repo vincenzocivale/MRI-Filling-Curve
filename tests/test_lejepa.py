@@ -59,3 +59,24 @@ def test_token_targets_are_the_same_patch_in_the_other_view():
     patches = torch.rand(3, 4096, 4, generator=g()) * 0.5 + 0.2
     out = m(patches, g())
     assert out["inv_token"] == 0 and torch.isfinite(out["loss"])
+
+
+def test_token_term_ignores_background():
+    """Masking (hence token pairs) touches foreground patches only; background stays in the views."""
+    class Enc(torch.nn.Module):
+        dim, grid = 4, 16
+        tokens = staticmethod(lambda v, mask: v)
+        run = staticmethod(lambda x, cu_seqlens: x)
+        norm = staticmethod(lambda x: x)
+    m = LeJEPA(Enc(), ["raster", "hilbert"], proj_hidden=8, proj_dim=4, mask_ratio=(1.0, 1.0))
+    patches = torch.rand(2, 4096, 4, generator=g()) * 0.5 + 0.2
+    patches[:, ::2] = 0                                            # every other patch is air
+    fg = patches.mean(-1) > m.fg_threshold
+    corner, edge = m.jittered(*m.boxes(fg, g()), g())
+    vol = torch.arange(2)[:, None, None].expand(-1, corner.shape[1], 2).reshape(-1)
+    c, e = corner.reshape(-1, 3), edge.reshape(-1, 3)
+    masked = torch.ones(len(c), dtype=torch.bool)
+    _, valid, fgv, mask, _, _ = m.read(patches, fg, vol, c, e, masked, g())
+    assert (valid & ~fgv).any()                                    # background is still read
+    assert torch.equal(mask, fgv)                                  # ratio 1: all foreground, nothing else
+    assert torch.isfinite(m(patches, g())["loss"])
