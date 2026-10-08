@@ -1,6 +1,6 @@
 """One table of every raw MRI volume we have, with standardized labels (NaN = not available).
 
-`python -m sfc_gdn2.data.catalog <raw_root> <mrrate_root> <mrrate_body_region.csv> <out.csv.gz> [brats_duplicates.csv]`
+`python -m sfc_gdn2.data.catalog <raw_root> <mrrate_root> <mrrate_body_region.csv> <out.csv.gz> [brats_duplicates*.csv ...]`
 
 Row = one volume: `dataset`, `cohort`, `subject` (global, `<source>:<id>`), `session`, `modality`
 (canonical, see `modality`), `variant` (source file entities), `path` (file or `zip://archive::member`),
@@ -240,21 +240,24 @@ def ucsf_pdgm(raw: Path) -> pd.DataFrame:
     return _join(df, meta, ["_id", "session"])
 
 
-def upenn_gbm(raw: Path) -> pd.DataFrame:  # needs datasets-meta/scripts/convert_upenn.sh (DICOM -> NIfTI)
-    base = raw / "UPENN-GBM"
-    series = pd.read_csv(base / "manifests/upenn_gbm_captk_series.csv").set_index("SeriesInstanceUID")
+def upenn_gbm(raw: Path) -> pd.DataFrame:
+    """TCIA NIfTI package (SRI24 240x240x155, skull-stripped, CaPTk = BraTS preprocessing): `<id>_11` baseline,
+    `<id>_21` follow-up. `seg`: manual segmentation where released (147), else the automated one (`seg_source`).
+    The IDC DICOM series (nifti/, native space, datasets-meta/scripts/convert_upenn.sh) are the same scans."""
+    base = raw / "UPENN-GBM/nifti_sri24/PKG - UPENN-GBM-NIfTI/UPENN-GBM/NIfTI-files"
     rows = []
-    for p in sorted(base.glob("nifti/UPENN-GBM-*/*.nii.gz")):
-        uid, pid = p.name.split(".nii")[0], p.parent.name
-        desc = series.SeriesDescription.get(uid, "").split(":")[0].strip()
-        rows.append({"dataset": "UPENN-GBM", "cohort": "UPENN-GBM", "_id": pid, "subject": f"UPENN-GBM:{pid}",
-                     "session": series.StudyInstanceUID.get(uid, ""), "modality": modality(desc), "variant": desc,
-                     "path": str(p)})
-    df = pd.DataFrame(rows, columns=["dataset", "cohort", "_id", "subject", "session", "modality", "variant", "path"])
-    c = pd.read_csv(base / "clinical/UPENN-GBM_clinical_info_v2.1.csv")
-    c = c[c.ID.str.endswith("_11")]  # baseline (pre-operative) scan of each patient
+    for d in sorted((base / "images_structural").glob("UPENN-GBM-*")):
+        pid, ses = d.name.rsplit("_", 1)
+        man, auto = base / f"images_segm/{d.name}_segm.nii.gz", base / f"automated_segm/{d.name}_automated_approx_segm.nii.gz"
+        seg, src = (man, "manual") if man.exists() else (auto, "automated") if auto.exists() else ("", "")
+        for m in ("T1", "T1GD", "T2", "FLAIR"):
+            rows.append({"dataset": "UPENN-GBM", "cohort": "UPENN-GBM", "_id": d.name, "subject": f"UPENN-GBM:{pid}",
+                         "session": ses, "modality": {"T1": "T1w", "T1GD": "T1c", "T2": "T2w", "FLAIR": "FLAIR"}[m],
+                         "variant": m, "path": str(d / f"{d.name}_{m}.nii.gz"), "seg": str(seg), "seg_source": src})
+    df = pd.DataFrame(rows)
+    c = pd.read_csv(raw / "UPENN-GBM/clinical/UPENN-GBM_clinical_info_v2.1.csv")
     meta = pd.DataFrame({
-        "_id": c.ID.str.removesuffix("_11"), "age": _num(c.Age_at_scan_years), "sex": c.Gender.map(sex),
+        "_id": c.ID, "age": _num(c.Age_at_scan_years), "sex": c.Gender.map(sex),
         "dx": "glioblastoma", "idh": c.IDH1.map({"Mutated": 1.0, "Wildtype": 0.0}),
         "mgmt": c.MGMT.map({"Methylated": 1.0, "Unmethylated": 0.0}),
         "os_days": _num(c.Survival_from_surgery_days_UPDATED),
@@ -380,7 +383,7 @@ def build(raw: Path, mrrate_root: Path, region_csv: Path) -> pd.DataFrame:
 if __name__ == "__main__":
     raw, mr, region, out = (Path(a) for a in sys.argv[1:5])
     df = build(raw, mr, region)
-    if len(sys.argv) > 5:  # brats_duplicates.csv: FOMO BraTS copies found by image fingerprint (no shared IDs)
-        df = df[~df.subject.isin(pd.read_csv(sys.argv[5])["drop"])]
+    for f in sys.argv[5:]:  # brats_duplicates*.csv: FOMO BraTS copies found by image fingerprint (no shared IDs)
+        df = df[~df.subject.isin(pd.read_csv(f)["drop"])]
     df.to_csv(out, index=False)
     print(df.groupby("dataset").agg(volumes=("path", "size"), subjects=("subject", "nunique")).to_string())
