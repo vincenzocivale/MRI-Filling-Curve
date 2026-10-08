@@ -166,13 +166,22 @@ def pixar(raw: Path) -> pd.DataFrame:
 
 
 def soop(raw: Path) -> pd.DataFrame:
-    # lesion masks are in DWI (TRACE) space, not registered to T1w/FLAIR: not attached
+    """`seg`: lesion mask coregistered to this T1w/FLAIR (datasets-meta/scripts/soop_coreg.py; the released masks
+    are in DWI TRACE space), only where its QC is `reliable`."""
     df = _bids(raw / "SOOP", "SOOP")
     p = pd.read_csv(raw / "SOOP/participants.tsv", sep="\t")
     meta = pd.DataFrame({"_id": p.participant_id.str.removeprefix("sub-"), "age": _num(p.age),
                          "sex": p.sex.map(sex), "nihss": _num(p.nihss), "mrs90": _num(p.gs_rankin_6isdeath),
                          "dx": np.where(p.acuteischaemicstroke == 1, "acute ischemic stroke", None)})
-    return _join(df, meta, ["_id"])
+    df = _join(df, meta, ["_id"])
+    coreg = raw.parent / "derivatives/SOOP-lesion-coreg"
+    if (coreg / "qc.csv").exists():
+        qc = pd.read_csv(coreg / "qc.csv")
+        ok = set(zip(qc.subject[qc.reliable], qc.target[qc.reliable]))
+        df["seg"] = [str(coreg / f"sub-{i}/anat/sub-{i}_space-{m}_desc-lesion_mask.nii.gz")
+                     if (f"sub-{i}", m) in ok and (coreg / f"sub-{i}/anat/sub-{i}_space-{m}_desc-lesion_mask.nii.gz").exists()
+                     else "" for i, m in zip(df._id, df.variant)]
+    return df
 
 
 def unlabelled(raw: Path, name: str) -> pd.DataFrame:  # SALD, Petfrog
