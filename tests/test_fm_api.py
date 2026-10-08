@@ -81,3 +81,17 @@ def test_save_trims_storage_only(tmp_path, fake_model):
     worker.main(str(tmp_path / "job.json"))
     res = torch.load(tmp_path / "a.pt")
     assert list(res["features"]) == ["embedding"] and res["features"]["embedding"].dtype == torch.float16
+
+
+def test_worker_group_shares_preprocessing_and_trims(tmp_path, fake_model):
+    save = {"features": ["embedding"], "dense": ["map_pool2"], "dtype": "float16",
+            "pool": [{"from": "map", "factor": 2, "to": "map_pool2"}]}
+    cfgs = [{"model": "fake", "repo": None, "save": save}, {"model": "fake", "repo": None}]
+    job = {"cfgs": cfgs, "outs": [str(tmp_path / "a"), str(tmp_path / "b")], "device": "cpu", "verify_shared": True,
+           "items": [{"id": "x", "image": "/x.nii.gz", "dense": True}, {"id": "y", "image": "/y.nii.gz"}]}
+    (tmp_path / "job.json").write_text(json.dumps(job))
+    worker.main(str(tmp_path / "job.json"))
+    x, y, xb = (torch.load(tmp_path / d / f"{i}.pt") for d, i in (("a", "x"), ("a", "y"), ("b", "x")))
+    assert set(x["features"]) == {"embedding", "map_pool2"} and x["features"]["map_pool2"].shape == (1, 1, 1, 1)
+    assert set(y["features"]) == {"embedding"} and y["features"]["embedding"].dtype == torch.float16
+    assert set(xb["features"]) == {"embedding", "map"} and "map_pool2" in x["derived"]

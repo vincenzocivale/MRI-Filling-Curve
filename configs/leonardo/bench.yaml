@@ -1,0 +1,43 @@
+# Downstream benchmark of the external FMs (and later ours): `sfc bench-split` writes the volume list and the
+# fixed subject-level splits; `sfc bench-extract <this> --group <g>` writes features (src/sfc_gdn2/bench.py).
+catalog: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/catalog.csv.gz
+totalseg_meta: /leonardo_scratch/large/userexternal/fcorrent/datasets/raw/TotalSegmentator/MRI_v300/Totalsegmentator_dataset_v300/meta.csv
+out_dir: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench   # volumes.csv, splits.csv, SHA256SUMS
+seeds: 5
+inputs_dir: /leonardo_scratch/large/userexternal/fcorrent/datasets/derivatives/bench_inputs   # bench.stage
+
+fm:
+  out_root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/fm_bench   # <out_root>/<config stem>/<id>.pt
+  # models in one group share the first one's preprocessing (same repo pipeline, same env);
+  # workers = CPU processes preprocessing ahead of the GPU (0: in-process, for repos that preprocess on the GPU)
+  groups:
+    brainiac: {configs: [brainiac], workers: 7}
+    openmind: {configs: [openmind_resencl_mae, openmind_primusm_mae, openmind_resencl_simclr], workers: 7}
+    nnfoundation: {configs: [nnfoundation_cnn, nnfoundation_vit], workers: 7}
+    fomo26: {configs: [fomo26], workers: 7}
+    brainfm: {configs: [brainfm], workers: 0}          # prepare_image resizes on the model's device
+    bsf_ukb: {configs: [bsf_ukb_pretrain], workers: 7}
+    bsf_atlas: {configs: [bsf_atlas_pretrain], workers: 7}
+    medicalnet: {configs: [medicalnet_resnet50_23dataset], workers: 7}
+    nnunet: {configs: [nnunet_totalseg_mr_870, nnunet_totalseg_mr_871], workers: 7}
+  # what is stored (fm/worker.py `trim`): globals + maps at stride >= 16 for every volume, stride-8 maps for
+  # `dense` volumes (segmentation). Computation is unchanged.
+  save:
+    brainiac: {features: [embedding, map, hidden_3, hidden_6, hidden_9]}
+    openmind_resencl_mae: &resenc {features: [crop_gap_last, gap_last, crop_last, stitched_stage5, stitched_stage4],
+                                   dense: [stitched_stage3]}
+    openmind_resencl_simclr: *resenc
+    nnfoundation_cnn: *resenc
+    openmind_primusm_mae: &tokens {features: [crop_gap_last, gap_last, stitched_tokens_pool2], dense: [stitched_tokens],
+                                   pool: [{from: stitched_tokens, factor: 2, to: stitched_tokens_pool2}]}
+    nnfoundation_vit: *tokens
+    fomo26: {features: [embedding, stage5, stage4], dense: [stage3]}
+    brainfm: {features: [feat_last_fgmean, feat_0, feat_1], dense: [feat_2, feat_last_pool8], drop_canonical: true,
+              pool: [{from: feat_last, factor: 8, to: feat_last_pool8}]}
+    bsf_ukb_pretrain: &bsf {features: [stage4_gap, stage4, stage3], dense: [stage2]}
+    bsf_atlas_pretrain: *bsf
+    medicalnet_resnet50_23dataset: {features: [layer4_gap, layer4_pool144], drop_canonical: true,
+                                    pool: [{from: layer4, factor: [1, 4, 4], to: layer4_pool144}]}
+    nnunet_totalseg_mr_870: &nnunet {features: [fg_mean_stage0, fg_mean_stage1, fg_mean_stage2, fg_mean_stage3,
+                                                fg_mean_stage4, stage4, stage3], dense: [stage2]}
+    nnunet_totalseg_mr_871: *nnunet

@@ -43,7 +43,10 @@ Triton kernels (`TRITON_CACHE_DIR` on $WORK keeps them across jobs).
 - `data/`: manifests (`zip_bids`, `totalseg`), labels, subject-level splits, `VolumeStore` native cache, loader (volumes as a list;
   `to_device` makes values + per-scan [N,P] patches; `grid`, `k`, `spacing` [B,3]).
 - `fm/`: external foundation models, image -> the model's own features. `api.extract` (`sfc fm`) runs `worker.py` under the model's conda env (`envs/fm/`, path in `configs/fm/*.yaml`); each wrapper (`base.Wrapper`) imports the ORIGINAL repo code for preprocessing, network, inference and outputs. Parity scripts in `tests/fm/`.
-- `cli.py`: `sfc prepare|split|pretrain|probe|fm|summarize`.
+- `bench.py`: downstream benchmark volume list (one per subject/session/sequence, `dense` = stride-8 maps kept),
+  input staging (OASIS Analyze -> NIfTI, hard links for paths with spaces) and fixed 70/10/20 subject splits;
+  `sfc bench-split|bench-extract configs/leonardo/bench.yaml` (FM groups sharing one preprocessing, CPU prefetch).
+- `cli.py`: `sfc prepare|split|pretrain|probe|fm|summarize|bench-split|bench-extract`.
 - `slurm/`: `submit.py` + YAML presets to sbatch any command on Leonardo (`python slurm/submit.py slurm/presets/<p>.yaml -- <cmd>`).
 
 ## Invariants (do not break)

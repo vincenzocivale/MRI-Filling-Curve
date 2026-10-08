@@ -45,17 +45,27 @@ def image_id(image) -> str:
     return p.name.removesuffix(".gz").removesuffix(".nii")
 
 
-def extract(config: str | Path | dict, images: list, out: str | Path, device: str = "cuda",
-            overwrite: bool = False, ids: list[str] | None = None) -> list[Path]:
-    """images: paths, or {modality: path} dicts for multi-modal models. Returns the written files."""
-    cfg = config if isinstance(config, dict) else load_config(config)
+def extract(config, images: list, out, device: str = "cuda", overwrite: bool = False,
+            ids: list[str] | None = None, dense: list[bool] | None = None, workers: int = 0,
+            verify_shared: bool = False) -> list[Path]:
+    """images: paths, or {modality: path} dicts for multi-modal models. Returns the written files.
+
+    `config` / `out` may be lists (same length): a group of models sharing the first one's preprocessing
+    (same env required); `dense` flags items whose `save.dense` features are kept. See worker.py."""
+    cfgs = [c if isinstance(c, dict) else load_config(c) for c in (config if isinstance(config, list) else [config])]
+    outs = [Path(o) for o in (out if isinstance(out, list) else [out])]
+    if len(outs) != len(cfgs) or len({c["env"] for c in cfgs}) != 1:
+        raise ValueError("a model group needs one `out` per config and a single env")
+    cfg = cfgs[0]
     ids = ids or [image_id(im) for im in images]
     if len(set(ids)) != len(ids):
         raise ValueError("image ids are not unique; pass `ids`.")
-    items = [{"id": i, "image": im if isinstance(im, dict) else str(im)} for i, im in zip(ids, images)]
-    out = Path(out)
+    dense = dense or [False] * len(ids)
+    items = [{"id": i, "image": im if isinstance(im, dict) else str(im), "dense": bool(d)}
+             for i, im, d in zip(ids, images, dense)]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump({"cfg": cfg, "items": items, "out": str(out), "device": device, "overwrite": overwrite}, f)
+        json.dump({"cfgs": cfgs, "items": items, "outs": [str(o) for o in outs], "device": device,
+                   "overwrite": overwrite, "workers": workers, "verify_shared": verify_shared}, f)
     python = Path(cfg["env"]) / "bin" / "python"
     env = os.environ | {"PYTHONPATH": os.pathsep.join([str(SRC), *filter(None, [os.environ.get("PYTHONPATH")])]),
                         "PYTHONNOUSERSITE": "1"}
@@ -63,4 +73,4 @@ def extract(config: str | Path | dict, images: list, out: str | Path, device: st
         subprocess.run([str(python), "-m", "sfc_gdn2.fm.worker", f.name], env=env, check=True)
     finally:
         os.unlink(f.name)
-    return [out / f"{i}.pt" for i in ids]
+    return [o / f"{i}.pt" for o in outs for i in ids]

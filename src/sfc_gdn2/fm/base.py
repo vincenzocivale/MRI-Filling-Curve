@@ -69,7 +69,11 @@ class Wrapper:
             unknown = set(image) - set(self.modalities)
             if unknown:
                 raise ValueError(f"{self.name}: unknown modalities {sorted(unknown)}; accepted {self.modalities}.")
-        out = self.features(self.preprocess(image))
+        return self.finish(self.preprocess(image))
+
+    def finish(self, prepared: Any) -> dict:
+        """features() + the contract checks and provenance."""
+        out = self.features(prepared)
         missing = {"features", "canonical", "meta"} - set(out)
         if missing or out["canonical"] not in out["features"]:
             raise RuntimeError(f"{self.name}: wrapper output violates the contract ({sorted(missing)} missing "

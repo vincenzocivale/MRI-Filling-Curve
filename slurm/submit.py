@@ -89,7 +89,7 @@ def build_script(cfg: dict[str, Any], command: list[str]) -> tuple[str, str]:
     mail = cfg.get("mail") or {}
     head = [directive(k, cfg.get(k)) for k in
             ("partition", "account", "qos", "job_name", "nodes", "ntasks_per_node", "cpus_per_task", "gres",
-             "mem", "time", "signal")]
+             "mem", "time", "signal", "array")]
     head += [directive("output", logs["output"]), directive("error", logs["error"]),
              directive("mail_type", mail.get("type") if mail.get("user") else None),
              directive("mail_user", mail.get("user"))]

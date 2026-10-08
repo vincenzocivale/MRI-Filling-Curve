@@ -1,8 +1,9 @@
-"""`sfc <command> <config>`: prepare | split | pretrain | probe | fm | summarize."""
+"""`sfc <command> <config>`: prepare | split | pretrain | probe | fm | summarize | bench-split | bench-extract."""
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -73,6 +74,43 @@ def fm(_, args) -> None:
     extract(args.config, images, args.out, device=args.device, overwrite=args.overwrite, ids=ids)
 
 
+def bench_split(cfg: dict, _) -> None:
+    """Volume list + fixed splits of the downstream benchmark (src/sfc_gdn2/bench.py)."""
+    from . import bench
+    out = Path(cfg["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    vols = bench.stage(bench.volumes(pd.read_csv(cfg["catalog"], low_memory=False)), cfg["inputs_dir"])
+    spl = bench.splits(vols, cfg["totalseg_meta"], int(cfg["seeds"]))
+    vols.to_csv(out / "volumes.csv", index=False)
+    spl.to_csv(out / "splits.csv", index=False)
+    (out / "SHA256SUMS").write_text("".join(f"{bench.sha256(out / n)}  {n}\n" for n in ("volumes.csv", "splits.csv")))
+    print(vols.groupby("dataset").agg(volumes=("id", "size"), dense=("dense", "sum")).to_string())
+    print(spl.groupby(["dataset", "split_s0"]).size().unstack().to_string(), f"\n{out}")
+
+
+def bench_extract(cfg: dict, args) -> None:
+    """Features of one model group (`--group`) for the benchmark volumes, one shard (`--shard i/n`, `auto/n` =
+    $SLURM_ARRAY_TASK_ID) or `--sample k` volumes per dataset (pilot)."""
+    from .fm.api import extract, load_config
+    vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv")
+    if args.query:
+        vols = vols.query(args.query)
+    if args.sample:
+        vols = pd.concat([g.sort_values("dense", ascending=False, kind="stable").head(args.sample)
+                          for _, g in vols.groupby("dataset")])
+    if args.shard:
+        i, n = args.shard.split("/")
+        i = int(os.environ["SLURM_ARRAY_TASK_ID"]) if i == "auto" else int(i)
+        vols = vols.iloc[i::int(n)]
+    group, fm_cfg = cfg["fm"]["groups"][args.group], cfg["fm"]
+    root = Path(args.out or fm_cfg["out_root"])
+    cfgs = [load_config(f"configs/fm/{s}.yaml") | {"save": fm_cfg["save"][s] | {"dtype": "float16"}}
+            for s in group["configs"]]
+    extract(cfgs, vols["input"].tolist(), [root / s for s in group["configs"]], device=args.device,
+            ids=vols["id"].tolist(), dense=vols["dense"].tolist(), workers=int(group["workers"]),
+            verify_shared=args.verify_shared)
+
+
 def summarize(_, args) -> None:
     """One row per (run, probe, candidate) under <root>: every checkpoint per run, plus the raw baselines."""
     root, rows = Path(args.config), []
@@ -91,7 +129,8 @@ def summarize(_, args) -> None:
     df.to_csv(root / "probe_summary.csv", index=False)
 
 
-COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize}
+COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize,
+            "bench-split": bench_split, "bench-extract": bench_extract}
 
 
 def main() -> None:
@@ -102,9 +141,14 @@ def main() -> None:
     ap.add_argument("--raw", help="probe: also run the encoder-free baseline (pass the pretrain config)")
     ap.add_argument("--images", nargs="+", help="fm: image files (single-modality models)")
     ap.add_argument("--csv", help="fm: CSV with `id` + one column per modality")
-    ap.add_argument("--out", help="fm: output directory (one <id>.pt per image)")
+    ap.add_argument("--out", help="fm: output directory (one <id>.pt per image); bench-extract: output root")
     ap.add_argument("--device", default="cuda", help="fm: cuda | cpu")
     ap.add_argument("--overwrite", action="store_true", help="fm: recompute existing outputs")
+    ap.add_argument("--group", help="bench-extract: model group of the config")
+    ap.add_argument("--shard", help="bench-extract: i/n or auto/n ($SLURM_ARRAY_TASK_ID)")
+    ap.add_argument("--sample", type=int, help="bench-extract: only k volumes per dataset (dense first)")
+    ap.add_argument("--query", help="bench-extract: pandas query on volumes.csv, e.g. \"dataset != 'IXI'\"")
+    ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):
         ap.error("fm needs --images or --csv, and --out")

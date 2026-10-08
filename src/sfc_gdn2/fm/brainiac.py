@@ -2,7 +2,7 @@
 
 All references are to the original repo (`cfg["repo"]`, verified at ba60f45), under `src/`:
 - preprocessing (default, `args.preprocessed: false`): `preprocessing/mri_preprocess_3d_simple.py:main`
-  (:125), exactly as quickstart.ipynb cell 4 runs it: SimpleITK N4 (:74), resampling of the template to
+  (:125), exactly as quickstart.ipynb cell 4 runs it, split in its two steps (`preprocess_cpu` / `preprocess_gpu`): SimpleITK N4 (:74), resampling of the template to
   1 mm + rigid Euler3D Mattes-MI registration to `preprocessing/atlases/temp_head.nii.gz` (:76-143), then the
   vendored HD-BET in fast mode, no TTA (:25 -> `preprocessing/HD_BET/hd_bet.py:10`). Registration samples
   1% of voxels at random with a wall-clock seed (:113), so this step is not bitwise reproducible.
@@ -62,39 +62,56 @@ class BrainIAC(Wrapper):
         self.template = str(self.args.get("template") or src / "preprocessing/atlases/temp_head.nii.gz")
         self.keep_dir = self.args.get("keep_dir")
 
-    def _run_repo_preprocessing(self, image: str, work: Path) -> Path:
-        """The repo's mri_preprocess_3d_simple.main on a one-file input dir (it globs `*.nii.gz` and takes the
-        ID as the name up to the first dot, :49), returning `<out>/<ID>_0000.nii.gz`."""
-        import mri_preprocess_3d_simple as mp
-
-        ident = Path(image).name.split(".")[0].replace("_mask", "_msk") or "image"  # "_mask" files are skipped (:66)
-        src_dir, out_dir = work / "in", work / "out"
-        src_dir.mkdir()
-        (src_dir / f"{ident}.nii.gz").symlink_to(Path(image).resolve())
-        mp.main(temp_img=self.template, input_dir=str(src_dir), output_dir=str(out_dir))
-        out = out_dir / f"{ident}_0000.nii.gz"
-        if not out.exists():
-            raise RuntimeError(f"brainiac: repo preprocessing produced no output for {image}")
-        return out
-
-    def preprocess(self, image: Image) -> dict:
+    def preprocess_cpu(self, image: Image) -> dict:
+        """Step 1 of the repo's mri_preprocess_3d_simple.main (:155-180) on a one-file input dir (it globs
+        `*.nii.gz` and takes the ID as the name up to the first dot, :49): `registration` = N4 + rigid registration
+        (SimpleITK, CPU). The worker runs this ahead in CPU processes; `preprocess_gpu` does the rest."""
         if not isinstance(image, str):
             raise TypeError("brainiac is single-modality: pass a NIfTI path")
+        if self.preprocessed:
+            return {"source": image, "work": None}
+        import mri_preprocess_3d_simple as mp
+
         work = Path(tempfile.mkdtemp(prefix="brainiac_"))
+        ident = Path(image).name.split(".")[0].replace("_mask", "_msk") or "image"  # "_mask" files are skipped (:66)
+        (work / "in").mkdir()
+        (work / "out" / "temp_registered").mkdir(parents=True)
+        (work / "in" / f"{ident}.nii.gz").symlink_to(Path(image).resolve())
+        mp.registration(input_dir=str(work / "in"), output_dir=str(work / "out" / "temp_registered"),
+                        temp_img=self.template)
+        return {"source": image, "work": str(work), "ident": ident}
+
+    def preprocess_gpu(self, staged: dict) -> dict:
+        """Step 2 of main (:182-190): HD-BET (fast, no TTA) on device "0" if CUDA else "cpu", as main picks it;
+        then the model input transform."""
+        image, work = staged["source"], staged["work"]
         try:
-            if self.preprocessed:
+            if work is None:
                 log.warning("brainiac: preprocessed=true, skipping N4/registration/HD-BET for %s", image)
                 path = Path(image)
             else:
-                path = self._run_repo_preprocessing(image, work)
+                import mri_preprocess_3d_simple as mp
+
+                out = Path(work) / "out"
+                if not (out / "temp_registered" / f"{staged['ident']}_0000.nii.gz").exists():
+                    raise RuntimeError(f"brainiac: repo registration produced no output for {image}")
+                mp.brain_extraction(input_dir=str(out / "temp_registered"), output_dir=str(out),
+                                    device="0" if torch.cuda.is_available() else "cpu")
+                path = out / f"{staged['ident']}_0000.nii.gz"
+                if not path.exists():
+                    raise RuntimeError(f"brainiac: repo preprocessing produced no output for {image}")
                 if self.keep_dir:
                     Path(self.keep_dir).mkdir(parents=True, exist_ok=True)
                     path = Path(shutil.copy2(path, Path(self.keep_dir) / path.name))
             x = self.transform({"image": str(path)})["image"]  # MetaTensor [1, 96, 96, 96]
         finally:
-            shutil.rmtree(work, ignore_errors=True)
+            if work:
+                shutil.rmtree(work, ignore_errors=True)
         kept = self.preprocessed or bool(self.keep_dir)
         return {"image": x, "source": image, "preprocessed_path": str(path) if kept else None}
+
+    def preprocess(self, image: Image) -> dict:
+        return self.preprocess_gpu(self.preprocess_cpu(image))
 
     @torch.no_grad()
     def features(self, prepared: dict) -> dict:
