@@ -192,6 +192,7 @@ def main(job_path: str) -> None:
                 tmp = dst.with_suffix(".tmp")
                 torch.save(res, tmp)
                 os.replace(tmp, dst)
+                (out / "_failed" / f"{it['id']}.txt").unlink(missing_ok=True)
                 done += 1
                 shapes = {k: tuple(v.shape) for k, v in res["features"].items() if isinstance(v, torch.Tensor)}
                 print(f"[fm] {cfg['model']} {it['id']}: {shapes} canonical={res['canonical']} pre={t_pre:.1f}s "

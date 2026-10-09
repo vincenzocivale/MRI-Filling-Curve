@@ -34,10 +34,15 @@ def test_stage_converts_analyze_and_links_spaced_paths(tmp_path):
     (tmp_path / "d d").mkdir()
     nib.save(nib.Nifti1Image(a[..., 0], np.eye(4)), tmp_path / "d d" / "y.nii.gz")
     nib.save(nib.Nifti1Image(a[..., 0], np.eye(4)), tmp_path / "z.nii.gz")
-    vols = pd.DataFrame({"id": ["x", "y", "z"], "path": [str(tmp_path / "x.img"), str(tmp_path / "d d" / "y.nii.gz"),
-                                                         str(tmp_path / "z.nii.gz")]})
+    sheared = np.eye(4)
+    sheared[0, 1] = 0.01
+    nib.save(nib.Nifti1Image(a[..., 0], sheared), tmp_path / "w.nii.gz")
+    vols = pd.DataFrame({"id": ["x", "y", "z", "w"], "path": [str(tmp_path / n) for n in
+                                                              ("x.img", "d d/y.nii.gz", "z.nii.gz", "w.nii.gz")]})
     out = bench.stage(vols, tmp_path / "in").set_index("id")
     x = nib.load(out.at["x", "input"])
     assert x.shape == (2, 3, 4) and (np.asarray(x.dataobj) == a[..., 0]).all() and out.at["x", "shape"] == "2x3x4"
     assert " " not in out.at["y", "input"] and Path(out.at["y", "input"]).stat().st_nlink == 2
     assert out.at["z", "input"] == str(tmp_path / "z.nii.gz")
+    w = nib.load(out.at["w", "input"])
+    assert not bench._oblique(w.affine) and (np.asarray(w.dataobj) == a[..., 0]).all()

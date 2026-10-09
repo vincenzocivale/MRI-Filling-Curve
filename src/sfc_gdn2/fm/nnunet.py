@@ -44,6 +44,15 @@ from .base import Wrapper, add_to_path
 TS_TRIPLE_SPLIT_VOXELS = 512 * 512 * 900  # TS/totalsegmentator/nnunet.py:569
 
 
+def block_mean(x: torch.Tensor, stride: list[int]) -> torch.Tensor:
+    """[C, *S] -> mean over stride blocks, the last partial block averaged over its voxels only (= avg_pool ceil_mode,
+    which refuses axes shorter than the stride, e.g. thin TotalSeg volumes)."""
+    pad = [p for s, n in zip(reversed(stride), reversed(x.shape[1:])) for p in (0, -n % s)]
+    pool = F.avg_pool3d if len(stride) == 3 else F.avg_pool2d
+    ones = torch.ones(1, *x.shape[1:], device=x.device, dtype=x.dtype)
+    return pool(F.pad(x, pad)[None], stride, stride)[0] / pool(F.pad(ones, pad)[None], stride, stride)[0]
+
+
 class _Replay(nn.Module):
     """Stands in for the network inside nnU-Net's sliding window: returns the encoder map recorded at the same
     call of the real run, repeated `stride` times per axis so it covers the patch like the logits do."""
@@ -174,8 +183,7 @@ class NNUNet(Wrapper):
             field = self._stitch(maps, stride, data)  # [C, *shape] on the results device, fp16
             m = mask.to(field.device)
             feats[f"fg_mean_stage{k}"] = (field * m).flatten(1).float().sum(1).cpu() / m.sum().clamp_min(1).cpu()
-            feats[f"stage{k}"] = F.avg_pool3d(field[None].float(), stride, stride, ceil_mode=True)[0].cpu() \
-                if len(stride) == 3 else F.avg_pool2d(field[None].float(), stride, stride, ceil_mode=True)[0].cpu()
+            feats[f"stage{k}"] = block_mean(field.float(), stride).cpu()
             feats[f"tiles_stage{k}"] = torch.cat(maps)
             del field
         if self.args.get("return_logits", True):

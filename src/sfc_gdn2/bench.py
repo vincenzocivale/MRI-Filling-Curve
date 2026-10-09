@@ -111,10 +111,24 @@ def splits(vols: pd.DataFrame, totalseg_meta: str | Path, seeds: int = 5) -> pd.
     return out.reset_index().sort_values(["dataset", "subject"]).reset_index(drop=True)
 
 
+def _oblique(affine: np.ndarray, tol: float = 1e-6) -> bool:
+    r = affine[:3, :3] / np.linalg.norm(affine[:3, :3], axis=0)
+    return bool(np.abs(r.T @ r - np.eye(3)).max() > tol)
+
+
+def _orthonormal(affine: np.ndarray) -> np.ndarray:
+    z = np.linalg.norm(affine[:3, :3], axis=0)
+    u, _, vt = np.linalg.svd(affine[:3, :3] / z)
+    out = affine.copy()
+    out[:3, :3] = (u @ vt) * z
+    return out
+
+
 def stage(vols: pd.DataFrame, root: str | Path) -> pd.DataFrame:
     """Model input per volume (`input`) + its header (`shape`, `spacing`). The original file, except: Analyze
     .img / singleton-4D (OASIS) -> a 3D NIfTI copy under `root` (nibabel's affine); paths with spaces (UCSF, UPENN;
-    MedicalNet splits its image list on spaces) -> a hard link under `root`. Same voxels for every model."""
+    MedicalNet splits its image list on spaces) -> a hard link under `root`; sheared affine (non-orthonormal direction
+    cosines, which ITK refuses) -> a copy with the nearest orthonormal direction. Same voxels for every model."""
     import nibabel as nib
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -128,6 +142,9 @@ def stage(vols: pd.DataFrame, root: str | Path) -> pd.DataFrame:
                 raise ValueError(f"{p}: not a 3D volume {img.shape}")
             if not dst.exists():
                 nib.save(nib.Nifti1Image.from_image(img), dst)
+        elif _oblique(img.affine):  # ITK readers reject non-orthonormal direction cosines (some TotalSeg files)
+            if not dst.exists():
+                nib.save(nib.Nifti1Image(np.asanyarray(img.dataobj), _orthonormal(img.affine), img.header), dst)
         elif " " in p:
             dst = root / (i + (".nii.gz" if p.endswith(".gz") else ".nii"))
             if not dst.exists():
