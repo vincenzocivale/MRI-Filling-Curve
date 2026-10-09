@@ -104,19 +104,21 @@ def _init(cfg: dict) -> None:
     _PREP = build(cfg, "cpu")
 
 
-def _prep(image) -> bytes:
+def _prep(image, fn: str | None = None) -> bytes:
     t0 = time.time()
-    x = getattr(_PREP, "preprocess_cpu", _PREP.preprocess)(image)  # CPU part only, if the wrapper splits it
+    x = getattr(_PREP, fn) if fn else getattr(_PREP, "preprocess_cpu", _PREP.preprocess)  # CPU part, if split
+    x = x(image)
     return pickle.dumps((x, time.time() - t0), protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def prepared(lead, cfg: dict, items: list, workers: int):
-    """Yield (item, preprocessed | None, error | None, seconds), in item order."""
+def prepared(lead, cfg: dict, items: list, workers: int, fn: str | None = None):
+    """Yield (item, preprocessed | None, error | None, seconds), in item order; `fn` = the wrapper's
+    preprocessing method (default `preprocess`, its CPU part `preprocess_cpu` in the workers)."""
     if workers <= 0:
         for it in items:
             t0 = time.time()
             try:
-                yield it, lead.preprocess(it["image"]), None, time.time() - t0
+                yield it, getattr(lead, fn or "preprocess")(it["image"]), None, time.time() - t0
             except Exception:  # noqa: BLE001 -- logged per item, the shard goes on
                 yield it, None, traceback.format_exc(), time.time() - t0
         return
@@ -125,7 +127,7 @@ def prepared(lead, cfg: dict, items: list, workers: int):
     try:
         ex = cf.ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_init, initargs=(cfg,))
         todo = iter(items)
-        window = [(it, ex.submit(_prep, it["image"])) for it in itertools.islice(todo, 2 * workers)]  # spawns
+        window = [(it, ex.submit(_prep, it["image"], fn)) for it in itertools.islice(todo, 2 * workers)]  # spawns
     finally:
         os.environ.clear()
         os.environ.update(env)
@@ -140,7 +142,7 @@ def prepared(lead, cfg: dict, items: list, workers: int):
                 raise
             except Exception:  # noqa: BLE001 -- logged per item, the shard goes on
                 yield it, None, traceback.format_exc(), float("nan")
-            window += [(n, ex.submit(_prep, n["image"])) for n in itertools.islice(todo, 1)]
+            window += [(n, ex.submit(_prep, n["image"], fn)) for n in itertools.islice(todo, 1)]
 
 
 def fail(out: Path, item_id: str, err: str) -> None:

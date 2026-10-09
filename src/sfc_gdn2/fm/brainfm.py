@@ -111,6 +111,29 @@ class BrainFM(Wrapper):
         }
         return {"input": x, "meta": meta}
 
+    # ------------------------------------------------------------------ segmentation (fm/segrun.py)
+    seg_bf16 = False  # the repo infers in fp32; its torch 2.0 has no bf16 upsample_nearest3d
+
+    def seg_input(self, prepared: dict):
+        """The 1 mm RAS zero-cropped volume the network sees (meta["affine"]: its voxel -> world)."""
+        meta = prepared["meta"]
+        m = np.linalg.inv(meta["affine"].numpy()) @ meta["source_affine"].numpy()
+        return prepared["input"][0].float().cpu(), m
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        """The repo's task head on the frozen backbone: `TaskHead` with task_f_maps [64] (cfgs/trainer/default_train.yaml:26)
+        = one 1x1 conv on feat_last (head.py:40), here with n_out classes; training crop 128^3 (cfgs/generator/
+        default.yaml:63). random: the backbone re-initialised with each layer's reset_parameters."""
+        import copy
+
+        head = torch.nn.Conv3d(64, n_out, 1)  # before the backbone reset: same head init in both builds
+        backbone = copy.deepcopy(self.model.backbone)
+        if not pretrained:
+            for mod in backbone.modules():
+                if hasattr(mod, "reset_parameters"):
+                    mod.reset_parameters()
+        return _FeatLastHead(backbone, head), ["backbone"], (128, 128, 128)
+
     @torch.no_grad()
     def features(self, prepared: dict) -> dict:
         x = prepared["input"]
@@ -136,6 +159,15 @@ class BrainFM(Wrapper):
                           "feat_last == feat_5 is on the input grid (meta['affine'])",
         }
         return {"features": feats, "canonical": "feat_last", "meta": meta, "derived": ["feat_last_fgmean"]}
+
+
+class _FeatLastHead(torch.nn.Module):
+    def __init__(self, backbone, head):
+        super().__init__()
+        self.backbone, self.head = backbone, head
+
+    def forward(self, x):
+        return self.head(self.backbone.get_feature(x)[-1])  # joiner.py:180 -> head.py:40
 
 
 def build(cfg: dict, device: str) -> BrainFM:

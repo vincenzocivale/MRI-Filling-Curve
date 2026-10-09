@@ -45,3 +45,13 @@ fm:
     nnunet_totalseg_mr_870: &nnunet {features: [fg_mean_stage0, fg_mean_stage1, fg_mean_stage2, fg_mean_stage3,
                                                 fg_mean_stage4, stage4, stage3], dense: [stage2]}
     nnunet_totalseg_mr_871: *nnunet
+
+# `sfc bench-segdec`: segmentation through each model's official decoder on its frozen encoder (bench_segdec.py,
+# fm/segrun.py); same volumes, recipe and budget for every model
+segdec:
+  cache: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/segdec_bench/inputs   # <cache>/<group lead>/<id>.pt
+  out: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/segdec_bench           # <out>/<task>/s<seed>/<model>__<init>.json
+  iters: 12500       # 50 nnU-Net epochs of 250 iterations
+  val_every: 2500   # 5 validations (sliding window on the val volumes)
+  batch: 2
+  lr: 1.0e-3         # AdamW on the non-frozen parameters, poly decay

@@ -154,6 +154,28 @@ class NNUNet(Wrapper):
         data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
         return {"data": data, "seg": seg, "properties": props, "totalseg": geo}
 
+    # ------------------------------------------------------------------ segmentation (fm/segrun.py)
+    def seg_input(self, prepared: dict):
+        """nnU-Net's preprocessed volume (after TotalSegmentator's canonical + resampling steps)."""
+        from ..bench_geom import source_to_input
+        meta = {"totalseg": prepared["totalseg"], "nnunet_properties": prepared["properties"],
+                "transpose_forward": self.predictor.plans_manager.transpose_forward,
+                "preprocessed_shape": list(prepared["data"].shape[1:])}
+        return prepared["data"], source_to_input("nnunet", meta)
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        """The checkpoint's nnU-Net architecture with n_out outputs: encoder from the trained network, decoder from
+        scratch (as nnU-Net's pretrained fine-tuning, pretrainedTrainer.py:167)."""
+        from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+        cm = self.predictor.configuration_manager
+        net = get_network_from_plans(cm.network_arch_class_name, cm.network_arch_init_kwargs,
+                                     cm.network_arch_init_kwargs_req_import, 1, n_out, allow_init=True,
+                                     deep_supervision=False)
+        if pretrained:
+            params = self.predictor.list_of_parameters[0]
+            net.encoder.load_state_dict({k[len("encoder."):]: v for k, v in params.items() if k.startswith("encoder.")})
+        return net, ["encoder"], tuple(cm.patch_size)
+
     def _stitch(self, maps: list[torch.Tensor], stride: list[int], data: torch.Tensor) -> torch.Tensor:
         """nnU-Net's own sliding-window aggregation applied to the recorded maps -> [C, *data.shape[1:]]."""
         p = self.predictor

@@ -217,6 +217,34 @@ class BrainSegFounder(Wrapper):
         model.swinViT.load_state_dict(swin_sd, strict=True)
         return model, model.swinViT
 
+    # ---------------------------------------------------------------- segmentation (fm/segrun.py)
+    def seg_input(self, prepared: dict):
+        """The pipeline's network input (ukb: RAS, intensity-scaled, foreground crop; atlas: the 96^3 resize)."""
+        from ..bench_geom import source_to_input
+
+        x = prepared["image"]
+        if self.pipeline == "atlas":
+            m = source_to_input("bsf_atlas", {"source_shape": prepared["source_shape"], "input_shape": tuple(x.shape[1:])})
+            return torch.as_tensor(x).float(), m
+        if self.pipeline != "ukb":
+            raise NotImplementedError(f"brainsegfounder/{self.pipeline}: segmentation inputs are wired for ukb / atlas")
+        m = source_to_input("bsf_ukb", {"input_affine": x.affine.to(torch.float64),
+                                        "source_affine": torch.as_tensor(np.asarray(x.meta["original_affine"]))})
+        return x.as_tensor().float(), m
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        """The repo's fine-tuning network (SwinUNETR, downstream/ATLAS/finetune.py:115-125, BraTS/finetuning): swinViT
+        from the checkpoint, the conv encoders/decoders (incl. the full-resolution `encoder1` on the image) from
+        scratch; patch = the roi (96^3; ATLAS: the whole resized volume)."""
+        from monai.networks.nets import SwinUNETR
+
+        net = SwinUNETR(img_size=self.roi, in_channels=self.in_channels, out_channels=n_out,
+                        feature_size=int(self.args.get("feature_size", 48)), use_checkpoint=False,
+                        depths=list(self.args.get("depths", [2, 2, 2, 2])))
+        if pretrained:
+            net.swinViT.load_state_dict(self.swin.state_dict(), strict=True)
+        return net, ["swinViT"], (self.roi,) * 3
+
     # ---------------------------------------------------------------- inference
     def _predict(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """One window (or the whole ATLAS volume) -> hidden states (+ decoder1 output for SwinUNETR)."""

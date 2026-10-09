@@ -1,4 +1,5 @@
-"""`sfc <command> <config>`: prepare | split | pretrain | probe | fm | summarize | bench-split | bench-extract."""
+"""`sfc <command> <config>`: prepare | split | pretrain | probe | fm | summarize | bench-split | bench-extract |
+bench-probe | bench-segdec."""
 from __future__ import annotations
 
 import argparse
@@ -133,6 +134,27 @@ def bench_probe(cfg: dict, args) -> None:
     bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device, common)
 
 
+def bench_segdec(cfg: dict, args) -> None:
+    """Segmentation through each model's official decoder on its frozen encoder (bench_segdec.py): `--stage prep
+    --group g [--shard i/n|auto/n]` caches a group's preprocessed inputs; `--stage train --models m.. --init
+    pretrained|random` trains and tests (`--tasks`: default every seg task; `--sample k`, `--iters n`: pilots)."""
+    from . import bench_segdec as bs
+    from .io import load_yaml
+    tasks = load_yaml(cfg["probe"]["tasks"])
+    tasks = {t: tasks[t] for t in (args.tasks or [t for t, c in tasks.items() if c["type"] == "seg"])}
+    vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv", low_memory=False, dtype={"session": str})
+    splits = pd.read_csv(Path(cfg["out_dir"]) / "splits.csv")
+    seed = int(args.seeds.split(",")[0])
+    items = bs.task_items(tasks, vols, splits, seed, args.sample)
+    if args.stage == "prep":
+        shard = args.shard and args.shard.replace("auto", os.environ.get("SLURM_ARRAY_TASK_ID", "auto"))
+        bs.prep(cfg, args.group, items, args.device, shard)
+        return
+    for m in args.models:
+        for t in tasks:
+            bs.train(cfg, m, t, items[t], seed, args.init, args.device, args.iters)
+
+
 def summarize(_, args) -> None:
     """One row per (run, probe, candidate) under <root>: every checkpoint per run, plus the raw baselines."""
     root, rows = Path(args.config), []
@@ -152,7 +174,8 @@ def summarize(_, args) -> None:
 
 
 COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize,
-            "bench-split": bench_split, "bench-extract": bench_extract, "bench-probe": bench_probe}
+            "bench-split": bench_split, "bench-extract": bench_extract, "bench-probe": bench_probe,
+            "bench-segdec": bench_segdec}
 
 
 def main() -> None:
@@ -175,6 +198,9 @@ def main() -> None:
     ap.add_argument("--seeds", default="0", help="bench-probe: split seeds, e.g. 0,1,2,3,4")
     ap.add_argument("--common", nargs="+", help="bench-probe: models whose shared volumes are used (default: --models)")
     ap.add_argument("--cache-only", action="store_true", help="bench-probe: only build the feature caches")
+    ap.add_argument("--stage", choices=["prep", "train"], help="bench-segdec: prep (group inputs) | train")
+    ap.add_argument("--init", default="pretrained", choices=["pretrained", "random"], help="bench-segdec: encoder")
+    ap.add_argument("--iters", type=int, help="bench-segdec: training iterations (pilot override)")
     ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):

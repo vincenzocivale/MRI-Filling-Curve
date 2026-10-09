@@ -80,6 +80,27 @@ class MedicalNet(Wrapper):
         return {"image": torch.from_numpy(x), "path": image, "source_shape": tuple(int(s) for s in img.shape[:3]),
                 "source_affine": torch.as_tensor(img.affine, dtype=torch.float64)}
 
+    # ------------------------------------------------------------------ segmentation (fm/segrun.py)
+    def seg_input(self, prepared: dict):
+        from ..bench_geom import source_to_input
+        x = prepared["image"]
+        return x, source_to_input("medicalnet", {"source_shape": prepared["source_shape"],
+                                                 "input_shape": tuple(x.shape[1:])})
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        """The repo's segmentation network: resnet + `conv_seg` (resnet.py:145-170, transposed conv to stride 4) with
+        n_out classes, backbone from the checkpoint (model.py:88-115), conv_seg from scratch; its output is resized to
+        the input grid (trilinear, as test.py:60-67 zooms the prediction with order 1). Whole-volume input."""
+        from models import resnet
+
+        net = getattr(resnet, f"resnet{self.depth}")(
+            sample_input_D=self.input_size[0], sample_input_H=self.input_size[1], sample_input_W=self.input_size[2],
+            shortcut_type=SHORTCUT[self.depth], no_cuda=False, num_seg_classes=n_out)
+        if pretrained:
+            net.load_state_dict({k: v for k, v in self.model.state_dict().items() if not k.startswith("conv_seg.")},
+                                strict=False)
+        return _ToInput(net), [f"net.{n}" for n, _ in net.named_children() if n != "conv_seg"], None
+
     @torch.no_grad()
     def features(self, prepared: dict) -> dict:
         volume = prepared["image"][None].to(self.device)  # DataLoader(batch_size=1) collation
@@ -101,6 +122,15 @@ class MedicalNet(Wrapper):
                 "shortcut": SHORTCUT[self.depth]}
         return {"features": {"layer4": layer4, "layer4_gap": layer4.mean((1, 2, 3))}, "canonical": "layer4",
                 "meta": meta, "derived": ["layer4_gap"]}
+
+
+class _ToInput(torch.nn.Module):
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, x):
+        return torch.nn.functional.interpolate(self.net(x), size=x.shape[2:], mode="trilinear", align_corners=False)
 
 
 def build(cfg: dict, device: str) -> MedicalNet:

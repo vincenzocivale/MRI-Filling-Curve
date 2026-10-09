@@ -68,6 +68,7 @@ class Asparagus(Wrapper):
 
         sd = torch.load(cfg["checkpoint"], map_location="cpu", weights_only=False)["state_dict"]
         enc = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.encoder.")}
+        self._enc = enc
         if enc[STEM].shape[1] != 1:
             raise ValueError(f"asparagus: checkpoint stem has {enc[STEM].shape[1]} input channels; the "
                              f"embedding pipeline is single-modality (1). The _5ch file is not supported.")
@@ -124,6 +125,45 @@ class Asparagus(Wrapper):
                  "spacing": tuple(float(z) for z in img.header.get_zooms()[:3]), "input_shape": tuple(x.shape[1:]),
                  "stage_strides": STRIDES}
         return {"x": x, "meta": meta}
+
+    # ------------------------------------------------------------------ segmentation (fm/segrun.py)
+    def seg_preprocess(self, image: str) -> dict:
+        """asparagus' segmentation data at 1 mm (asparagus_preprocessing `get_iso_preprocessing_config`, the `_ISO`
+        variant of its segmentation datasets, configs/preprocessing_presets.py:14-21; the FOMO25 baseline segments at
+        1 mm too): RAS as above, size round(spacing / 1 mm * shape) (utils/process_case.py:670), skimage `resize(order=3)`
+        (utils/resample.py:46, "yucca"; that module is re-done here since it imports pandas, absent from the env),
+        no norm at preprocessing; then the training-time whole-volume z-score (`Torch_Normalize(normalize=True)`,
+        CPU_seg_val/test_transforms, presets/train.py:178-196). No crop: training samples patches, inference slides."""
+        from gardening_tools.functional.nibabel_utils import get_nib_orientation, reorient_nib_image
+        from gardening_tools.modules.transforms.normalize import Torch_Normalize
+        from skimage.transform import resize
+
+        from ..bench_geom import _scale
+
+        img = nib.load(image)
+        src = img.affine.copy()
+        orient = get_nib_orientation(img)
+        if self.reorient_ras and orient != "RAS":
+            img = reorient_nib_image(img, orient, "RAS")
+        arr = np.asarray(img.get_fdata(), dtype=np.float32)
+        size = np.round(np.array(img.header.get_zooms()[:3], dtype=float) * arr.shape).astype(int)
+        arr = resize(arr, output_shape=tuple(size), order=3).astype(np.float32)
+        x = Torch_Normalize(normalize=True)({"image": torch.from_numpy(arr)[None], "transforms_applied": {}})["image"]
+        return {"x": x, "m": _scale(img.shape[:3], size) @ np.linalg.inv(img.affine) @ src}
+
+    def seg_input(self, prepared: dict):
+        return prepared["x"], prepared["m"]
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        """`resenc_unet_b` with skip connections (the seg_net of configs/model resenc_unet_b), encoder from the
+        checkpoint, decoder from scratch (`load_decoder: False`), training patch 160^3 (default_finetune_seg.yaml)."""
+        from asparagus.modules.networks.resenc_unet import resenc_unet_b
+
+        net = resenc_unet_b(dimensions="3D", input_channels=1, output_channels=n_out, use_skip_connections=True)
+        if pretrained:
+            torch.nn.Module.load_state_dict(net.encoder, {k[len("encoder."):]: v for k, v in self._enc.items()},
+                                            strict=True)
+        return net, ["encoder"], (160, 160, 160)
 
     @torch.no_grad()
     def features(self, prepared: dict) -> dict:

@@ -121,21 +121,12 @@ class NnsslWrapper(Wrapper):
         arch = ap["architecture_plans"]
         self.arch = arch["arch_class_name"]
         self.is_primus = self.arch.startswith("Primus")
-        trainer = PretrainedTrainer_Primusx if self.is_primus else PretrainedTrainer
+        self._trainer = PretrainedTrainer_Primusx if self.is_primus else PretrainedTrainer
+        self._ap = ap
         # like_nnssl.py:124-126,169-172 -> ConfigurationManager.network_arch_* -> pretrainedTrainer.py:88-96
         self.arch_details = {"network_class_name": self.arch, "arch_kwargs": arch["arch_kwargs"],
                              "_kw_requires_import": arch["arch_kwargs_requiring_import"]}
-        net = trainer.build_network_architecture(
-            architecture_class_name=self.arch, arch_init_kwargs=deepcopy(arch["arch_kwargs"]),
-            arch_init_kwargs_req_import=arch["arch_kwargs_requiring_import"], input_patch_size=self.patch,
-            num_input_channels=1, num_output_channels=1, enable_deep_supervision=False)
-        with _torch_load_on_cpu():
-            net, _ = trainer.load_pretrained_weights(
-                net, pretrained_weights_path=cfg["checkpoint"], pt_input_channels=ap["pretrain_num_input_channels"],
-                downstream_input_channels=1, pt_input_patchsize=self.pt_patch,
-                downstream_input_patchsize=self.patch, pt_key_to_encoder=ap["key_to_encoder"],
-                pt_key_to_stem=ap["key_to_stem"], pt_keys_to_in_proj=tuple(ap["keys_to_in_proj"]),
-                pt_key_to_lpe=ap["key_to_lpe"])
+        net = self._load(self._build(1))
         self.network = net.to(device).eval()
         self.adaptation_plan, self.trainer_name = ap, ckpt.get("trainer_name")
         self.predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=False,
@@ -147,6 +138,44 @@ class NnsslWrapper(Wrapper):
         if self.is_primus:
             self._tokens = None
             self.network.eva.register_forward_hook(lambda m, i, o: setattr(self, "_tokens", o[0]))
+
+    def _build(self, n_out: int):
+        arch = self._ap["architecture_plans"]
+        return self._trainer.build_network_architecture(
+            architecture_class_name=self.arch, arch_init_kwargs=deepcopy(arch["arch_kwargs"]),
+            arch_init_kwargs_req_import=arch["arch_kwargs_requiring_import"], input_patch_size=self.patch,
+            num_input_channels=1, num_output_channels=n_out, enable_deep_supervision=False)
+
+    def _load(self, net):
+        ap = self._ap
+        with _torch_load_on_cpu():
+            net, _ = self._trainer.load_pretrained_weights(
+                net, pretrained_weights_path=self.cfg["checkpoint"], pt_input_channels=ap["pretrain_num_input_channels"],
+                downstream_input_channels=1, pt_input_patchsize=self.pt_patch,
+                downstream_input_patchsize=self.patch, pt_key_to_encoder=ap["key_to_encoder"],
+                pt_key_to_stem=ap["key_to_stem"], pt_keys_to_in_proj=tuple(ap["keys_to_in_proj"]),
+                pt_key_to_lpe=ap["key_to_lpe"])
+        return net
+
+    # ------------------------------------------------------------------ segmentation (fm/segrun.py)
+    def seg_input(self, prepared: dict):
+        """nnssl's preprocessed volume: the grid nnU-Net fine-tunes and predicts on (before its sliding-window pad)."""
+        from ..bench_geom import _nnunet_crop_resample, _perm
+        props = prepared["props"]
+        geo = {k: props[k] for k in ("bbox_used_for_cropping", "shape_after_cropping_and_before_resampling")}
+        m = _nnunet_crop_resample(geo | {"preprocessed_shape": prepared["data"].shape[1:]},
+                                  _perm(self.plan.transpose_forward) @ _perm([2, 1, 0]))
+        return torch.from_numpy(prepared["data"]), m
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        """The network `nnUNetv2_train_pretrained` fine-tunes, built and loaded as in __init__ with n_out outputs (decoder
+        from scratch, pretrainedTrainer.py:167); frozen = the parts load_pretrained_weights fills."""
+        net = self._build(n_out)
+        if pretrained:
+            net = self._load(net)
+        keys = [net.key_to_encoder, getattr(net, "key_to_stem", None), *(getattr(net, "keys_to_in_proj", None) or ()),
+                getattr(net, "key_to_lpe", None)]
+        return net, [k for k in keys if k], tuple(self.patch)
 
     # ------------------------------------------------------------------ preprocessing (nnssl)
     def preprocess(self, image: Image) -> dict:

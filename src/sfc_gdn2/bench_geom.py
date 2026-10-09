@@ -7,6 +7,9 @@ the continuous voxel index of the model's network input grid, rebuilt from the g
 """
 from __future__ import annotations
 
+from pathlib import Path
+
+import nibabel as nib
 import numpy as np
 import torch
 from torch.nn import functional as F
@@ -66,7 +69,8 @@ def _nnunet_crop_resample(props_or_meta: dict, reverse_then_transpose: np.ndarra
 
 
 def source_to_input(model: str, meta: dict) -> np.ndarray | None:
-    fam = FAMILY[model]
+    """`model` = a config stem of FAMILY, or a family name (the wrappers' own segmentation inputs)."""
+    fam = FAMILY.get(model, model)
     if fam in ("asparagus", "brainfm"):
         return np.linalg.inv(_np(meta["affine"])) @ _np(meta["source_affine"])
     if fam == "bsf_ukb":
@@ -112,3 +116,17 @@ def from_cells(values: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
     norm = (2 * (c + 0.5) / grid[:, None, None, None] - 1)  # align_corners=False normalisation
     g = norm.flip(0).permute(1, 2, 3, 0)[None]               # grid_sample wants (x=W, y=H, z=D)
     return F.grid_sample(values[None].float(), g, mode="bilinear", padding_mode="border", align_corners=False)[0]
+
+
+def gt_labels(path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """(labels 0..K, affine, class names): a mask file (any > 0 = 1) or a directory of one mask per class."""
+    p = Path(path)
+    if p.is_dir():
+        files = sorted(p.glob("*.nii*"))
+        ref = nib.load(files[0])
+        lab = np.zeros(ref.shape, dtype=np.uint8)
+        for k, f in enumerate(files, 1):
+            lab[np.asarray(nib.load(f).dataobj) > 0] = k
+        return lab, ref.affine, [f.name.split(".")[0] for f in files]
+    img = nib.load(p)
+    return (np.asarray(img.dataobj) > 0).astype(np.uint8), img.affine, ["lesion"]

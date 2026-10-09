@@ -46,7 +46,12 @@ Triton kernels (`TRITON_CACHE_DIR` on $WORK keeps them across jobs).
 - `bench.py`: downstream benchmark volume list (one per subject/session/sequence, `dense` = stride-8 maps kept),
   input staging (OASIS Analyze -> NIfTI, hard links for paths with spaces) and fixed 70/10/20 subject splits;
   `sfc bench-split|bench-extract configs/leonardo/bench.yaml` (FM groups sharing one preprocessing, CPU prefetch).
-- `cli.py`: `sfc prepare|split|pretrain|probe|fm|summarize|bench-split|bench-extract`.
+- `bench_probe.py` (`sfc bench-probe`): one probe for every model on cached globals (linear + MLP heads, grid and
+  selection on val); `bench_seg.py` + `bench_geom.py`: stride-8 segmentation probe (diagnostic) and map geometry.
+- `bench_segdec.py` + `fm/segrun.py` (`sfc bench-segdec`): segmentation through each model's OFFICIAL downstream
+  decoder (wrapper hooks `seg_input` / `seg_net` / optional `seg_preprocess`) on its frozen pretrained encoder,
+  same recipe for all, `init: random` baseline; inputs cached per preprocessing group, no feature cache.
+- `cli.py`: `sfc prepare|split|pretrain|probe|fm|summarize|bench-split|bench-extract|bench-probe|bench-segdec`.
 - `slurm/`: `submit.py` + YAML presets to sbatch any command on Leonardo (`python slurm/submit.py slurm/presets/<p>.yaml -- <cmd>`).
 
 ## Invariants (do not break)

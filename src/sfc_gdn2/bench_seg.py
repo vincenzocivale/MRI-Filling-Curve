@@ -23,24 +23,11 @@ from torch import nn
 from torch.nn import functional as F
 
 from . import bench_geom as geom
+from .bench_geom import gt_labels
 
 EPOCHS = 20
 GRID = ((1e-3, 1e-4), (1e-3, 1e-2), (3e-4, 1e-4), (3e-4, 1e-2))
 MAX_TRAIN, MAX_VAL = 400, 100  # ponytail: volumes held in RAM; a streaming loader lifts the cap
-
-
-def gt_labels(path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """(labels 0..K, affine, class names): a mask file (any > 0 = 1) or a directory of one mask per class."""
-    p = Path(path)
-    if p.is_dir():
-        files = sorted(p.glob("*.nii*"))
-        ref = nib.load(files[0])
-        lab = np.zeros(ref.shape, dtype=np.uint8)
-        for k, f in enumerate(files, 1):
-            lab[np.asarray(nib.load(f).dataobj) > 0] = k
-        return lab, ref.affine, [f.name.split(".")[0] for f in files]
-    img = nib.load(p)
-    return (np.asarray(img.dataobj) > 0).astype(np.uint8), img.affine, ["lesion"]
 
 
 def model_input(model: str, rec: dict) -> tuple[torch.Tensor, object]:
@@ -86,14 +73,21 @@ def full_res_dice(prob: torch.Tensor, coords: torch.Tensor, lab: np.ndarray) -> 
     return float(np.mean(ds)) if ds else float("nan")
 
 
-def run_seg(name: str, cfg: dict, rows: pd.DataFrame, model: str, model_dir: Path, seed: int,
-            device: str = "cuda") -> dict:
-    rng = np.random.default_rng(seed)
+def select(rows: pd.DataFrame, cfg: dict, rng: np.random.Generator) -> dict[str, np.ndarray]:
+    """Row indices per split: at most MAX_TRAIN / MAX_VAL random train / val volumes, every test volume (of
+    `test_query`, if set)."""
     sel = {s: rows.index[rows["split"] == s].to_numpy() for s in ("train", "val", "test")}
     sel["train"] = rng.permutation(sel["train"])[:MAX_TRAIN]
     sel["val"] = rng.permutation(sel["val"])[:MAX_VAL]
     if cfg.get("test_query"):
         sel["test"] = rows.loc[sel["test"]].query(cfg["test_query"]).index.to_numpy()
+    return sel
+
+
+def run_seg(name: str, cfg: dict, rows: pd.DataFrame, model: str, model_dir: Path, seed: int,
+            device: str = "cuda") -> dict:
+    rng = np.random.default_rng(seed)
+    sel = select(rows, cfg, rng)
 
     def load(i, keep_coords=False):
         r = rows.loc[i]

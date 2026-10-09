@@ -27,6 +27,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import nibabel as nib
 import numpy as np
 import torch
 from torch.utils.data import default_collate
@@ -78,10 +79,34 @@ class BrainIAC(Wrapper):
         (work / "in").mkdir()
         (work / "out" / "temp_registered").mkdir(parents=True)
         (work / "in" / f"{ident}.nii.gz").symlink_to(Path(image).resolve())
-        with self._n4():
+        with self._n4(), self._capture_registration() as reg:
             mp.registration(input_dir=str(work / "in"), output_dir=str(work / "out" / "temp_registered"),
                             temp_img=self.template)
-        return {"source": image, "work": str(work), "ident": ident}
+        return {"source": image, "work": str(work), "ident": ident, "registration": reg[0] if reg else None}
+
+    @contextlib.contextmanager
+    def _capture_registration(self):
+        """Keeps the rigid transform the repo's registration finds (fixed = template -> moving = input, LPS mm) as a
+        4x4, for mapping segmentations back; the repo discards it after resampling (:129-138). Nothing else changes."""
+        import SimpleITK as sitk
+
+        box, orig = [], sitk.ImageRegistrationMethod
+
+        class Capturing(orig):
+            def Execute(self, *a):
+                t = super().Execute(*a)
+                p0 = np.array(t.TransformPoint((0.0, 0.0, 0.0)))
+                m = np.eye(4)
+                m[:3, :3] = np.stack([np.array(t.TransformPoint(tuple(e))) - p0 for e in np.eye(3)], 1)
+                m[:3, 3] = p0
+                box.append(m)
+                return t
+
+        sitk.ImageRegistrationMethod = Capturing
+        try:
+            yield box
+        finally:
+            sitk.ImageRegistrationMethod = orig
 
     @contextlib.contextmanager
     def _n4(self):
@@ -132,7 +157,40 @@ class BrainIAC(Wrapper):
             if work:
                 shutil.rmtree(work, ignore_errors=True)
         kept = self.preprocessed or bool(self.keep_dir)
-        return {"image": x, "source": image, "preprocessed_path": str(path) if kept else None}
+        return {"image": x, "source": image, "preprocessed_path": str(path) if kept else None,
+                "registration": staged.get("registration")}
+
+    # ------------------------------------------------------------------ segmentation (fm/segrun.py)
+    def seg_input(self, prepared: dict):
+        """The 96^3 model input; source voxel -> world (RAS) -> LPS -> inverse of the captured rigid transform ->
+        template grid of the registered file (HD-BET keeps it) -> trilinear Resize to 96^3 (align_corners=False)."""
+        from ..bench_geom import _scale
+
+        x, reg = prepared["image"], prepared["registration"]
+        if reg is None:
+            raise RuntimeError("brainiac: no registration transform (preprocessed=true inputs cannot be mapped back)")
+        lps = np.diag([-1.0, -1.0, 1.0, 1.0])
+        a_reg = np.asarray(x.meta["original_affine"], dtype=np.float64)
+        shape = [int(s) for s in x.meta["spatial_shape"]]
+        m = (_scale(shape, x.shape[1:]) @ np.linalg.inv(a_reg) @ lps @ np.linalg.inv(reg) @ lps
+             @ nib.load(prepared["source"]).affine)
+        return x.as_tensor().float(), m
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        """The repo's segmentation network (segmentation_model.py `ViTUNETRSegmentationModel`: MONAI UNETR, feature_size 16,
+        instance norm, res blocks, 96^3) with n_out classes; its ViT from the SimCLR `backbone.*` weights (strict), the
+        UNETR conv path from scratch. The repo's `freeze: "yes"` (train_lightning_segmentation.py:32-34) freezes the
+        unused standalone `model.vit`, not `unetr.vit`; the protocol freezes `unetr.vit`, the encoder actually run."""
+        from monai.networks.nets import UNETR
+
+        net = UNETR(in_channels=1, out_channels=n_out, img_size=(SIZE,) * 3, feature_size=16, hidden_size=768,
+                    mlp_dim=3072, num_heads=12, norm_name="instance", res_block=True, dropout_rate=0.0)
+        if pretrained:
+            sd = torch.load(self.cfg["checkpoint"], map_location="cpu", weights_only=False)
+            sd = sd.get("state_dict", sd)
+            net.vit.load_state_dict({k[len("backbone."):]: v for k, v in sd.items() if k.startswith("backbone.")},
+                                    strict=True)
+        return net, ["vit"], (SIZE,) * 3
 
     def preprocess(self, image: Image) -> dict:
         return self.preprocess_gpu(self.preprocess_cpu(image))
