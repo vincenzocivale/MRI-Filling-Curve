@@ -111,6 +111,27 @@ def bench_extract(cfg: dict, args) -> None:
             verify_shared=args.verify_shared)
 
 
+def bench_probe(cfg: dict, args) -> None:
+    """Probes of the benchmark tasks on the stored features of `--models` (default: every model under out_root),
+    on the volumes all of them have; `--cache-only` just builds each model's `_globals.pt`."""
+    from . import bench_probe as bp
+    from .io import load_yaml
+    root = Path(cfg["fm"]["out_root"])
+    names = args.models or sorted(p.name for p in root.iterdir() if p.is_dir())
+    models = {m: root / m for m in names}
+    if args.cache_only:
+        for d in models.values():
+            bp.load_globals(d)
+            print(f"[probe] cached {d}", flush=True)
+        return
+    tasks = load_yaml(cfg["probe"]["tasks"])
+    tasks = {t: tasks[t] for t in (args.tasks or tasks)}
+    vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv", low_memory=False, dtype={"session": str})
+    splits = pd.read_csv(Path(cfg["out_dir"]) / "splits.csv")
+    seeds = [int(s) for s in args.seeds.split(",")]
+    bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device)
+
+
 def summarize(_, args) -> None:
     """One row per (run, probe, candidate) under <root>: every checkpoint per run, plus the raw baselines."""
     root, rows = Path(args.config), []
@@ -130,7 +151,7 @@ def summarize(_, args) -> None:
 
 
 COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize,
-            "bench-split": bench_split, "bench-extract": bench_extract}
+            "bench-split": bench_split, "bench-extract": bench_extract, "bench-probe": bench_probe}
 
 
 def main() -> None:
@@ -148,6 +169,10 @@ def main() -> None:
     ap.add_argument("--shard", help="bench-extract: i/n or auto/n ($SLURM_ARRAY_TASK_ID)")
     ap.add_argument("--sample", type=int, help="bench-extract: only k volumes per dataset (dense first)")
     ap.add_argument("--query", help="bench-extract: pandas query on volumes.csv, e.g. \"dataset != 'IXI'\"")
+    ap.add_argument("--models", nargs="+", help="bench-probe: model dirs under fm.out_root (default: all)")
+    ap.add_argument("--tasks", nargs="+", help="bench-probe: task names (default: all)")
+    ap.add_argument("--seeds", default="0", help="bench-probe: split seeds, e.g. 0,1,2,3,4")
+    ap.add_argument("--cache-only", action="store_true", help="bench-probe: only build the feature caches")
     ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):

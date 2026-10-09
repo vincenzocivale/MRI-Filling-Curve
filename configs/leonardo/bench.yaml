@@ -6,6 +6,10 @@ out_dir: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench   # volume
 seeds: 5
 inputs_dir: /leonardo_scratch/large/userexternal/fcorrent/datasets/derivatives/bench_inputs   # bench.stage
 
+probe:
+  tasks: configs/leonardo/probe_tasks.yaml
+  out: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/probe_bench   # <out>/<task>/s<seed>/<model>.json, summary.csv
+
 fm:
   out_root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/fm_bench   # <out_root>/<config stem>/<id>.pt
   # models in one group share the first one's preprocessing (same repo pipeline, same env);

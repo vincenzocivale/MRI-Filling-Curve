@@ -1,0 +1,24 @@
+# Downstream probe tasks (`sfc bench-probe`, src/sfc_gdn2/bench_probe.py). query: pandas query on volumes.csv;
+# label: column or expression (an expression lists its columns in `requires`, rows with NaN there are dropped);
+# type: class | ordinal | dex (bin = bin width) | cox (label = [time, event]).
+age:      {type: dex, label: age, bin: 1.0,
+           query: "modality == 'T1w' and dataset in ['AOMIC-ID1000', 'Calgary', 'DLBS', 'IXI', 'Long579', 'Pixar', 'OASIS-1'] and not (cdr > 0)"}
+sex:      {type: class, label: sex,
+           query: "modality == 'T1w' and dataset in ['AOMIC-ID1000', 'Calgary', 'DLBS', 'IXI', 'Long579', 'Pixar', 'OASIS-1']"}
+dementia: {type: class, label: "cdr > 0", requires: [cdr], query: "modality == 'T1w' and dataset in ['OASIS-1', 'OASIS-2']"}
+autism:   {type: class, label: dx_group, query: "dataset == 'ABIDE-I'"}
+nihss:    {type: dex, label: nihss, bin: 1.0, query: "dataset == 'SOOP'"}
+mrs90:    {type: ordinal, label: mrs90, query: "dataset == 'SOOP'"}
+idh:      {type: class, label: idh, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
+mgmt:     {type: class, label: mgmt, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
+codel:    {type: class, label: codel_1p19q, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
+grade:    {type: ordinal, label: who_grade, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
+survival: {type: cox, label: [os_days, os_event],
+           query: "dataset in ['UCSF-PDGM', 'UPENN-GBM'] and modality in ['T1w', 'T1c', 'T2w', 'FLAIR'] and session != '21'"}
+sequence: {type: class, label: modality,
+           query: "dataset in ['UCSF-PDGM', 'UPENN-GBM', 'DLBS', 'IXI', 'SOOP'] and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
+# segmentation (bench_seg.py): dense volumes with a mask; test_query restricts the test volumes
+tumor_ucsf:  {type: seg, label: seg, query: "dataset == 'UCSF-PDGM' and dense"}
+tumor_upenn: {type: seg, label: seg, query: "dataset == 'UPENN-GBM' and dense", test_query: "seg_source == 'manual'"}
+stroke:      {type: seg, label: seg, query: "dataset == 'SOOP' and dense"}
+totalseg:    {type: seg, label: seg, query: "dataset == 'TotalSegmentator-MRI'"}
