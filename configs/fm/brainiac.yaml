@@ -5,6 +5,7 @@ repo: ${SFC_FM_REPOS}/BrainIAC
 commit: ba60f45
 checkpoint: ${SFC_FM_MODELS}/BrainIAC/BrainIAC.ckpt
 args:
+  n4_shrink: 4          # OURS (2026-10-09): N4 field fitted at 1/4 resolution, applied at full (repo: full-res N4, ~11 min/volume)
   preprocessed: false   # true: input already through the repo's N4 + temp_head registration + HD-BET pipeline
   # template: <path>    # default: <repo>/src/preprocessing/atlases/temp_head.nii.gz (quickstart.ipynb cell 4)
   # keep_dir: <dir>     # keep the preprocessed (template-space) NIfTI

@@ -19,7 +19,7 @@ fm:
     bsf_ukb: {configs: [bsf_ukb_pretrain], workers: 7}
     bsf_atlas: {configs: [bsf_atlas_pretrain], workers: 7}
     medicalnet: {configs: [medicalnet_resnet50_23dataset], workers: 7}
-    nnunet: {configs: [nnunet_totalseg_mr_870, nnunet_totalseg_mr_871], workers: 7}
+    nnunet: {configs: [nnunet_totalseg_mr_870], workers: 7}   # 871 (muscles) dropped: same net and data as 870
   # what is stored (fm/worker.py `trim`): globals + maps at stride >= 16 for every volume, stride-8 maps for
   # `dense` volumes (segmentation). Computation is unchanged.
   save:

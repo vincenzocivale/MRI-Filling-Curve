@@ -21,6 +21,7 @@ pre-norm outputs of blocks 3/6/9, which UNETR consumes for segmentation (`segmen
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import tempfile
@@ -77,9 +78,32 @@ class BrainIAC(Wrapper):
         (work / "in").mkdir()
         (work / "out" / "temp_registered").mkdir(parents=True)
         (work / "in" / f"{ident}.nii.gz").symlink_to(Path(image).resolve())
-        mp.registration(input_dir=str(work / "in"), output_dir=str(work / "out" / "temp_registered"),
-                        temp_img=self.template)
+        with self._n4():
+            mp.registration(input_dir=str(work / "in"), output_dir=str(work / "out" / "temp_registered"),
+                            temp_img=self.template)
         return {"source": image, "work": str(work), "ident": ident}
+
+    @contextlib.contextmanager
+    def _n4(self):
+        """`args.n4_shrink` = s (OURS, off by default): the N4 bias field is fitted on the image shrunk by s per axis
+        and applied at full resolution, instead of the repo's full-resolution N4 (mri_preprocess_3d_simple.py:74)."""
+        s = self.args.get("n4_shrink")
+        if not s:
+            yield
+            return
+        import SimpleITK as sitk
+        orig = sitk.N4BiasFieldCorrection
+
+        def n4(img, *_, **__):
+            f = sitk.N4BiasFieldCorrectionImageFilter()
+            f.Execute(sitk.Shrink(img, [int(s)] * img.GetDimension()))
+            # `/` is real division (float64): cast back to the input type, as the repo's N4 returns (registration needs it)
+            return sitk.Cast(img / sitk.Exp(f.GetLogBiasFieldAsImage(img)), img.GetPixelID())
+        sitk.N4BiasFieldCorrection = n4
+        try:
+            yield
+        finally:
+            sitk.N4BiasFieldCorrection = orig
 
     def preprocess_gpu(self, staged: dict) -> dict:
         """Step 2 of main (:182-190): HD-BET (fast, no TTA) on device "0" if CUDA else "cpu", as main picks it;
@@ -129,6 +153,7 @@ class BrainIAC(Wrapper):
             "source": prepared["source"],
             "preprocessed_path": prepared["preprocessed_path"],  # None unless args.keep_dir is set
             "preprocessed": self.preprocessed,
+            "n4_shrink": self.args.get("n4_shrink"),  # ours when set: N4 field fitted at 1/s resolution
             "template": None if self.preprocessed else self.template,
             # grid of the preprocessed NIfTI (template grid when the repo preprocessing ran)
             "source_shape": tuple(int(s) for s in x.meta["spatial_shape"]),

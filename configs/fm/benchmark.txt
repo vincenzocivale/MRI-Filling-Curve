@@ -13,4 +13,4 @@ configs/fm/bsf_ukb_pretrain.yaml              # barely trained, kept on purpose
 configs/fm/bsf_atlas_pretrain.yaml            # barely trained, kept on purpose
 configs/fm/medicalnet_resnet50_23dataset.yaml # legacy baseline
 configs/fm/nnunet_totalseg_mr_870.yaml        # supervised on TotalSeg MRI: upper bound on the TotalSeg test only
-configs/fm/nnunet_totalseg_mr_871.yaml        #   (organs + muscles, TotalSegmentator's default total_mr at 1.5 mm)
+# configs/fm/nnunet_totalseg_mr_871.yaml       # dropped 2026-10-09: same net and data as 870 (muscles instead of organs)
