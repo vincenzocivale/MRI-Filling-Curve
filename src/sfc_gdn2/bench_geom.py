@@ -68,11 +68,28 @@ def _nnunet_crop_resample(props_or_meta: dict, reverse_then_transpose: np.ndarra
     return _scale(crop_shape, pre_shape) @ _shift([-b for b in bbox]) @ reverse_then_transpose
 
 
+def brainfm_input_affine(source_affine, source_shape, crop_start) -> np.ndarray:
+    """Voxel -> world of BrainFM's network input. `prepare_image` (BrainFM utils/test_utils.py:253-276) resizes to 1 mm
+    (misc.py:1124-1126 size, myzoom affine update :1108-1113) and then "aligns" `final` with the ALREADY aligned
+    affine (:272-276), a no-op: the network sees the source axis order, while the affine it returns is the
+    RAS-aligned one (equal only for near-RAS inputs). Then the zero crop starting at `crop_start`."""
+    a = _np(source_affine)
+    shape = np.asarray(source_shape[:3], dtype=np.float64)
+    f = np.round(shape * np.sqrt((a[:3, :3] ** 2).sum(0))) / shape
+    r = a.copy()
+    r[:3, :3] = a[:3, :3] / f
+    r[:3, 3] = a[:3, 3] - a[:3, :3] @ (0.5 - 0.5 / f) + (a[:3, :3] / f) @ np.asarray(crop_start, dtype=np.float64)
+    return r
+
+
 def source_to_input(model: str, meta: dict) -> np.ndarray | None:
     """`model` = a config stem of FAMILY, or a family name (the wrappers' own segmentation inputs)."""
     fam = FAMILY.get(model, model)
-    if fam in ("asparagus", "brainfm"):
+    if fam == "asparagus":
         return np.linalg.inv(_np(meta["affine"])) @ _np(meta["source_affine"])
+    if fam == "brainfm":
+        a = brainfm_input_affine(meta["source_affine"], meta["source_shape"], meta["bbox"][0])
+        return np.linalg.inv(a) @ _np(meta["source_affine"])
     if fam == "bsf_ukb":
         return np.linalg.inv(_np(meta["input_affine"])) @ _np(meta["source_affine"])
     if fam == "bsf_atlas":

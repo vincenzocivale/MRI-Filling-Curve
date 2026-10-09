@@ -9,7 +9,9 @@ All references are to the original repo (`cfg["repo"]`, verified at f1731a1):
   voxels > 0. We call prepare_image with zero_crop_first=False and apply the repo's `zero_crop` with the
   same bbox ourselves -- `center_crop(win_size=None, zero_crop_first=True)` (:155-165) does exactly this --
   only to record the bbox: the repo does not shift the returned affine by the crop offset (bug at
-  :155-165 / :258), `meta["affine"]` is the corrected one. The tensor is unchanged (see the parity script).
+  :155-165 / :258), and the affine it returns is the RAS-aligned one while the image is NOT reoriented (:272-276
+  align `final` with the already aligned affine, a no-op): `meta["affine"]` is the true one
+  (`bench_geom.brainfm_input_affine`: 1 mm resize in source axis order, then the crop; checked against the shape). The tensor is unchanged (see the parity script).
 - network: `Trainer/models/__init__.py:404` `build_model` from `cfgs/generator/default.yaml` +
   `cfgs/generator/test/demo_test.yaml` and `cfgs/trainer/default_train.yaml` + `default_val.yaml` +
   `cfgs/trainer/test/demo_test.yaml` (UNet3D, f_maps 64, 6 levels, 'gcl', unit_feat). The repo's own
@@ -38,6 +40,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
+from ..bench_geom import brainfm_input_affine
 from .base import Image, Wrapper, add_to_path
 
 GEN_CFGS = ("cfgs/generator/default.yaml", "cfgs/generator/test/demo_test.yaml")
@@ -94,9 +97,12 @@ class BrainFM(Wrapper):
         coords = torch.argwhere(vol > 0)  # zero_crop's own bbox rule (tol=0), test_utils.py:69-77
         lo, hi = coords.min(0)[0].tolist(), (coords.max(0)[0] + 1).tolist()
         x = self.tu.zero_crop(vol, crop_range_lst=[lo, hi])[None, None]
-        corrected = np.array(aff, dtype=np.float64)
-        corrected[:3, 3] += corrected[:3, :3] @ np.asarray(lo, dtype=np.float64)
         src = nib.load(image)
+        corrected = brainfm_input_affine(src.affine, src.shape, lo)
+        size = np.round(np.asarray(src.shape[:3]) * np.sqrt((src.affine[:3, :3] ** 2).sum(0))).astype(int)
+        if tuple(size) != tuple(vol.shape):
+            raise RuntimeError(f"brainfm: network input {tuple(vol.shape)} is not the 1 mm resize {tuple(size)} "
+                               "in source axis order; the geometry below would be wrong")
         meta = {
             "input_path": image,
             "source_shape": tuple(int(s) for s in src.shape),
@@ -115,10 +121,9 @@ class BrainFM(Wrapper):
     seg_bf16 = False  # the repo infers in fp32; its torch 2.0 has no bf16 upsample_nearest3d
 
     def seg_input(self, prepared: dict):
-        """The 1 mm RAS zero-cropped volume the network sees (meta["affine"]: its voxel -> world)."""
-        meta = prepared["meta"]
-        m = np.linalg.inv(meta["affine"].numpy()) @ meta["source_affine"].numpy()
-        return prepared["input"][0].float().cpu(), m
+        """The 1 mm zero-cropped volume the network sees, in the SOURCE axis order (bench_geom.brainfm_input_affine)."""
+        from ..bench_geom import source_to_input
+        return prepared["input"][0].float().cpu(), source_to_input("brainfm", prepared["meta"])
 
     def seg_net(self, n_out: int, pretrained: bool = True):
         """The repo's task head on the frozen backbone: `TaskHead` with task_f_maps [64] (cfgs/trainer/default_train.yaml:26)
