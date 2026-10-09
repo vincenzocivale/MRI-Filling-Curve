@@ -129,7 +129,8 @@ def bench_probe(cfg: dict, args) -> None:
     vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv", low_memory=False, dtype={"session": str})
     splits = pd.read_csv(Path(cfg["out_dir"]) / "splits.csv")
     seeds = [int(s) for s in args.seeds.split(",")]
-    bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device)
+    common = {m: root / m for m in args.common} if args.common else None
+    bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device, common)
 
 
 def summarize(_, args) -> None:
@@ -172,6 +173,7 @@ def main() -> None:
     ap.add_argument("--models", nargs="+", help="bench-probe: model dirs under fm.out_root (default: all)")
     ap.add_argument("--tasks", nargs="+", help="bench-probe: task names (default: all)")
     ap.add_argument("--seeds", default="0", help="bench-probe: split seeds, e.g. 0,1,2,3,4")
+    ap.add_argument("--common", nargs="+", help="bench-probe: models whose shared volumes are used (default: --models)")
     ap.add_argument("--cache-only", action="store_true", help="bench-probe: only build the feature caches")
     ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()

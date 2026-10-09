@@ -11,7 +11,7 @@ nihss:    {type: dex, label: nihss, bin: 1.0, query: "dataset == 'SOOP'"}
 mrs90:    {type: ordinal, label: mrs90, query: "dataset == 'SOOP'"}
 idh:      {type: class, label: idh, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
 mgmt:     {type: class, label: mgmt, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
-codel:    {type: class, label: codel_1p19q, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
+# codel (1p/19q) dropped: 9 codeleted subjects in UCSF-PDGM, 0-3 per test split
 grade:    {type: ordinal, label: who_grade, query: "dataset == 'UCSF-PDGM' and modality in ['T1w', 'T1c', 'T2w', 'FLAIR']"}
 survival: {type: cox, label: [os_days, os_event],
            query: "dataset in ['UCSF-PDGM', 'UPENN-GBM'] and modality in ['T1w', 'T1c', 'T2w', 'FLAIR'] and session != '21'"}

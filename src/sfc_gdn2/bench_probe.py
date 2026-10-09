@@ -17,6 +17,7 @@ Task types (`configs/leonardo/probe_tasks.yaml`):
 """
 from __future__ import annotations
 
+import gc
 import json
 from pathlib import Path
 
@@ -47,13 +48,13 @@ def load_globals(model_dir: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
         if c["ids"] == ids:
             return c["ids"], c["feats"]
     rows = []
-    for i in ids:
-        try:
-            r = torch.load(model_dir / f"{i}.pt", map_location="cpu", mmap=True, weights_only=False)
-        except RuntimeError:  # files of older torch: no mmap
-            r = torch.load(model_dir / f"{i}.pt", map_location="cpu", weights_only=False)
-        rows.append({k: _vec(v).clone() for k, v in r["features"].items()  # clone: release the file mapping
+    for n, i in enumerate(ids):  # no mmap: mapped pages of 18k files are charged to the job (OOM kill)
+        r = torch.load(model_dir / f"{i}.pt", map_location="cpu", weights_only=False)
+        rows.append({k: _vec(v).clone() for k, v in r["features"].items()
                      if isinstance(v, torch.Tensor) and v.is_floating_point()})
+        del r
+        if n % 500 == 0:
+            gc.collect()
     names = sorted(set.intersection(*(set(r) for r in rows)))
     c = {"ids": ids, "feats": {n: torch.stack([r[n] for r in rows]).half() for n in names}}
     torch.save(c, cache)
@@ -298,10 +299,12 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
 
 
 def run(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, splits: pd.DataFrame,
-        out_dir: Path, seeds: list[int], device: str = "cuda") -> pd.DataFrame:
-    """Every task x seed x model; only the volumes all `models` have. Writes `<out>/<task>/s<seed>/<model>.json`."""
+        out_dir: Path, seeds: list[int], device: str = "cuda", common: dict[str, Path] | None = None) -> pd.DataFrame:
+    """Every task x seed x model; only the volumes all `common` models (default `models`) have.
+    Writes `<out>/<task>/s<seed>/<model>.json`."""
     loaded = {m: load_globals(d) for m, d in models.items()}
-    common = set.intersection(*(set(ids) for ids, _ in loaded.values()))
+    others = [load_globals(d)[0] for m, d in (common or {}).items() if m not in loaded]
+    common = set.intersection(*(set(ids) for ids, _ in loaded.values()), *(set(i) for i in others))
     vols = vols[vols["id"].isin(common)]
     summary = []
     for tname, cfg in tasks.items():
