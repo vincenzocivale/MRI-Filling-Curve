@@ -70,3 +70,8 @@ def test_patches_and_loss():
     assert x.shape == (4, 1, 8, 8, 8) and y.shape == (4, 8, 8, 8)
     y[0, 0] = 255
     assert torch.isfinite(segrun.loss_fn(torch.randn(4, 3, 8, 8, 8), y, 3))
+
+
+def test_empty_input_is_background():
+    _, per = segrun.dice_full_res(torch.zeros(3, 0, 0, 0), np.eye(4), _labels(), 3, "cpu")
+    assert per == [0.0, 0.0]

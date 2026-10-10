@@ -145,6 +145,8 @@ def dice_full_res(probs: torch.Tensor, grid_from_gt: np.ndarray, lab: np.ndarray
     """Probabilities [k, *grid] (on any device) -> every GT voxel (trilinear, border clamped), argmax, Dice per class;
     slab-wise, moving to `dev` only the part of the grid each GT slab samples."""
     dev = dev or probs.device
+    if probs[0].numel() == 0:  # the pipeline cropped the volume to nothing (no foreground): background everywhere
+        probs = F.one_hot(torch.zeros(1, 1, 1, dtype=torch.long), k).permute(3, 0, 1, 2).float()
     M = torch.tensor(grid_from_gt, dtype=torch.float32, device=dev)
     G = torch.tensor(probs.shape[1:], device=dev)
     jk = torch.stack(torch.meshgrid(*[torch.arange(n, device=dev, dtype=torch.float32) for n in lab.shape[1:]],
@@ -247,46 +249,57 @@ def train(job: dict) -> None:
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
-    train_v = [load(it) for it in split["train"]]
-    val_v = [load(it) for it in split["val"]]
-    data = Patches(train_v, patch, k, rng)
-    del train_v
-    params = [p for p in net.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=job["lr"], weight_decay=1e-4)
+    # the best state is kept on disk until the test is written: a crash while testing does not cost the training
+    ckpt = Path(job["out"]).with_suffix(".best.pt")
+    key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])}
+    saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
     iters, every = int(job["iters"]), int(job["val_every"])
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: (1 - i / iters) ** 0.9)
-    best, curve, t0 = {"val": -1.0}, [], time.time()
+    if saved.get("key") == key:
+        best, curve = saved["best"], saved["curve"]
+        print(f"[seg] best state from {ckpt} (iter {best['iter']}), training skipped", flush=True)
+    else:
+        train_v = [load(it) for it in split["train"]]
+        val_v = [load(it) for it in split["val"]]
+        data = Patches(train_v, patch, k, rng)
+        del train_v
+        params = [p for p in net.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(params, lr=job["lr"], weight_decay=1e-4)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: (1 - i / iters) ** 0.9)
+        best, curve, t0 = {"val": -1.0}, [], time.time()
 
-    def set_mode():
-        net.train()
-        for m in frozen_mods:
-            m.eval()
+        def set_mode():
+            net.train()
+            for m in frozen_mods:
+                m.eval()
 
-    set_mode()
-    for it in range(1, iters + 1):
-        x, y = data.sample(int(job["batch"]))
-        with amp():
-            logits = net(x.to(dev, non_blocking=True).float())
-        loss = loss_fn(logits, y.to(dev), k)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, 12)
-        opt.step()
-        sched.step()
-        if it % every == 0 or it == iters:
-            net.eval()
-            ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp).argmax(0).to(dev), v["y"].to(dev), k)
-                  for v in val_v]
-            val = float(np.nanmean(ds))
-            curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
-            print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} ({(time.time() - t0) / 60:.1f} min)",
-                  flush=True)
-            if "state" not in best or val > best["val"]:
-                best = {"val": val, "iter": it, "state": copy.deepcopy({n: t.cpu() for n, t in net.state_dict().items()})}
-            set_mode()
+        set_mode()
+        for it in range(1, iters + 1):
+            x, y = data.sample(int(job["batch"]))
+            with amp():
+                logits = net(x.to(dev, non_blocking=True).float())
+            loss = loss_fn(logits, y.to(dev), k)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 12)
+            opt.step()
+            sched.step()
+            if it % every == 0 or it == iters:
+                net.eval()
+                ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp).argmax(0).to(dev),
+                              v["y"].to(dev), k) for v in val_v]
+                val = float(np.nanmean(ds))
+                curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
+                print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} ({(time.time() - t0) / 60:.1f} min)",
+                      flush=True)
+                if "state" not in best or val > best["val"]:
+                    best = {"val": val, "iter": it,
+                            "state": copy.deepcopy({n: t.cpu() for n, t in net.state_dict().items()})}
+                set_mode()
+        del val_v, data
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     net.load_state_dict(best.pop("state"))
     net.eval()
-    del val_v, data
     res = {"per_volume": [], "per_class": [], "test_ids": []}
     for it in split["test"]:
         v = load(it)
@@ -302,6 +315,7 @@ def train(job: dict) -> None:
            "test_dice": float(np.nanmean(res["per_volume"])), **res}
     Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
     Path(job["out"]).write_text(json.dumps(out, indent=1))
+    ckpt.unlink()
     print(f"[seg] test dice {out['test_dice']:.4f} on {len(res['per_volume'])} volumes -> {job['out']}", flush=True)
 
 
