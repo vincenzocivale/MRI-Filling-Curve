@@ -152,7 +152,7 @@ def bench_segdec(cfg: dict, args) -> None:
         return
     for m in args.models:
         for t in tasks:
-            bs.train(cfg, m, t, items[t], seed, args.init, args.device, args.iters)
+            bs.train(cfg, m, t, items[t], seed, args.init, args.device, args.iters, args.resume)
 
 
 def summarize(_, args) -> None:
@@ -201,6 +201,7 @@ def main() -> None:
     ap.add_argument("--stage", choices=["prep", "train"], help="bench-segdec: prep (group inputs) | train")
     ap.add_argument("--init", default="pretrained", choices=["pretrained", "random"], help="bench-segdec: encoder")
     ap.add_argument("--iters", type=int, help="bench-segdec: training iterations (pilot override)")
+    ap.add_argument("--resume", action="store_true", help="bench-segdec: skip runs whose json is written (chained jobs)")
     ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):

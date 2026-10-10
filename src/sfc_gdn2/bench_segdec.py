@@ -67,9 +67,14 @@ def prep(bench: dict, group: str, items: dict[str, list[dict]], device: str = "c
 
 
 def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init: str, device: str = "cuda",
-          iters: int | None = None) -> dict:
+          iters: int | None = None, resume: bool = False) -> dict:
+    """`resume`: a run whose json is written (same iters) is skipped, for chained jobs (a killed run always resumes
+    from its checkpoints, fm/segrun.py)."""
     s = bench["segdec"] | ({"iters": iters, "val_every": max(iters // 2, 1)} if iters else {})
     out = Path(s["out"]) / task / f"s{seed}" / f"{model}__{init}.json"
+    if resume and out.exists() and "test_ci95" in (res := json.loads(out.read_text())) and res["iters"] == int(s["iters"]):
+        print(f"[segdec] {task} s{seed} {model} {init}: done ({out}), skipped", flush=True)
+        return res
     seg = Path(items[0]["seg"])
     k = 1 + (len(list(seg.glob("*.nii*"))) if seg.is_dir() else 1)  # as bench_geom.gt_labels counts classes
     run_job(load_config(f"configs/fm/{model}.yaml"),

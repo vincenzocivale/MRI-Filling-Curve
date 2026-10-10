@@ -22,15 +22,17 @@ voxel of a random foreground class present, nnU-Net's oversampling), loss CE + s
 batch Dice), bf16 autocast (fp32 if the wrapper sets `seg_bf16 = False`); every `val_every` iterations Dice on the val volumes (sliding window, Gaussian, step
 0.5, on the grid), the best state kept. Test: class probabilities interpolated (trilinear, from_cells) to every GT
 voxel, argmax, Dice per foreground class present in GT or prediction, mean per volume (as bench_seg.full_res_dice).
+A killed job resumes from what it left next to the result json: the training state (every 10 min, SFC_SEG_SAVE_S),
+the best state, the test volumes done.
 Only stdlib + numpy + torch + nibabel here.
 """
 from __future__ import annotations
 
 import contextlib
-import copy
 import json
 import math
 import os
+import resource
 import sys
 import time
 import traceback
@@ -44,6 +46,8 @@ import torch.nn.functional as F
 
 from ..bench_geom import gt_labels
 from .worker import build, prepared
+
+SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
 
 def pull_labels(lab: np.ndarray, grid_from_gt: np.ndarray, grid, device) -> torch.Tensor:
@@ -249,11 +253,22 @@ def train(job: dict) -> None:
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
-    # the best state is kept on disk until the test is written: a crash while testing does not cost the training
-    ckpt = Path(job["out"]).with_suffix(".best.pt")
+    # on disk as the run goes, so a killed job resumes: the training state every 10 min (.last.pt), the best state
+    # until the test is written (.best.pt), the test volumes done (.test.json)
+    out_p = Path(job["out"])
+    ckpt, last, part = (out_p.with_suffix(s) for s in (".best.pt", ".last.pt", ".test.json"))
+    out_p.parent.mkdir(parents=True, exist_ok=True)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])}
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
     iters, every = int(job["iters"]), int(job["val_every"])
+
+    def trained() -> dict:  # what training changes (frozen parameters stay as built)
+        return {n: t.detach().to("cpu", copy=True) for n, t in net.state_dict().items() if n not in frozen_names}
+
+    def load_trained(state: dict) -> None:
+        missing, unexpected = net.load_state_dict(state, strict=False)
+        assert not unexpected and set(missing) <= frozen_names, (unexpected, missing)
+
     if saved.get("key") == key:
         best, curve = saved["best"], saved["curve"]
         print(f"[seg] best state from {ckpt} (iter {best['iter']}), training skipped", flush=True)
@@ -265,7 +280,26 @@ def train(job: dict) -> None:
         params = [p for p in net.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=job["lr"], weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: (1 - i / iters) ** 0.9)
-        best, curve, t0 = {"val": -1.0}, [], time.time()
+        best, curve, start, t0 = {"val": -1.0}, [], 1, time.time()
+        state = torch.load(last, map_location="cpu", weights_only=False) if last.exists() else {}
+        if state.get("key") == key:
+            load_trained(state["net"])
+            opt.load_state_dict(state["opt"])
+            sched.load_state_dict(state["sched"])
+            rng.bit_generator.state = state["rng"]  # after Patches, which draws from it as in the first job
+            torch.set_rng_state(state["torch_rng"])
+            if state["cuda_rng"] is not None and dev.type == "cuda":
+                torch.cuda.set_rng_state(state["cuda_rng"])
+            best, curve, start, t0 = state["best"], state["curve"], state["it"] + 1, t0 - state["min"] * 60
+            print(f"[seg] resumed from {last} at iter {state['it']} ({state['min']:.1f} min done)", flush=True)
+        t_save = time.time()
+
+        def save_last(it: int) -> None:
+            torch.save({"key": key, "it": it, "net": trained(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                        "rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+                        "cuda_rng": torch.cuda.get_rng_state() if dev.type == "cuda" else None,
+                        "best": best, "curve": curve, "min": (time.time() - t0) / 60}, last.with_suffix(".tmp"))
+            os.replace(last.with_suffix(".tmp"), last)
 
         def set_mode():
             net.train()
@@ -273,7 +307,7 @@ def train(job: dict) -> None:
                 m.eval()
 
         set_mode()
-        for it in range(1, iters + 1):
+        for it in range(start, iters + 1):
             x, y = data.sample(int(job["batch"]))
             with amp():
                 logits = net(x.to(dev, non_blocking=True).float())
@@ -292,16 +326,25 @@ def train(job: dict) -> None:
                 print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} ({(time.time() - t0) / 60:.1f} min)",
                       flush=True)
                 if "state" not in best or val > best["val"]:
-                    best = {"val": val, "iter": it,
-                            "state": copy.deepcopy({n: t.cpu() for n, t in net.state_dict().items()})}
+                    best = {"val": val, "iter": it, "state": trained()}
                 set_mode()
+            if time.time() - t_save > SAVE_S and it < iters:
+                save_last(it)
+                t_save = time.time()
         del val_v, data
-        ckpt.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
-    net.load_state_dict(best.pop("state"))
+        last.unlink(missing_ok=True)
+    load_trained(best.pop("state"))
     net.eval()
-    res = {"per_volume": [], "per_class": [], "test_ids": []}
+    tkey = key | {"best_iter": best["iter"]}
+    done = json.loads(part.read_text()) if part.exists() else {}
+    res = done["res"] if done.get("key") == tkey else {"per_volume": [], "per_class": [], "test_ids": []}
+    if res["test_ids"]:
+        print(f"[seg] test resumed from {part}: {len(res['test_ids'])} volumes done", flush=True)
     for it in split["test"]:
+        if it["id"] in res["test_ids"]:
+            continue
+        t1 = time.time()
         v = load(it)
         probs = sliding(net, v["x"].to(dev).float(), patch, k, amp)
         lab, _, _ = gt_labels(it["seg"])
@@ -309,13 +352,18 @@ def train(job: dict) -> None:
         res["per_volume"].append(d)
         res["per_class"].append(per)
         res["test_ids"].append(it["id"])
+        part.write_text(json.dumps({"key": tkey, "res": res}))
+        print(f"[seg] test {len(res['test_ids'])}/{len(split['test'])} {it['id']}: dice {d:.4f} grid "
+              f"{tuple(v['x'].shape[1:])} {time.time() - t1:.0f}s, peak RSS "
+              f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.0f} GB", flush=True)
+        del v, probs, lab
     out = {"model": job["cfg"]["model"], "init": job["init"], "lr": job["lr"], "iters": iters, "patch": patch,
            "frozen_prefixes": frozen, "params_frozen": n_frozen, "params_trained": n_train, "best": best,
            "curve": curve, "n": {s: len(v) for s, v in split.items()},
            "test_dice": float(np.nanmean(res["per_volume"])), **res}
-    Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
-    Path(job["out"]).write_text(json.dumps(out, indent=1))
+    out_p.write_text(json.dumps(out, indent=1))
     ckpt.unlink()
+    part.unlink(missing_ok=True)
     print(f"[seg] test dice {out['test_dice']:.4f} on {len(res['per_volume'])} volumes -> {job['out']}", flush=True)
 
 
