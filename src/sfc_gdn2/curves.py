@@ -1,117 +1,96 @@
-"""3D space-filling curves over an n^3 patch grid, and their views under the cube's symmetries.
+"""3D space-filling curves as sort keys over integer patch coordinates, and the cube's symmetries.
 
-Patches live in canonical raster index space: index = x*n^2 + y*n + z. A curve is a
-permutation `order` of those indices (sequence position -> patch index). A *view* is the same
-curve traced on the grid after one of the 48 symmetries of the cube (axis permutation x
-reflection), so every view has identical locality statistics but a different traversal.
+A curve is a key per patch coordinate; sorting a box's patches by key gives its traversal. Boxes
+need not be cubic nor powers of two: Hilbert and Morton keys are those of the enclosing 2^bits cube,
+so the traversal of a box is the cube's curve restricted to it (it may jump where the curve leaves
+and re-enters the box). A *view* applies one of the 48 symmetries of the cube (axis permutation x
+reflection, within the box) before keying, so views of one curve share its locality statistics but
+differ in traversal.
 """
 from __future__ import annotations
 
 import itertools
 
-import numpy as np
 import torch
 
 CURVES = ("raster", "snake", "morton", "hilbert", "random")
 
 
-def grid_coords(n: int) -> np.ndarray:
-    """[n^3, 3] integer coordinates in canonical raster order."""
-    return np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1).reshape(-1, 3)
+def grid_coords(grid: torch.Tensor, n_patch: int) -> torch.Tensor:
+    """Patch grids [B,3] -> raster coordinates [B,N,3] along a patch axis padded to N (-1 = padding)."""
+    j = torch.arange(n_patch, device=grid.device)
+    gy, gz = grid[:, 1:2], grid[:, 2:3]
+    xyz = torch.stack([j // (gy * gz), j // gz % gy, j % gz], -1)
+    return torch.where((j < grid.prod(1, keepdim=True))[..., None], xyz, -1)
 
 
-def _hilbert_key(c: np.ndarray, bits: int) -> np.ndarray:
-    """Skilling's AxesToTranspose + bit interleave, vectorised over points."""
-    x = [c[:, i].astype(np.int64) for i in range(3)]
+def symmetries() -> tuple[torch.Tensor, torch.Tensor]:
+    """The 48 (axis permutation [48,3], per-axis flip [48,3]) pairs; identity first."""
+    perms, flips = zip(*itertools.product(itertools.permutations(range(3)),
+                                          itertools.product((False, True), repeat=3)))
+    return torch.tensor(perms), torch.tensor(flips)
+
+
+def transform(c: torch.Tensor, dims: torch.Tensor, perm: torch.Tensor, flip: torch.Tensor):
+    """Box-local coords c [...,3] in a box of size dims [...,3] -> (c', dims') under a symmetry."""
+    c = torch.where(flip, dims - 1 - c, c)
+    return c.gather(-1, perm.expand_as(c)), dims.gather(-1, perm.expand_as(dims))
+
+
+def _hilbert(c: torch.Tensor, bits: int) -> torch.Tensor:
+    """Skilling's AxesToTranspose + bit interleave, vectorised."""
+    x = [c[..., i] for i in range(3)]
     q = 1 << (bits - 1)
     while q > 1:
         m = q - 1
         for i in range(3):
             hit = (x[i] & q) != 0
             t = (x[0] ^ x[i]) & m
-            x0 = np.where(hit, x[0] ^ m, x[0] ^ t)
+            x0 = torch.where(hit, x[0] ^ m, x[0] ^ t)
             if i:
-                x[i] = np.where(hit, x[i], x[i] ^ t)
+                x[i] = torch.where(hit, x[i], x[i] ^ t)
             x[0] = x0
         q >>= 1
     for i in (1, 2):
         x[i] = x[i] ^ x[i - 1]
-    t = np.zeros_like(x[0])
+    t = torch.zeros_like(x[0])
     q = 1 << (bits - 1)
     while q > 1:
-        t = np.where((x[2] & q) != 0, t ^ (q - 1), t)
+        t = torch.where((x[2] & q) != 0, t ^ (q - 1), t)
         q >>= 1
     x = [v ^ t for v in x]
-    key = np.zeros_like(x[0])
+    key = torch.zeros_like(x[0])
     for b in range(bits - 1, -1, -1):
         for v in x:
             key = (key << 1) | ((v >> b) & 1)
     return key
 
 
-def _morton_key(c: np.ndarray, bits: int) -> np.ndarray:
-    key = np.zeros(len(c), dtype=np.int64)
+def _morton(c: torch.Tensor, bits: int) -> torch.Tensor:
+    key = torch.zeros_like(c[..., 0])
     for b in range(bits):
         for axis in range(3):
-            key |= ((c[:, axis].astype(np.int64) >> b) & 1) << (3 * b + axis)
+            key |= ((c[..., axis] >> b) & 1) << (3 * b + axis)
     return key
 
 
-def _snake_key(c: np.ndarray, n: int) -> np.ndarray:
-    x, y, z = c.T
-    y = np.where(x % 2 == 0, y, n - 1 - y)
-    z = np.where((x + c[:, 1]) % 2 == 0, z, n - 1 - z)
-    return (x * n + y) * n + z
-
-
-def order(name: str, n: int, seed: int = 17) -> np.ndarray:
-    """Sequence position -> canonical patch index."""
-    c = grid_coords(n)
-    bits = max(int(n - 1).bit_length(), 1)
+def keys(name: str, c: torch.Tensor, dims: torch.Tensor, seed: int = 17) -> torch.Tensor:
+    """Curve sort key of box-local coords c [...,3] (int64, 0 <= c < dims) in boxes of size dims [...,3].
+    Distinct within a box."""
+    bits = max(int(dims.max()) - 1, 1).bit_length()
+    x, y, z = c.unbind(-1)
+    ny, nz = dims[..., 1], dims[..., 2]
     if name == "raster":
-        return np.arange(n ** 3)
-    if name == "random":
-        return np.random.default_rng(seed).permutation(n ** 3)
+        return (x * ny + y) * nz + z
     if name == "snake":
-        key = _snake_key(c, n)
-    elif name == "morton":
-        key = _morton_key(c, bits)
-    elif name == "hilbert":
-        if n & (n - 1):
-            raise ValueError("Hilbert ordering requires a power-of-two grid.")
-        key = _hilbert_key(c, bits)
-    else:
-        raise ValueError(f"Unknown curve {name!r}; have {CURVES}")
-    return np.argsort(key, kind="stable")
-
-
-def cube_symmetries() -> list[tuple[tuple[int, int, int], tuple[bool, bool, bool]]]:
-    """The 48 (axis permutation, per-axis flip) pairs; identity first."""
-    return [(p, f) for p in itertools.permutations(range(3))
-            for f in itertools.product((False, True), repeat=3)]
-
-
-class CurveViews:
-    """Distinct traversals of one curve under the cube symmetries.
-
-    `perms[v]`: sequence position -> canonical patch index for view v.
-    `ranks[v]`: canonical patch index -> sequence position (inverse of perms[v]).
-    View 0 is the untransformed curve (used for downstream feature extraction).
-    """
-
-    def __init__(self, name: str, n: int, seed: int = 17):
-        self.name, self.n = name, n
-        ordered = grid_coords(n)[order(name, n, seed)]
-        perms, seen = [], set()
-        for axes, flips in cube_symmetries():
-            c = ordered[:, axes]
-            c = np.where(np.array(flips), n - 1 - c, c)
-            p = (c[:, 0] * n + c[:, 1]) * n + c[:, 2]
-            if (key := p.tobytes()) not in seen:
-                seen.add(key)
-                perms.append(p)
-        self.perms = torch.from_numpy(np.stack(perms))
-        self.ranks = torch.argsort(self.perms, dim=1)
-
-    def __len__(self) -> int:
-        return len(self.perms)
+        y = torch.where(x % 2 == 0, y, ny - 1 - y)
+        z = torch.where((x + c[..., 1]) % 2 == 0, z, nz - 1 - z)
+        return (x * ny + y) * nz + z
+    if name == "morton":
+        return _morton(c, bits)
+    if name == "hilbert":
+        return _hilbert(c, bits)
+    if name == "random":  # a fixed random permutation of the enclosing cube
+        table = torch.randperm(1 << 3 * bits, generator=torch.Generator().manual_seed(seed)).to(c.device)
+        return table[_morton(c, bits)]
+    raise ValueError(f"Unknown curve {name!r}; have {CURVES}")

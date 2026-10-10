@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 import zipfile
 from pathlib import Path
 
 import nibabel as nib
+import nibabel.orientations as nio
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -20,51 +22,46 @@ def _atomic_write(dest: Path, write) -> None:
     os.replace(tmp, dest)
 
 
-def foreground_percentile(vol: np.ndarray) -> np.ndarray:
-    """Clip to the 1st/99th percentile of voxels > 0 and rescale to [0, 1]."""
-    fg = vol[vol > 0]
-    lo, hi = np.percentile(fg if fg.size else vol, [1, 99])
-    return (np.clip(vol, lo, hi) - lo) / max(hi - lo, 1e-6)
+def patch_dims(spacing, patch_mm: float) -> tuple[int, int, int]:
+    """Native voxels per patch axis: the whole number closest to `patch_mm` mm (>= 1)."""
+    return tuple(max(1, round(patch_mm / float(z))) for z in spacing[:3])
 
 
-def fit_cube(vol: np.ndarray, zooms, side: int, mode: str = "trilinear") -> np.ndarray:
-    """Aspect-preserving resample: isotropic voxels with the longest physical side spanning `side`,
-    zero-padded (centred) to a `side`^3 cube. Thick-slice stacks keep their true proportions
-    instead of being stretched to fill the cube."""
-    extent = np.asarray(vol.shape) * np.asarray(zooms[:3], dtype=float)
-    shape = tuple(int(s) for s in np.clip(np.round(extent / extent.max() * side), 1, side))
-    kw = {"align_corners": False} if mode == "trilinear" else {}
-    t = F.interpolate(torch.from_numpy(np.ascontiguousarray(vol, dtype=np.float32))[None, None],
-                      size=shape, mode=mode, **kw)[0, 0]
-    out = torch.zeros((side,) * 3)
-    lo = [(side - s) // 2 for s in shape]
-    out[lo[0]:lo[0] + shape[0], lo[1]:lo[1] + shape[1], lo[2]:lo[2] + shape[2]] = t
-    return out.numpy()
-
-
-def load_canonical(path: str | Path) -> tuple[np.ndarray, tuple]:
-    img = nib.as_closest_canonical(nib.load(str(path)))
-    return np.asarray(img.dataobj, dtype=np.float32), img.header.get_zooms()
+def load_canonical(path: str | Path) -> tuple[np.ndarray, tuple, float, float]:
+    """RAS-closest orientation (axis permutation and flips only, as nib.as_closest_canonical: no value
+    changed) of the voxels as stored (dtype kept, header scaling not applied) -> (raw, zooms in the
+    new axis order, slope, inter); the scan's values are raw * slope + inter."""
+    img = nib.load(str(path))
+    ornt = nio.io_orientation(img.affine)
+    raw = nio.apply_orientation(img.dataobj.get_unscaled(), ornt)
+    if raw.dtype == np.uint16:   # torch has no uint16 tensors
+        raw = raw.astype(np.int32)
+    elif raw.dtype == np.float64:
+        raw = raw.astype(np.float32)
+    zooms = [0.0] * 3
+    for i, z in enumerate(img.header.get_zooms()[:3]):
+        zooms[int(ornt[i, 0])] = float(z)
+    slope, inter = (float(v) if v is not None and np.isfinite(v) else d
+                    for v, d in ((img.dataobj.slope, 1.0), (img.dataobj.inter, 0.0)))
+    return np.ascontiguousarray(raw), tuple(zooms), slope or 1.0, inter
 
 
 class VolumeStore:
-    """Loads a scan as a canonical, normalised, isotropically resampled float16 cube.
+    """A scan exactly as acquired: canonical orientation (no value changed), stored dtype, native voxels.
+    `load` -> (raw array, spacing mm [3], (a, c)): a * raw + c is the scan's value (header slope and
+    intercept) divided by the 99th percentile of its voxels > 0, i.e. ~[0, 1] without clipping anything.
 
-    The first access decodes the NIfTI (extracting it from its zip if needed) and writes the
-    result to `cache_dir/cubes/`; every later access is a single memory-mapped .npy read, which
-    is what keeps the data loader off the critical path.
+    The first access decodes the NIfTI (extracting it from its zip if needed) and writes the array to
+    `cache_dir/native/` (+ a .json with spacing and scale); every later access is a memory-mapped
+    .npy read, which is what keeps the data loader off the critical path.
     """
 
-    def __init__(self, cache_dir: str | Path, target_shape: tuple[int, int, int]):
+    def __init__(self, cache_dir: str | Path):
         self.root = Path(cache_dir)
-        self.shape = tuple(target_shape)
-        if len(set(self.shape)) != 1:
-            raise ValueError(f"target_shape must be cubic, got {self.shape}")
-        self.side = self.shape[0]
 
-    def _cube_path(self, path: str) -> Path:
-        key = hashlib.sha1(f"{path}|{self.shape}|iso-fg-p1-p99".encode()).hexdigest()[:20]
-        return self.root / "cubes" / key[:2] / f"{key}.npy"
+    def _cache_path(self, path: str) -> Path:
+        key = hashlib.sha1(f"{path}|native-v1".encode()).hexdigest()[:20]
+        return self.root / "native" / key[:2] / f"{key}.npy"
 
     def _materialize(self, path: str) -> Path:
         if not path.startswith("zip://"):
@@ -80,32 +77,35 @@ class VolumeStore:
             _atomic_write(dest, write)
         return dest
 
-    def _decode(self, path: str) -> np.ndarray:
-        vol, zooms = load_canonical(self._materialize(path))
-        return fit_cube(foreground_percentile(vol), zooms, self.side).astype(np.float16)
+    def load(self, path: str) -> tuple[np.ndarray, tuple, float]:
+        arr_path = self._cache_path(path)
+        meta_path = arr_path.with_suffix(".json")
+        if not meta_path.exists():
+            arr, spacing, slope, inter = load_canonical(self._materialize(path))
+            val = arr.astype(np.float64) * slope + inter
+            fg = val[val > 0]
+            scale = 1.0 / max(float(np.percentile(fg if fg.size else val, 99)), 1e-6)
+            meta = {"spacing": spacing, "affine": [slope * scale, inter * scale]}
 
-    def load(self, path: str) -> np.ndarray:
-        cube = self._cube_path(path)
-        if not cube.exists():
-            arr = self._decode(path)
-            def write(tmp):
+            def write_arr(tmp):
                 with open(tmp, "wb") as f:
                     np.save(f, arr)
-            _atomic_write(cube, write)
-            return arr
-        return np.load(cube, mmap_mode="r")
+            _atomic_write(arr_path, write_arr)
+            _atomic_write(meta_path, lambda tmp: Path(tmp).write_text(json.dumps(meta)))
+            return arr, tuple(spacing), tuple(meta["affine"])
+        meta = json.loads(meta_path.read_text())
+        return np.load(arr_path, mmap_mode="r"), tuple(meta["spacing"]), tuple(meta["affine"])
 
 
-def patchify(vol: torch.Tensor, patch: int) -> torch.Tensor:
-    """[D,H,W] cube -> [N, patch^3] non-overlapping patches in canonical raster order."""
-    g = vol.shape[0] // patch
-    v = vol.reshape(g, patch, g, patch, g, patch).permute(0, 2, 4, 1, 3, 5)
-    return v.reshape(g ** 3, patch ** 3)
+def patchify(vol: torch.Tensor, k) -> torch.Tensor:
+    """[D,H,W] volume -> [N, k0*k1*k2] non-overlapping patches of k = (k0, k1, k2) voxels (an int: a
+    cube), in raster order of the patch grid. The end of each axis is zero-padded to a multiple of k."""
+    k = (k,) * 3 if isinstance(k, int) else tuple(int(v) for v in k)
+    vol = F.pad(vol, [p for n, q in zip(reversed(vol.shape), reversed(k)) for p in (0, -n % q)])
+    (gx, gy, gz), (a, b, c) = (n // q for n, q in zip(vol.shape, k)), k
+    return vol.reshape(gx, a, gy, b, gz, c).permute(0, 2, 4, 1, 3, 5).reshape(gx * gy * gz, a * b * c)
 
 
-def unpatchify(patches: torch.Tensor, grid: int) -> torch.Tensor:
-    """Inverse of `patchify`, batched: [B, grid^3, p^3] canonical-order patches -> [B, S, S, S] cubes."""
-    b, _, v = patches.shape
-    p = round(v ** (1 / 3))
-    x = patches.reshape(b, grid, grid, grid, p, p, p).permute(0, 1, 4, 2, 5, 3, 6)
-    return x.reshape(b, grid * p, grid * p, grid * p)
+def patch_grid(shape, k) -> torch.Tensor:
+    """Patch grid [3] of a volume of `shape` cut into patches of k voxels (end padded)."""
+    return torch.tensor([-(-int(n) // int(q)) for n, q in zip(shape[:3], k)])

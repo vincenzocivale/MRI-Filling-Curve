@@ -1,20 +1,20 @@
 # LeJEPA over groups of patches: `sfc pretrain configs/pretrain_lejepa.yaml`.
 # Per volume, groups (boxes of the patch grid); per group, two views (jittered box, intensity,
-# own curve of `view_curves`; view A masked). Global term on the last forward state, token term on
-# masked patches (bi tokens of A predict B's). No held-out set:
+# own curve of `view_curves`; view A masked in aligned cubes). One masked-prediction task per scale (H-JEPA
+# pattern, space for time): patch tokens, cubes of `levels` patches, the whole view (mean token) on top. No held-out set:
 # checkpoints (save_every) are selected on the probe's val split.
 seed: 17
-output_root: /raid/DATASETS/MRI-US/biomed-fm-results/sfc_pretrain_v5
+output_root: /raid/DATASETS/MRI-US/biomed-fm-results/sfc_pretrain_v8
 
 data:
   manifests:                  # pretraining pool = union of each manifest's `pretrain` split
     - data/manifests/fomo300k_sex.csv     # 4366 brain T1w (every scan of every non-probe subject)
     - data/manifests/totalseg_mri.csv     # 896 body MRI
   splits: [pretrain]          # probe splits (train/val/test) stay disjoint by subject
-  target_shape: [128, 128, 128]  # isotropic, longest side 128, zero-padded (aspect preserved)
-  patch_size: 8               # grid 16 -> 4096 tokens
+  patch_mm: 16.0              # patch = the scan's native voxels, round(16 / spacing) per axis (~16 mm); nothing resampled
   cache_dir: /raid/DATASETS/MRI-US/biomed-fm-results/.cache_volumes
   num_workers: 8
+  patches_per_batch: 16384    # per GPU: whole scans packed up to this many patches (~6 brains; a big body scan alone)
 
 model:
   d_model: 256
@@ -22,31 +22,39 @@ model:
   head_dim: 64
   num_heads: 4
   use_short_conv: true
-  grad_checkpoint: false
+  grad_checkpoint: true         # GDN-2 blocks recomputed in backward when a step's views exceed objective.checkpoint_tokens
+  embed:                      # continuous-kernel patch embedding (model.KernelEmbed), any spacing
+    rank: 16                  # learned 1D basis functions per axis (kernel = G . phi_x phi_y phi_z)
+    max_cycles_per_mm: 4.0    # highest Fourier frequency of phi (finest pool spacing 0.16 mm)
 
 objective:
-  view_curves: [raster, hilbert]  # each view: one of these curves, in a random cube symmetry
+  view_curves: [raster, morton, hilbert]  # each view: one of these curves, in a random cube symmetry; probes average all three
   groups_global: 2            # per volume: boxes spanning global_frac of the foreground bounding box
   groups_local: 6             # per volume: boxes with edges log-uniform in local_edge patches
   global_frac: [0.3, 1.0]     # volume fraction of the foreground bounding box
   local_edge: [3, 8]          # patches per edge (27-512 tokens)
   jitter: 0.25                # view box = group box rescaled/shifted by up to this fraction of its edge
-  mask_ratio: [0.2, 0.5]      # fraction of view A's foreground patches replaced by the mask token (token term targets)
+  max_view_tokens: null       # no cap: a global view can span a whole volume (whole body ~37k patches)
+  thick_prob: 0.3             # per view: native slices averaged into slabs along a random axis ...
+  thick_mm: [4, 8]            # ... ~4 or 8 mm thick (skipped where the scan's slices already are): thick-slice acquisitions
+  mask_ratio: [0.2, 0.5]      # fraction of view A's cubes whose foreground patches get the mask token
+  mask_cells: [1, 2, 4]       # per view A: cube edge (patches) of its mask, <= half the view's shortest edge
+  levels: [2, 4]              # cube levels above the patch (32, 64 mm): mean token of fully masked A cubes -> B's (v8 smoke: 128 mm cubes got 0-4 pairs per step: masks that big fit only whole-body views)
   gamma: 0.3                  # intensity: x^exp(U(-g,g)) * U(1-scale,1+scale) + U(-shift,shift) + N(0, U(0,noise))
   scale: 0.1
   shift: 0.05
   noise: 0.02
   fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
   proj_hidden: 1024
-  proj_dim: 64                # both heads: glob (last forward state) and tok (bi token); LeJEPA Tab. 1d: small is better
-  tokens_per_volume: 32       # B foreground tokens per volume fed to the token SIGReg (6 GPUs x 6 vols x 32 = 1152 samples)
+  proj_dim: 64                # every head (view mean, patch, each cube level); LeJEPA Tab. 1d: small is better
+  tokens_per_volume: 32       # B foreground tokens per volume fed to the token SIGReg (4 GPUs x 6 vols x 32 = 768 samples)
   lam: 0.05                   # loss = (1-lam)*invariance + lam*SIGReg
   sigreg_slices: 256
   sigreg_knots: 17
 
 train:
-  steps: 15000                # per GPU batch_size; effective batch = GPUs x batch_size
-  batch_size: 6                # per GPU (views packed: B=6 peaks at ~11GB); 6 GPUs -> effective 36
+  steps: 15000
+  batch_size: 6                # per GPU, at most (data.patches_per_batch packs whole scans); 4 GPUs
   lr: 0.0005
   weight_decay: 0.05          # matrices only (see pretrain.param_groups)
   grad_clip: 1.0              # rare single-token gradient spikes (50-1500x median) otherwise; skip non-finite steps

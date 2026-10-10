@@ -11,9 +11,13 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-from .data.dataset import loader
+from .data.dataset import loader, to_device
 from .io import RunDir, seed_all
 from .lejepa import LeJEPA
+
+# grids differ ~30x in size between a brain and a whole body: with the default allocator the cache
+# fragmented to the card's limit and steps slowed 10x (4 shared GPUs, 0.6 -> 6 s/step)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def pretrain_rows(cfg: dict) -> pd.DataFrame:
@@ -78,7 +82,7 @@ class Pretrainer:
         self.model.train()
         for step, batch in zip(range(1, t["steps"] + 1), self._batches()):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = self.model(batch["patches"].to(self.device, non_blocking=True).float(), gen)
+                out = self.model(to_device(batch, self.device), gen)
             self.opt.zero_grad(set_to_none=True)
             out["loss"].backward()
             gnorm = nn.utils.clip_grad_norm_(self.model.parameters(), clip)

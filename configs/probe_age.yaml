@@ -1,5 +1,5 @@
 # Age within cohort: target = age - cohort's train mean, so "which scanner" is no cue. Cohorts with a
-# wide age range only (GSP sd ~3 y, OASIS2 sd ~7 y left out). Ridge regression, selected on val R^2.
+# wide age range only (GSP sd ~3 y, OASIS2 sd ~7 y left out). Ridge regression, fixed L2, fitted on train+val.
 seed: 17
 task: regression
 manifest: data/manifests/fomo300k_sex.csv
@@ -7,4 +7,4 @@ label: age
 cohorts: [PT021_IXI, PT027_NKI, PT028_OASIS1]
 batch_size: 8
 num_workers: 8
-cv_folds: 5                   # subject-grouped CV on train+val for selection (val alone is ~56-100 volumes)
+l2: {encoder: 0.01, raw: 10.0}   # v7 CV selections, fixed since

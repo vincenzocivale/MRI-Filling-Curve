@@ -5,16 +5,25 @@ region are different space-filling-curve serializations of it, evaluated with fr
 
 ## Pretraining (`configs/pretrain_lejepa.yaml`)
 
-A volume is a `16³` grid of `8³`-voxel patches (linear embedding, no position embedding). Per batch of
-B volumes:
+Nothing is resampled. A patch is a block of the scan's own voxels, `round(patch_mm / spacing)` per axis
+(~16 mm: 13³ voxels of a 1.2 mm brain, 102×102×7 of a 0.16×0.16×2.2 mm body scan, one 28 mm slice), so the
+patch grid follows the field of view (a brain ~12×15×15, a whole body ~34×9×123). The patch embedding is a
+learned continuous kernel in mm, integrated over each voxel's physical extent (`model.KernelEmbed`): every
+voxel enters with its own weight, the same kernel serves every spacing, and a scan and the same scan with
+each voxel copied into finer voxels give the same token. No position embedding. Per batch of B volumes:
 
 1. **Groups.** N boxes of the patch grid per volume, centred on foreground patches: `groups_global`
    spanning `global_frac` of the foreground bounding box, `groups_local` with `local_edge` patches per edge.
 2. **Views.** K per group. A view is the group box rescaled/shifted by up to `jitter` (partial
-   overlap), intensity-augmented (gamma, scale, shift, noise), with `mask_ratio` of its foreground patches set to
-   the mask token, read along a curve drawn from `view_curves` in a random cube symmetry.
-3. **Loss.** View embedding = mean encoder output over its tokens → projector;
-   `(1-λ)·invariance(views of a group) + λ·SIGReg(per-volume-centred embeddings)`.
+   overlap) and capped at `max_view_tokens` patches, intensity-augmented (gamma, scale, shift, noise), with
+   probability `thick_prob` given simulated thick slices (native slices averaged into ~`thick_mm` slabs along
+   a random axis, where the scan's slices are thinner), view A with `mask_ratio` of its aligned cubes (edge drawn from `mask_cells` patches) set to the mask token on their foreground patches, read along a curve drawn
+   from `view_curves` in a random cube symmetry, traced within the view's box (any shape: Hilbert/Morton
+   are the enclosing power-of-two cube's curve restricted to the box).
+3. **Loss.** One masked-prediction task per spatial scale (the H-JEPA pattern, arXiv 2610.06805, with space in
+   place of time), each with its own projector and SIGReg: A's masked patch tokens → B's same patches; mean
+   token of each cube of `levels` patches fully masked in A → B's same cube; the view's mean foreground token
+   (top) → B's. `(1-λ)·mean(invariances) + λ·mean(SIGRegs)`.
 
 Views differ in content as well as order: with no position embedding, serialization alone would be
 satisfied by an encoder that ignores order.
@@ -51,22 +60,24 @@ sfc summarize <output_root>                           # -> probe_summary.csv
 Pretraining uses every `pretrain` row of `data.manifests` (FOMO300K brain T1w + TotalSegmentator MRI)
 and saves `encoder_step*.pt` every `save_every` steps, starting with step 0 (the run's own init).
 
-| probe | task | features | head | selected on |
+| probe | task | features | head | metric |
 |---|---|---|---|---|
-| `probe_totalseg.yaml` | per-patch majority class, 50 classes + background | patch token: `token` (causal) / `bi` (++ backward pass) | logistic | val macro AP (fg) |
-| `probe_age.yaml` | age − cohort train mean, IXI/NKI/OASIS1 | last causal state (`last`) | ridge | 5-fold CV R² |
-| `probe_sex.yaml` | sex (sanity check: trivial cues give AUC ~0.81) | last causal state (`last`) | logistic | 5-fold CV AUC |
+| `probe_totalseg.yaml` | per-patch majority class, 50 classes + background | patch `bi` token (forward ++ backward pass) | logistic | macro AP (fg) |
+| `probe_age.yaml` | age − cohort mean, IXI/NKI/OASIS1 | mean foreground `bi` token | ridge | R² |
+| `probe_sex.yaml` | sex (sanity check: trivial cues give AUC ~0.81) | mean foreground `bi` token | logistic | AUC |
 
-Each probe reports, per inference curve in the run's `view_curves`, the pretrained encoder (best
-checkpoint × features × L2) and its step-0 `init`, scores test once with a volume-bootstrap 95% CI and
-saves `test_preds.pt` for paired comparisons. Segmentation also reports `@token`/`@bi` separately and
-`chance_ap`. `--raw` adds encoder-free baselines (patch intensities; for segmentation also `position`,
+No model selection: each probe fits with the fixed `l2` of its config (v7's val/CV choices) on train+val and
+scores test once, with a volume-bootstrap 95% CI, for every saved checkpoint (step 0 = init). Encoder features
+are averaged over the run's `view_curves` (test-time augmentation). `test_preds.pt` keeps the test outputs for
+paired comparisons; segmentation also reports `chance_ap`. `--raw` adds encoder-free baselines (patch intensities box-averaged to 8³ as a fixed-length
+input; for segmentation also `position`,
 random Fourier features of patch coordinates). A probe refuses to run if a probe subject was seen in
 pretraining.
 
-Preprocessing (canonical reorientation, foreground 1–99th percentile, aspect-preserving isotropic
-resample with the longest side spanning `target_shape`, zero-padded to the cube) runs once per scan and is cached as a float16 `.npy` cube under `cache_dir/cubes/`;
-later epochs memory-map it.
+Storage: each scan's voxels exactly as stored (dtype kept, canonical reorientation = axis permutation and
+flips only), cached once as `.npy` under `cache_dir/native/` with a `.json` of spacing and the value map
+`a·raw + c` (header slope/intercept over the 99th percentile of the foreground; no clipping). Values become
+fp32 on the GPU, where the volume is cut into patches; the embedding runs in fp32.
 
 **FOMO300K is a superset of OpenMind:** never pool them as independent cohorts.
 
@@ -88,7 +99,7 @@ Presets: `dbg` (1 GPU, debug QOS, 30 min), `1gpu`, `4gpu` and `8gpu` (torchrun D
 `cpu` (`lrd_all_serial`). Under torchrun the command is `-m <module>` or a script, never `python`.
 Config: `slurm/defaults.yaml` <- `slurm/local.yaml` <- preset <- `--set key=value`; logs in `outputs/slurm/`.
 `configs/leonardo/` holds copies of the pretraining, dataset and split configs with Leonardo paths
-(runs on `$SCRATCH`, cube cache on `$FAST`); keep their non-path fields in sync with `configs/`.
+(runs on `$SCRATCH`, native cache on `$FAST`); keep their non-path fields in sync with `configs/`.
 flash-attn's upstream wheels need GLIBC 2.32 (Leonardo: 2.28); build it with `slurm/build_flash_attn.sh`.
 
 ## External foundation models

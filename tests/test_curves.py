@@ -1,45 +1,52 @@
-import numpy as np
 import pytest
 import torch
 
-from sfc_gdn2.curves import CURVES, CurveViews, grid_coords, order
+from sfc_gdn2.curves import CURVES, keys, symmetries, transform
+
+
+def coords(*dims):
+    return torch.stack(torch.meshgrid(*[torch.arange(n) for n in dims], indexing="ij"), -1).reshape(-1, 3)
+
+
+def walk(name, *dims):
+    c = coords(*dims)
+    return c[keys(name, c, torch.tensor(dims)).argsort()]
 
 
 @pytest.mark.parametrize("name", CURVES)
-def test_curve_is_permutation(name):
-    assert np.array_equal(np.sort(order(name, 8)), np.arange(8 ** 3))
-
-
-def test_hilbert_requires_power_of_two():
-    with pytest.raises(ValueError):
-        order("hilbert", 6)
+@pytest.mark.parametrize("dims", [(8, 8, 8), (5, 3, 7)])
+def test_keys_are_distinct(name, dims):
+    c = coords(*dims)
+    assert len(keys(name, c, torch.tensor(dims)).unique()) == len(c)
 
 
 @pytest.mark.parametrize("name", ["snake", "hilbert"])
 def test_unit_step_curves_are_continuous(name):
-    c = grid_coords(8)[order(name, 8)]
-    assert (np.abs(np.diff(c, axis=0)).sum(1) == 1).all()
+    assert ((walk(name, 8, 8, 8).diff(dim=0).abs().sum(1)) == 1).all()
+
+
+def test_snake_is_continuous_on_any_box():
+    assert ((walk("snake", 5, 3, 7).diff(dim=0).abs().sum(1)) == 1).all()
 
 
 def test_morton_visits_octants_contiguously():
-    c = grid_coords(8)[order("morton", 8)]
-    octant = (c // 4) @ np.array([1, 2, 4])
-    assert (np.diff(octant) >= 0).all()
+    octant = (walk("morton", 8, 8, 8) // 4) @ torch.tensor([1, 2, 4])
+    assert (octant.diff() >= 0).all()
 
 
-@pytest.mark.parametrize("name", CURVES)
-def test_views_are_distinct_permutations_with_identity_first(name):
-    v = CurveViews(name, 4)
-    assert len(v) == 48
-    assert torch.equal(v.perms[0], torch.from_numpy(order(name, 4)))
-    assert len({tuple(p.tolist()) for p in v.perms}) == 48
-    ar = torch.arange(64)
-    for p, r in zip(v.perms, v.ranks):
-        assert torch.equal(p.sort().values, ar) and torch.equal(p[r], ar)
+def test_symmetries_are_48_distinct_traversals_with_identity_first():
+    perms, flips = symmetries()
+    assert len(perms) == 48 and perms[0].tolist() == [0, 1, 2] and not flips[0].any()
+    c, d = coords(4, 4, 4), torch.tensor([4, 4, 4])
+    orders = {tuple(keys("hilbert", *transform(c, d, p, f)).argsort().tolist()) for p, f in zip(perms, flips)}
+    assert len(orders) == 48
 
 
-def test_views_preserve_step_lengths():
-    v = CurveViews("hilbert", 8)
-    c = torch.from_numpy(grid_coords(8))
-    steps = [(c[p][1:] - c[p][:-1]).abs().sum(1) for p in v.perms]
-    assert all(torch.equal(s, steps[0]) for s in steps)
+def test_transform_stays_in_the_box_and_preserves_steps():
+    perms, flips = symmetries()
+    d = torch.tensor([5, 3, 7])
+    path = walk("hilbert", 5, 3, 7)
+    for p, f in zip(perms, flips):
+        t, td = transform(path, d, p, f)
+        assert ((t >= 0) & (t < td)).all() and sorted(td.tolist()) == [3, 5, 7]
+        assert torch.equal(t.diff(dim=0).abs().sum(1), path.diff(dim=0).abs().sum(1))

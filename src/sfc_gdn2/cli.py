@@ -39,11 +39,24 @@ def pretrain(cfg: dict, args) -> None:
 
 
 def probe(cfg: dict, args) -> None:
+    """Under torchrun, candidates (checkpoint x curve x features) are split across GPUs."""
+    import os
+    from datetime import timedelta
+
+    import torch
+    import torch.distributed as dist
+
     from .probe import probe_raw, probe_run
+    if "WORLD_SIZE" in os.environ:
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        # ranks fit different candidate shards (hours on segmentation): the gather waits for the slowest
+        dist.init_process_group("nccl", timeout=timedelta(hours=12))
     if args.raw:
         probe_raw(cfg, load_yaml(args.raw))
     for run_dir in args.run_dir or []:
         probe_run(cfg, run_dir)
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def fm(_, args) -> None:
@@ -61,19 +74,19 @@ def fm(_, args) -> None:
 
 
 def summarize(_, args) -> None:
-    """One row per (run, probe, group) under <root>: pretrained/init per run, plus the raw baseline."""
+    """One row per (run, probe, candidate) under <root>: every checkpoint per run, plus the raw baselines."""
     root, rows = Path(args.config), []
     for p in sorted([*root.glob("*/probe-*/metrics.json"), *root.glob("raw-probe-*/metrics.json")]):
         m = json.loads(p.read_text())
-        key = m["select_on"].split("_", 1)[1]  # val_<metric> or cv<k>_<metric>
+        key = m["metric"]
         for group, r in m["groups"].items():
             lo, hi = r[f"test_{key}_ci95"]
             rows.append({"label": m["label"], "metric": key, "objective": m["objective"], "curve": m["curve"],
-                         "group": group, "selected": r["selected"], "val": r["val"][key], "test": r["test"][key],
+                         "candidate": group, "l2": r["l2"], "test": r["test"][key],
                          "ci95": f"[{lo:.3f}, {hi:.3f}]", "run": p.parent.parent.name})
     if not rows:
         raise SystemExit(f"No probe results under {root}.")
-    df = pd.DataFrame(rows).sort_values(["label", "group", "objective", "curve"])
+    df = pd.DataFrame(rows).sort_values(["label", "objective", "run", "candidate"])
     print(df.to_string(index=False))
     df.to_csv(root / "probe_summary.csv", index=False)
 

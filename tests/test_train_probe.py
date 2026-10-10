@@ -66,7 +66,7 @@ def test_bootstrap_resamples_whole_volumes():
 
 
 def test_position_features_depend_only_on_location():
-    ext = position_extractor(n_features=16)
-    a, b = ext(torch.rand(2, 64, 8))["rff"], ext(torch.zeros(2, 64, 8))["rff"]
+    ext, grid = position_extractor(n_features=16), torch.tensor([[4, 4, 4]] * 2)
+    a, b = ext({"grid": grid, "patches": [torch.rand(64, 8)] * 2})["rff"], ext({"grid": grid})["rff"]
     assert a.shape == (2, 64, 32) and torch.equal(a, b) and torch.equal(a[0], a[1])
     assert len(torch.unique(a[0], dim=0)) == 64                  # every grid cell distinct

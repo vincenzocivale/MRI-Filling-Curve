@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .volume import VolumeStore, _atomic_write, fit_cube, load_canonical, patchify
+from .volume import VolumeStore, _atomic_write, load_canonical, patch_dims, patchify
 
 
 def scan(cfg: dict) -> pd.DataFrame:
@@ -32,17 +32,18 @@ def classes(seg_dir: str | Path) -> list[str]:
 
 
 class PatchLabels:
-    """Per-patch majority class (0 = background, i + 1 = classes[i]) in the same canonical,
-    aspect-preserving geometry as VolumeStore, cached as [N] int16. Picklable (DataLoader workers)."""
+    """Per-patch majority class (0 = background, i + 1 = classes[i]) over the patch's native voxels, on the
+    same patches as the image (`patch_dims` of the scan's spacing), cached as [N] int16.
+    Picklable (DataLoader workers)."""
 
-    def __init__(self, store: VolumeStore, patch: int, class_names: list[str]):
-        self.store, self.patch, self.classes = store, patch, class_names
+    def __init__(self, store: VolumeStore, patch_mm: float, class_names: list[str]):
+        self.store, self.patch_mm, self.classes = store, float(patch_mm), class_names
 
     def __call__(self, row: pd.Series) -> torch.Tensor:
-        key = hashlib.sha1(f"{row['mask_path']}|{self.store.shape}|{self.patch}|iso-majority".encode())
+        key = hashlib.sha1(f"{row['mask_path']}|{self.patch_mm}|native-majority".encode())
         dest = self.store.root / "patch_labels" / f"{key.hexdigest()[:20]}.npy"
         if not dest.exists():
-            arr = self._compute(row["mask_path"])
+            arr = self._compute(row["mask_path"], self.store.load(row["path"])[0].shape)
 
             def write(tmp):
                 with open(tmp, "wb") as f:
@@ -50,14 +51,18 @@ class PatchLabels:
             _atomic_write(dest, write)
         return torch.from_numpy(np.load(dest).astype(np.int64))
 
-    def _compute(self, seg_dir: str) -> np.ndarray:
+    def _compute(self, seg_dir: str, image_shape) -> np.ndarray:
         label, zooms = None, None
         for i, name in enumerate(self.classes, start=1):
-            m, zooms = load_canonical(Path(seg_dir) / f"{name}.nii.gz")
-            label = np.zeros(m.shape, np.float32) if label is None else label
+            m, zooms, _, _ = load_canonical(Path(seg_dir) / f"{name}.nii.gz")
+            label = np.zeros(m.shape, np.int16) if label is None else label
             label[m > 0] = i
-        cube = torch.from_numpy(fit_cube(label, zooms, self.store.side, mode="nearest")).long()
-        counts = torch.zeros(cube.numel() // self.patch ** 3, len(self.classes) + 1, dtype=torch.long)
-        p = patchify(cube, self.patch)
-        counts.scatter_add_(1, p, torch.ones_like(p))
-        return counts.argmax(1).numpy().astype(np.int16)
+        if label.shape != tuple(image_shape):
+            raise ValueError(f"{seg_dir}: masks {label.shape} != image {tuple(image_shape)}")
+        p = patchify(torch.from_numpy(label), patch_dims(zooms, self.patch_mm))
+        out = torch.empty(len(p), dtype=torch.int16)
+        for i in range(0, len(p), 4096):                    # chunks: whole-body scans have ~10^8 voxels
+            c = p[i:i + 4096].long()
+            counts = torch.zeros(len(c), len(self.classes) + 1, dtype=torch.long).scatter_add_(1, c, torch.ones_like(c))
+            out[i:i + 4096] = counts.argmax(1)
+        return out.numpy()
