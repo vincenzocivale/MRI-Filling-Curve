@@ -128,10 +128,14 @@ class BrainFM(Wrapper):
     def seg_net(self, n_out: int, pretrained: bool = True):
         """The repo's task head on the frozen backbone: `TaskHead` with task_f_maps [64] (cfgs/trainer/default_train.yaml:26)
         = one 1x1 conv on feat_last (head.py:40), here with n_out classes; training crop 128^3 (cfgs/generator/
-        default.yaml:63). random: the backbone re-initialised with each layer's reset_parameters."""
+        default.yaml:63). random: the backbone re-initialised with each layer's reset_parameters.
+        The whole UNet is frozen, so the head is a full-resolution linear probe: a BatchNorm without affine goes before it
+        (MAE's linear-probe convention; same function class). Without it feat_last's scale (spatial std ~0.05/channel)
+        stalls AdamW at lr 1e-3: tumour Dice 0.014, below the random backbone's 0.197."""
         import copy
 
-        head = torch.nn.Conv3d(64, n_out, 1)  # before the backbone reset: same head init in both builds
+        head = torch.nn.Sequential(torch.nn.BatchNorm3d(64, affine=False),  # before the backbone reset: same head
+                                   torch.nn.Conv3d(64, n_out, 1))           # init in both builds
         backbone = copy.deepcopy(self.model.backbone)
         if not pretrained:
             for mod in backbone.modules():

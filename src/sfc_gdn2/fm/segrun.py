@@ -82,7 +82,8 @@ def prep(job: dict) -> None:
             grid_from_gt = np.asarray(m, dtype=np.float64) @ np.linalg.inv(nib.load(it["image"]).affine) @ gt_aff
             y = pull_labels(lab, grid_from_gt, tuple(xin.shape[1:]), job["device"])
             dst = cache / f"{it['id']}.pt"
-            torch.save({"x": xin.half(), "y": y, "m": np.asarray(m), "grid_from_gt": grid_from_gt,
+            xin = xin.half() if xin.abs().max() < 6e4 else xin.float()  # raw intensities (BSF atlas) overflow fp16
+            torch.save({"x": xin, "y": y, "m": np.asarray(m), "grid_from_gt": grid_from_gt,
                         "classes": names}, dst.with_suffix(".tmp"))
             os.replace(dst.with_suffix(".tmp"), dst)
             print(f"[seg] {it['id']}: grid {tuple(xin.shape)} fg {(y[y < 255] > 0).float().mean():.4f} "
@@ -116,15 +117,18 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp) -> torch.Tensor:
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
               for s, p in zip(P, patch)]
     g = gaussian(patch, x.device)
-    out = torch.zeros(n_out, *P, device=x.device)
+    try:  # fp16 accumulator on the device, else on the CPU (nnU-Net's predictor does both)
+        out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device)
+    except torch.cuda.OutOfMemoryError:
+        out = torch.zeros(n_out, *P, dtype=torch.half)
     wsum = torch.zeros(P, device=x.device)
     for a, b, c in product(*starts):
         sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
         with amp():
             logits = net(xp[(slice(None), *sl)][None])
-        out[(slice(None), *sl)] += logits[0].float().softmax(0) * g
+        out[(slice(None), *sl)] += (logits[0].float().softmax(0) * g).to(out)
         wsum[sl] += g
-    return (out / wsum)[(slice(None),) + tuple(slice(0, s) for s in S)]
+    return out.div_(wsum.to(out.device))[(slice(None),) + tuple(slice(0, s) for s in S)]
 
 
 def dice_on(pred: torch.Tensor, y: torch.Tensor, k: int) -> float:
@@ -136,19 +140,24 @@ def dice_on(pred: torch.Tensor, y: torch.Tensor, k: int) -> float:
 
 
 @torch.no_grad()
-def dice_full_res(probs: torch.Tensor, grid_from_gt: np.ndarray, lab: np.ndarray, k: int) -> tuple[float, list]:
-    """Probabilities [k, *grid] -> every GT voxel (trilinear, border clamped), argmax, Dice per class (slab-wise)."""
-    dev = probs.device
+def dice_full_res(probs: torch.Tensor, grid_from_gt: np.ndarray, lab: np.ndarray, k: int,
+                  dev: str | torch.device | None = None) -> tuple[float, list]:
+    """Probabilities [k, *grid] (on any device) -> every GT voxel (trilinear, border clamped), argmax, Dice per class;
+    slab-wise, moving to `dev` only the part of the grid each GT slab samples."""
+    dev = dev or probs.device
     M = torch.tensor(grid_from_gt, dtype=torch.float32, device=dev)
-    G = torch.tensor(probs.shape[1:], dtype=torch.float32, device=dev)
+    G = torch.tensor(probs.shape[1:], device=dev)
     jk = torch.stack(torch.meshgrid(*[torch.arange(n, device=dev, dtype=torch.float32) for n in lab.shape[1:]],
                                     indexing="ij")).reshape(2, -1)
     L = torch.from_numpy(lab).to(dev)
     tp, np_, nt = (torch.zeros(k, device=dev) for _ in range(3))
     for i in range(lab.shape[0]):
         c = M[:3, :3] @ torch.cat([torch.full_like(jk[:1], i), jk]) + M[:3, 3:]
-        g = (2 * (c + 0.5) / G[:, None] - 1).flip(0).T.reshape(1, 1, 1, -1, 3)  # grid_sample (x=W, y=H, z=D)
-        pred = F.grid_sample(probs[None], g, mode="bilinear", padding_mode="border", align_corners=False)[0, :, 0, 0]
+        lo = torch.minimum(c.amin(1).floor().long().clamp_min(0), G - 1)  # the slab's grid box, border clamping kept
+        hi = torch.maximum(torch.minimum(c.amax(1).floor().long() + 2, G), lo + 1)
+        sub = probs[:, lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].to(dev).float()
+        g = (2 * (c - lo[:, None] + 0.5) / (hi - lo)[:, None] - 1).flip(0).T.reshape(1, 1, 1, -1, 3)  # x=W, y=H, z=D
+        pred = F.grid_sample(sub[None], g, mode="bilinear", padding_mode="border", align_corners=False)[0, :, 0, 0]
         pred = pred.argmax(0)
         t = L[i].reshape(-1).long()
         tp += torch.bincount(t[pred == t], minlength=k)[:k].float()
@@ -185,7 +194,7 @@ class Patches:
             else:
                 start = np.array([self.rng.integers(s - p + 1) for s, p in zip(S, P)])
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
-            xs.append(x[(slice(None), *sl)])
+            xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
             ys.append(y[sl])
         return torch.stack(xs), torch.stack(ys)
 
@@ -266,7 +275,7 @@ def train(job: dict) -> None:
         sched.step()
         if it % every == 0 or it == iters:
             net.eval()
-            ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp).argmax(0), v["y"].to(dev), k)
+            ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp).argmax(0).to(dev), v["y"].to(dev), k)
                   for v in val_v]
             val = float(np.nanmean(ds))
             curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
@@ -283,7 +292,7 @@ def train(job: dict) -> None:
         v = load(it)
         probs = sliding(net, v["x"].to(dev).float(), patch, k, amp)
         lab, _, _ = gt_labels(it["seg"])
-        d, per = dice_full_res(probs, v["grid_from_gt"], lab, k)
+        d, per = dice_full_res(probs, v["grid_from_gt"], lab, k, dev)
         res["per_volume"].append(d)
         res["per_class"].append(per)
         res["test_ids"].append(it["id"])
