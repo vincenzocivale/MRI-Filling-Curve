@@ -20,13 +20,16 @@ class PatchDataset(Dataset):
                  target: Callable[[pd.Series], torch.Tensor] | None = None):
         self.rows = rows.reset_index(drop=True)
         self.paths = self.rows["path"].tolist()
+        self.frames = self.rows["frames"].tolist() if "frames" in self.rows else None
         self.store, self.patch_mm, self.target = store, patch_mm, target
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, i: int) -> dict:
-        arr, spacing, affine = self.store.load(self.paths[i])
+        # 4D+ scans (pool column `frames`): a random frame per access (torch RNG: seeded per worker by the loader)
+        n = int(self.frames[i]) if self.frames is not None else 1
+        arr, spacing, affine = self.store.load(self.paths[i], int(torch.randint(n, ())) if n > 1 else None)
         k = patch_dims(spacing, self.patch_mm)
         item = {"volume": torch.from_numpy(np.array(arr)), "grid": patch_grid(arr.shape, k), "k": torch.tensor(k),
                 "spacing": torch.tensor(spacing, dtype=torch.float32),
@@ -95,8 +98,10 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: i
     common = {"num_workers": workers, "collate_fn": collate, "pin_memory": True,
               "persistent_workers": train and workers > 0, "prefetch_factor": 4 if workers else None}
     if train and data.get("patches_per_batch"):
-        if "n_patch" in ds.rows:  # pool manifests carry it (data/pool.py): no scan is read here
-            sizes = ds.rows["n_patch"].astype(int).tolist()
+        if "shape" in ds.rows:  # pool manifests carry the header (data/pool.py): no scan is read, any patch_mm
+            from .pool import n_patch
+            sizes = [n_patch(tuple(map(int, s.split("x"))), tuple(map(float, z.split("x"))), data["patch_mm"])
+                     for s, z in zip(ds.rows["shape"], ds.rows["spacing"])]
         else:
             sizes = []
             for p in ds.paths:

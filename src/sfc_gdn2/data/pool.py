@@ -2,8 +2,9 @@
 (MR-RATE phase-1 brain series, FOMO300K after dedup, SALD, CoRR, Petfrog), none of a downstream benchmark subject.
 
 `sfc pretrain-pool <pretrain config>` writes `data.manifests[0]` (split `pretrain`) with each scan's header shape,
-spacing and patch count `n_patch` (the loader packs batches from it without reading the scans). Only 3D scans
-(4D with one frame included) with positive spacing are kept. The header pass reads ~1M headers: a SLURM CPU job.
+spacing, `frames` (4D+ scans: DWI directions, ASL, ...; the loader reads a random one per access) and `n_patch` at the
+config's patch_mm (a statistic: the loader recomputes it from shape / spacing at its own patch_mm). Unreadable scans
+and scans with no positive spacing are dropped. The header pass reads ~1M headers: a SLURM CPU job.
 """
 from __future__ import annotations
 
@@ -68,13 +69,14 @@ def _headers(paths: list[str]) -> list:
 
 
 def n_patch(shape, zooms, patch_mm: float) -> int:
-    if len(shape) < 3 or any(n != 1 for n in shape[3:]) or min(zooms[:3]) <= 0:
+    """Patches of the first 3 axes (one frame); 0 = unusable (fewer than 3 axes, no positive spacing)."""
+    if len(shape) < 3 or len(zooms) < 3 or min(zooms[:3]) <= 0:
         return 0
     return math.prod(-(-n // k) for n, k in zip(shape[:3], patch_dims(zooms, patch_mm)))
 
 
 def with_patches(df: pd.DataFrame, patch_mm: float, workers: int = 8) -> pd.DataFrame:
-    """Header shape / spacing / n_patch per row; rows that are not single 3D scans are dropped."""
+    """Header shape / spacing / frames / n_patch per row; unusable rows are dropped."""
     archive = df["path"].str.split("::").str[0]
     groups = [g.tolist() for _, g in df["path"].groupby(archive, sort=False)]
     if workers <= 1:
@@ -86,5 +88,6 @@ def with_patches(df: pd.DataFrame, patch_mm: float, workers: int = 8) -> pd.Data
     h = [heads[p] for p in df["path"]]
     df = df.assign(shape=["x".join(map(str, x[0])) if x else "" for x in h],
                    spacing=["x".join(f"{z:.4g}" for z in x[1][:3]) if x else "" for x in h],
+                   frames=[math.prod(x[0][3:]) if x else 0 for x in h],
                    n_patch=[n_patch(*x, patch_mm) if x else 0 for x in h])
-    return df[df["n_patch"] > 0].reset_index(drop=True)
+    return df[(df["n_patch"] > 0) & (df["frames"] > 0)].reset_index(drop=True)

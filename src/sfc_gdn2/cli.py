@@ -22,8 +22,9 @@ def pretrain_pool(cfg: dict, args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
     print(df.groupby("dataset").agg(scans=("path", "size"), subjects=("subject", "nunique"),
+                                    multi_frame=("frames", lambda f: int((f > 1).sum())), frames=("frames", "sum"),
                                     patches=("n_patch", "sum")).to_string())
-    print(f"{len(df)} of {n} scans kept (3D, readable) -> {out}")
+    print(f"{len(df)} of {n} scans kept (readable, 3D or a frame per access) -> {out}")
 
 
 def pretrain(cfg: dict, args) -> None:

@@ -39,18 +39,20 @@ def open_image(path: str | Path):
     return nib.Nifti1Image.from_bytes(gzip.decompress(data) if member.endswith(".gz") else data)
 
 
-def load_canonical(path) -> tuple[np.ndarray, tuple, float, float]:
+def load_canonical(path, frame: int | None = None) -> tuple[np.ndarray, tuple, float, float]:
     """RAS-closest orientation (axis permutation and flips only, as nib.as_closest_canonical: no value
     changed) of the voxels as stored (dtype kept, header scaling not applied) -> (raw, zooms in the
     new axis order, slope, inter); the scan's values are raw * slope + inter. `path`: a file, a zip member
-    or a loaded image. A 4D image with one frame is read as 3D."""
+    or a loaded image. 4D+ (DWI, ASL, ...): the 3D volume `frame` of the flattened trailing axes (required when
+    there is more than one)."""
     img = path if isinstance(path, nib.spatialimages.SpatialImage) else open_image(path)
     ornt = nio.io_orientation(img.affine)
     raw = img.dataobj.get_unscaled()
     if raw.ndim > 3:
-        if any(n != 1 for n in raw.shape[3:]):
-            raise ValueError(f"{path}: not a 3D volume {raw.shape}")
-        raw = raw.reshape(raw.shape[:3])
+        raw = raw.reshape(*raw.shape[:3], -1)
+        if frame is None and raw.shape[3] > 1:
+            raise ValueError(f"{path}: {raw.shape[3]} frames, pass `frame`")
+        raw = raw[..., frame or 0]
     raw = nio.apply_orientation(raw, ornt)
     if raw.dtype == np.uint16:   # torch has no uint16 tensors
         raw = raw.astype(np.int32)
@@ -80,8 +82,9 @@ class VolumeStore:
         self.root = Path(cache_dir) if cache_dir else None
 
     @staticmethod
-    def decode(path: str) -> tuple[np.ndarray, tuple, tuple]:
-        arr, spacing, slope, inter = load_canonical(path)
+    def decode(path, frame: int | None = None) -> tuple[np.ndarray, tuple, tuple]:
+        """-> (raw, spacing, (a, c)); a 4D+ scan's `frame`, scaled on its own (b0 and DWI frames differ)."""
+        arr, spacing, slope, inter = load_canonical(path, frame)
         val = arr.astype(np.float64) * slope + inter
         fg = val[val > 0]
         scale = 1.0 / max(float(np.percentile(fg if fg.size else val, 99)), 1e-6)
@@ -105,13 +108,13 @@ class VolumeStore:
             _atomic_write(dest, write)
         return dest
 
-    def load(self, path: str) -> tuple[np.ndarray, tuple, tuple]:
+    def load(self, path: str, frame: int | None = None) -> tuple[np.ndarray, tuple, tuple]:
         if self.root is None:
-            return self.decode(path)
-        arr_path = self._cache_path(path)
+            return self.decode(path, frame)
+        arr_path = self._cache_path(path if frame is None else f"{path}#{frame}")
         meta_path = arr_path.with_suffix(".json")
         if not meta_path.exists():
-            arr, spacing, affine = self.decode(str(self._materialize(path)))
+            arr, spacing, affine = self.decode(str(self._materialize(path)), frame)
             meta = {"spacing": spacing, "affine": list(affine)}
 
             def write_arr(tmp):
