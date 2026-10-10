@@ -32,7 +32,7 @@ MAX_TRAIN, MAX_VAL = 400, 100  # ponytail: volumes held in RAM; a streaming load
 
 def model_input(model: str, rec: dict) -> tuple[torch.Tensor, object]:
     """([C, *grid] fp16, stride of the grid): the dense maps of a stored volume, finest grid."""
-    strides = geom.STRIDES[geom.FAMILY[model]]
+    strides = rec["meta"].get("strides") or geom.STRIDES[geom.FAMILY[model]]  # ours: per scan (patch k)
     maps = {n: (rec["features"][n], s) for n, s in strides.items() if n in rec["features"]}
     finest = min(max(np.atleast_1d(s)) for _, s in maps.values())
     maps = {n: (m, s) for n, (m, s) in maps.items() if max(np.atleast_1d(s)) <= 2 * finest}

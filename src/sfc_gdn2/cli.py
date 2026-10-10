@@ -1,5 +1,5 @@
-"""`sfc <command> <config>`: prepare | split | pretrain | probe | fm | summarize | bench-split | bench-extract |
-bench-probe | bench-segdec."""
+"""`sfc <command> <config>`: prepare | split | pretrain-pool | pretrain | probe | fm | summarize | bench-split |
+bench-extract | bench-probe | bench-segdec."""
 from __future__ import annotations
 
 import argparse
@@ -32,6 +32,22 @@ def split(cfg: dict, _) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
     print(summarize(df, cfg["labels"][0]).to_string(index=False), f"\n{out}")
+
+
+def pretrain_pool(cfg: dict, args) -> None:
+    """Pretraining manifest `data.manifests[0]` from the catalog (`data.pool`, data/pool.py)."""
+    from .data import pool
+    d, p = cfg["data"], cfg["data"]["pool"]
+    cat = pd.read_csv(p["catalog"], usecols=pool.COLUMNS, low_memory=False, dtype={"session": str})
+    df = pool.select(cat, p["datasets"], pd.read_csv(p["exclude"], usecols=["subject"])["subject"])
+    n = len(df)
+    df = pool.with_patches(df, float(d["patch_mm"]), args.workers)
+    out = Path(d["manifests"][0])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    print(df.groupby("dataset").agg(scans=("path", "size"), subjects=("subject", "nunique"),
+                                    patches=("n_patch", "sum")).to_string())
+    print(f"{len(df)} of {n} scans kept (3D, readable) -> {out}")
 
 
 def pretrain(cfg: dict, args) -> None:
@@ -173,7 +189,7 @@ def summarize(_, args) -> None:
     df.to_csv(root / "probe_summary.csv", index=False)
 
 
-COMMANDS = {"prepare": prepare, "split": split, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize,
+COMMANDS = {"prepare": prepare, "split": split, "pretrain-pool": pretrain_pool, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize,
             "bench-split": bench_split, "bench-extract": bench_extract, "bench-probe": bench_probe,
             "bench-segdec": bench_segdec}
 
@@ -202,6 +218,7 @@ def main() -> None:
     ap.add_argument("--init", default="pretrained", choices=["pretrained", "random"], help="bench-segdec: encoder")
     ap.add_argument("--iters", type=int, help="bench-segdec: training iterations (pilot override)")
     ap.add_argument("--resume", action="store_true", help="bench-segdec: skip runs whose json is written (chained jobs)")
+    ap.add_argument("--workers", type=int, default=8, help="pretrain-pool: header-reading processes")
     ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):

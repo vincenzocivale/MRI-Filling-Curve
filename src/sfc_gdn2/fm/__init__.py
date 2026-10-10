@@ -19,6 +19,7 @@ MODELS = {
     "fomo26": "asparagus", "amaes_fomo260k": "asparagus",
     "brainfm": "brainfm",
     "nnunet": "nnunet",
+    "sfc_gdn2": "sfc",   # ours (LeJEPA GDN-2), run in our own env
 }
 
 

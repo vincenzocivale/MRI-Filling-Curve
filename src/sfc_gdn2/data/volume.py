@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -27,13 +28,30 @@ def patch_dims(spacing, patch_mm: float) -> tuple[int, int, int]:
     return tuple(max(1, round(patch_mm / float(z))) for z in spacing[:3])
 
 
-def load_canonical(path: str | Path) -> tuple[np.ndarray, tuple, float, float]:
+def open_image(path: str | Path):
+    """A NIfTI file, or a `zip://archive::member` read in memory (nothing extracted to disk)."""
+    path = str(path)
+    if not path.startswith("zip://"):
+        return nib.load(path)
+    archive, member = path[len("zip://"):].split("::", 1)
+    with zipfile.ZipFile(archive) as zf:
+        data = zf.read(member)
+    return nib.Nifti1Image.from_bytes(gzip.decompress(data) if member.endswith(".gz") else data)
+
+
+def load_canonical(path) -> tuple[np.ndarray, tuple, float, float]:
     """RAS-closest orientation (axis permutation and flips only, as nib.as_closest_canonical: no value
     changed) of the voxels as stored (dtype kept, header scaling not applied) -> (raw, zooms in the
-    new axis order, slope, inter); the scan's values are raw * slope + inter."""
-    img = nib.load(str(path))
+    new axis order, slope, inter); the scan's values are raw * slope + inter. `path`: a file, a zip member
+    or a loaded image. A 4D image with one frame is read as 3D."""
+    img = path if isinstance(path, nib.spatialimages.SpatialImage) else open_image(path)
     ornt = nio.io_orientation(img.affine)
-    raw = nio.apply_orientation(img.dataobj.get_unscaled(), ornt)
+    raw = img.dataobj.get_unscaled()
+    if raw.ndim > 3:
+        if any(n != 1 for n in raw.shape[3:]):
+            raise ValueError(f"{path}: not a 3D volume {raw.shape}")
+        raw = raw.reshape(raw.shape[:3])
+    raw = nio.apply_orientation(raw, ornt)
     if raw.dtype == np.uint16:   # torch has no uint16 tensors
         raw = raw.astype(np.int32)
     elif raw.dtype == np.float64:
@@ -53,11 +71,21 @@ class VolumeStore:
 
     The first access decodes the NIfTI (extracting it from its zip if needed) and writes the array to
     `cache_dir/native/` (+ a .json with spacing and scale); every later access is a memory-mapped
-    .npy read, which is what keeps the data loader off the critical path.
+    .npy read, which is what keeps the data loader off the critical path. `cache_dir=None`: every access
+    decodes the source (zip members in memory), nothing is written (the pretraining pool, ~1M scans, would
+    not fit any cache we have).
     """
 
-    def __init__(self, cache_dir: str | Path):
-        self.root = Path(cache_dir)
+    def __init__(self, cache_dir: str | Path | None):
+        self.root = Path(cache_dir) if cache_dir else None
+
+    @staticmethod
+    def decode(path: str) -> tuple[np.ndarray, tuple, tuple]:
+        arr, spacing, slope, inter = load_canonical(path)
+        val = arr.astype(np.float64) * slope + inter
+        fg = val[val > 0]
+        scale = 1.0 / max(float(np.percentile(fg if fg.size else val, 99)), 1e-6)
+        return arr, tuple(spacing), (slope * scale, inter * scale)
 
     def _cache_path(self, path: str) -> Path:
         key = hashlib.sha1(f"{path}|native-v1".encode()).hexdigest()[:20]
@@ -77,22 +105,21 @@ class VolumeStore:
             _atomic_write(dest, write)
         return dest
 
-    def load(self, path: str) -> tuple[np.ndarray, tuple, float]:
+    def load(self, path: str) -> tuple[np.ndarray, tuple, tuple]:
+        if self.root is None:
+            return self.decode(path)
         arr_path = self._cache_path(path)
         meta_path = arr_path.with_suffix(".json")
         if not meta_path.exists():
-            arr, spacing, slope, inter = load_canonical(self._materialize(path))
-            val = arr.astype(np.float64) * slope + inter
-            fg = val[val > 0]
-            scale = 1.0 / max(float(np.percentile(fg if fg.size else val, 99)), 1e-6)
-            meta = {"spacing": spacing, "affine": [slope * scale, inter * scale]}
+            arr, spacing, affine = self.decode(str(self._materialize(path)))
+            meta = {"spacing": spacing, "affine": list(affine)}
 
             def write_arr(tmp):
                 with open(tmp, "wb") as f:
                     np.save(f, arr)
             _atomic_write(arr_path, write_arr)
             _atomic_write(meta_path, lambda tmp: Path(tmp).write_text(json.dumps(meta)))
-            return arr, tuple(spacing), tuple(meta["affine"])
+            return arr, spacing, affine
         meta = json.loads(meta_path.read_text())
         return np.load(arr_path, mmap_mode="r"), tuple(meta["spacing"]), tuple(meta["affine"])
 

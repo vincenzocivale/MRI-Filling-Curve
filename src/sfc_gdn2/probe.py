@@ -221,7 +221,7 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
     """Each volume read along each of `curves` over its whole patch grid (untransformed view), forwards and
     backwards; `bi` = forward ++ backward output per patch, averaged over the curves (test-time augmentation).
     patch: `bi` per patch (raster order). volume: `mean`, bi averaged over the foreground patches (the top of the
-    pretraining pyramid)."""
+    pretraining pyramid). both: the two (the benchmark wrapper, fm/sfc.py)."""
     def extract(vols):
         grid = vols["grid"]
         n = grid.prod(1)
@@ -246,7 +246,8 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
             return {"bi": bi}
         fg = valid & (per_patch(vols, xyz.shape[1], lambda x: x.mean(-1)) > fg_threshold)
         w = (fg | (valid & ~fg.any(1, keepdim=True))).float()
-        return {"mean": (w[..., None] * bi).sum(1) / w.sum(1, keepdim=True)}
+        mean = (w[..., None] * bi).sum(1) / w.sum(1, keepdim=True)
+        return {"mean": mean} if level == "volume" else {"bi": bi, "mean": mean}
     return extract
 
 

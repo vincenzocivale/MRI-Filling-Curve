@@ -24,6 +24,7 @@ fm:
     bsf_atlas: {configs: [bsf_atlas_pretrain], workers: 7}
     medicalnet: {configs: [medicalnet_resnet50_23dataset], workers: 7}
     nnunet: {configs: [nnunet_totalseg_mr_870], workers: 7}   # 871 (muscles) dropped: same net and data as 870
+    sfc: {configs: [sfc_gdn2, sfc_gdn2_raster, sfc_gdn2_morton, sfc_gdn2_hilbert], workers: 7}   # ours (fm/sfc.py)
   # what is stored (fm/worker.py `trim`): globals + maps at stride >= 16 for every volume, stride-8 maps for
   # `dense` volumes (segmentation). Computation is unchanged.
   save:
@@ -45,6 +46,10 @@ fm:
     nnunet_totalseg_mr_870: &nnunet {features: [fg_mean_stage0, fg_mean_stage1, fg_mean_stage2, fg_mean_stage3,
                                                 fg_mean_stage4, stage4, stage3], dense: [stage2]}
     nnunet_totalseg_mr_871: *nnunet
+    sfc_gdn2: &sfc {features: [mean, map]}   # map: bi tokens on the patch grid (~16 mm), every volume
+    sfc_gdn2_raster: *sfc
+    sfc_gdn2_morton: *sfc
+    sfc_gdn2_hilbert: *sfc
 
 # `sfc bench-segdec`: segmentation through each model's official decoder on its frozen encoder (bench_segdec.py,
 # fm/segrun.py); same volumes, recipe and budget for every model

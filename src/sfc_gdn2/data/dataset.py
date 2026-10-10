@@ -100,10 +100,13 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: i
     common = {"num_workers": workers, "collate_fn": collate, "pin_memory": True,
               "persistent_workers": train and workers > 0, "prefetch_factor": 4 if workers else None}
     if train and data.get("patches_per_batch"):
-        sizes = []
-        for p in ds.paths:
-            arr, spacing, _ = store.load(p)
-            sizes.append(int(patch_grid(arr.shape, patch_dims(spacing, data["patch_mm"])).prod()))
+        if "n_patch" in ds.rows:  # pool manifests carry it (data/pool.py): no scan is read here
+            sizes = ds.rows["n_patch"].astype(int).tolist()
+        else:
+            sizes = []
+            for p in ds.paths:
+                arr, spacing, _ = store.load(p)
+                sizes.append(int(patch_grid(arr.shape, patch_dims(spacing, data["patch_mm"])).prod()))
         return DataLoader(ds, batch_sampler=BudgetBatches(sizes, int(data["patches_per_batch"]), batch_size, seed),
                           **common)
     return DataLoader(ds, batch_size=batch_size, shuffle=train, drop_last=train,

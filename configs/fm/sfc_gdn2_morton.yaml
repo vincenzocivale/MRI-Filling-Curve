@@ -1,0 +1,7 @@
+# Ours: LeJEPA GDN-2 encoder (src/sfc_gdn2/fm/sfc.py), last checkpoint of the Leonardo pool run.
+# Inference along morton only (one benchmark row per curve; sfc_gdn2 = the curve average).
+model: sfc_gdn2
+env: ${SFC_FM_ENVS}/sfc-gdn2
+repo: ${SFC_FM_REPOS}/MRI-Filling-Curve
+checkpoint: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/sfc_pretrain_v8   # output_root of configs/leonardo/pretrain_lejepa.yaml (one run) or a run dir / encoder file
+args: {curves: [morton]}

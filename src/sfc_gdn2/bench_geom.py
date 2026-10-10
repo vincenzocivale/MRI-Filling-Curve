@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-# model (config stem) -> family; family -> {map name: stride on the input grid}
+# model (config stem) -> family; family -> {map name: stride on the input grid} (or the wrapper's meta["strides"])
 FAMILY = {"fomo26": "asparagus", "brainfm": "brainfm", "bsf_ukb_pretrain": "bsf_ukb", "bsf_atlas_pretrain": "bsf_atlas",
           "medicalnet_resnet50_23dataset": "medicalnet", "nnunet_totalseg_mr_870": "nnunet",
           "openmind_resencl_mae": "nnssl", "openmind_resencl_simclr": "nnssl", "openmind_primusm_mae": "nnssl",
@@ -83,7 +83,10 @@ def brainfm_input_affine(source_affine, source_shape, crop_start) -> np.ndarray:
 
 
 def source_to_input(model: str, meta: dict) -> np.ndarray | None:
-    """`model` = a config stem of FAMILY, or a family name (the wrappers' own segmentation inputs)."""
+    """`model` = a config stem of FAMILY, or a family name (the wrappers' own segmentation inputs). A wrapper may
+    store the map itself in `meta["source_to_input"]` (ours, fm/sfc.py)."""
+    if "source_to_input" in meta:
+        return _np(meta["source_to_input"])
     fam = FAMILY.get(model, model)
     if fam == "asparagus":
         return np.linalg.inv(_np(meta["affine"])) @ _np(meta["source_affine"])
