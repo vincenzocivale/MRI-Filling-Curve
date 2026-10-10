@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 from .io import load_yaml
 
@@ -16,9 +17,11 @@ def pretrain_pool(cfg: dict, args) -> None:
     d, p = cfg["data"], cfg["data"]["pool"]
     cat = pd.read_csv(p["catalog"], usecols=pool.COLUMNS, low_memory=False, dtype={"session": str})
     df = pool.select(cat, p["datasets"], pd.read_csv(p["exclude"], usecols=["subject"])["subject"])
+    if args.sample:  # uniform over the pool (its real mix): a manifest for the loader check
+        df = df.sample(args.sample, random_state=int(cfg["seed"])).reset_index(drop=True)
     n = len(df)
     df = pool.with_patches(df, float(d["patch_mm"]), args.workers)
-    out = Path(d["manifests"][0])
+    out = Path(args.out or d["manifests"][0])
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
     print(df.groupby("dataset").agg(scans=("path", "size"), subjects=("subject", "nunique"),
@@ -137,12 +140,12 @@ def main() -> None:
     ap.add_argument("config", help="YAML config")
     ap.add_argument("--images", nargs="+", help="fm: image files (single-modality models)")
     ap.add_argument("--csv", help="fm: CSV with `id` + one column per modality")
-    ap.add_argument("--out", help="fm: output directory (one <id>.pt per image); bench-extract: output root")
+    ap.add_argument("--out", help="fm: output dir; bench-extract: output root; pretrain-pool: manifest path")
     ap.add_argument("--device", default="cuda", help="fm: cuda | cpu")
     ap.add_argument("--overwrite", action="store_true", help="fm: recompute existing outputs")
     ap.add_argument("--group", help="bench-extract: model group of the config")
     ap.add_argument("--shard", help="bench-extract: i/n or auto/n ($SLURM_ARRAY_TASK_ID)")
-    ap.add_argument("--sample", type=int, help="bench-extract: only k volumes per dataset (dense first)")
+    ap.add_argument("--sample", type=int, help="bench-extract: k volumes per dataset; pretrain-pool: k pool scans")
     ap.add_argument("--query", help="bench-extract: pandas query on volumes.csv, e.g. \"dataset != 'IXI'\"")
     ap.add_argument("--models", nargs="+", help="bench-probe: model dirs under fm.out_root (default: all)")
     ap.add_argument("--tasks", nargs="+", help="bench-probe: task names (default: all)")
@@ -154,12 +157,22 @@ def main() -> None:
     ap.add_argument("--iters", type=int, help="bench-segdec: training iterations (pilot override)")
     ap.add_argument("--resume", action="store_true", help="bench-segdec: skip runs whose json is written (chained jobs)")
     ap.add_argument("--workers", type=int, default=8, help="pretrain-pool: header-reading processes")
+    ap.add_argument("--override", nargs="+", default=[], metavar="KEY=VALUE",
+                    help="config fields, dotted keys and YAML values, e.g. train.steps=200 data.manifests=[a.csv]")
     ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):
         ap.error("fm needs --images or --csv, and --out")
     # fm: the config is resolved (env vars) by fm.api
-    COMMANDS[args.command](None if args.command == "fm" else load_yaml(args.config), args)
+    cfg = None if args.command == "fm" else load_yaml(args.config)
+    for kv in args.override:
+        key, value = kv.split("=", 1)
+        *path, last = key.split(".")
+        node = cfg
+        for k in path:
+            node = node.setdefault(k, {})
+        node[last] = yaml.safe_load(value)
+    COMMANDS[args.command](cfg, args)
 
 
 if __name__ == "__main__":

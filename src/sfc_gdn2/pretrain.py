@@ -77,10 +77,15 @@ class Pretrainer:
         save = self.rank == 0
         clip = float(t.get("grad_clip", float("inf")))
         hist, skipped, t0 = [], 0, time.time()
+        batches, wait, patches, t_log = self._batches(), 0.0, 0, time.time()  # loader check: wait share, patches/s
         if save:
             torch.save(self.net.encoder.state_dict(), self.run.path / "encoder_step000000.pt")  # init baseline
         self.model.train()
-        for step, batch in zip(range(1, t["steps"] + 1), self._batches()):
+        for step in range(1, t["steps"] + 1):
+            t_w = time.time()
+            batch = next(batches)   # the previous step already synced (isfinite(gnorm)): this wait is a GPU stall
+            wait += time.time() - t_w
+            patches += int(batch["grid"].prod(1).sum())
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = self.model(to_device(batch, self.device), gen)
             self.opt.zero_grad(set_to_none=True)
@@ -92,8 +97,11 @@ class Pretrainer:
                 skipped += 1
             self.sched.step()
             if step % t.get("log_every", 50) == 0 or step == t["steps"]:
+                dt = time.time() - t_log
                 hist.append({"step": step, **{k: v.item() for k, v in out.items()}, "grad_norm": gnorm.item(),
-                             "skipped": skipped, "seconds": time.time() - t0})
+                             "skipped": skipped, "seconds": time.time() - t0, "data_wait": wait / dt,
+                             "patches_per_s": patches / dt})
+                wait, patches, t_log = 0.0, 0, time.time()
                 self.log("[lejepa] " + " ".join(f"{k}={v:.4g}" for k, v in hist[-1].items()), flush=True)
             if save and (step % t["save_every"] == 0 or step == t["steps"]):
                 torch.save(self.net.encoder.state_dict(), self.run.path / f"encoder_step{step:06d}.pt")
