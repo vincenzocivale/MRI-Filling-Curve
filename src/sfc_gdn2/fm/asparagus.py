@@ -138,7 +138,7 @@ class Asparagus(Wrapper):
         from gardening_tools.modules.transforms.normalize import Torch_Normalize
         from skimage.transform import resize
 
-        from ..bench_geom import _scale
+        from ..bench.geom import _scale
 
         img = nib.load(image)
         src = img.affine.copy()

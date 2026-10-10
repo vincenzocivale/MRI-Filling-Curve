@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
+
+from .curves import grid_coords, keys
 
 
 def _gdn2():
@@ -132,3 +135,43 @@ class Encoder(nn.Module):
         cu = torch.cat([cu, cu[-1:] + pad] if pad else [cu]).int()
         out = self.norm(self.run(nn.functional.pad(flat, (0, 0, 0, pad))[None], cu, ckpt)[0, :total])
         return out.new_zeros(*valid.shape, out.shape[-1]).index_put((valid,), out)
+
+
+# scans on the device (`dataset.to_device`) -> {name: [B,F] (volume level) or [B,N,F] (patch level, N = the
+# batch's largest grid)}
+Extractor = Callable[[dict], dict[str, torch.Tensor]]
+
+
+def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int, fg_threshold: float) -> Extractor:
+    """Each volume read along each of `curves` over its whole patch grid (untransformed view), forwards and
+    backwards; `bi` = forward ++ backward output per patch, averaged over the curves (test-time augmentation).
+    patch: `bi` per patch (raster order). volume: `mean`, bi averaged over the foreground patches (the top of the
+    pretraining pyramid). both: the two (the benchmark wrapper, fm/sfc.py)."""
+    def extract(vols):
+        grid = vols["grid"]
+        n = grid.prod(1)
+        xyz = grid_coords(grid, int(n.max()))
+        j = torch.arange(xyz.shape[1], device=grid.device)
+        valid = j < n[:, None]
+        rev = torch.where(valid, (n[:, None] - 1 - j).clamp_min(0), j)
+        t = torch.zeros(len(grid), xyz.shape[1], encoder.dim, device=grid.device)
+        for i, x in enumerate(vols["patches"]):                             # per scan: its own kernel weights
+            t[i, : len(x)] = encoder.tokens(x, encoder.patch_embed.weights(vols["spacing"][i], vols["k"][i].tolist()))
+        bi = 0
+        for curve in curves:
+            order = torch.stack([keys(curve, c.clamp_min(0), g, seed).masked_fill(c[:, 0] < 0, 1 << 62).argsort()
+                                 for c, g in zip(xyz, grid)])              # per volume: no batch-dependent curve
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                s = t.gather(1, order[..., None].expand(-1, -1, encoder.dim))
+                h = encoder.packed(torch.cat([s, s.gather(1, rev[..., None].expand_as(s))]), valid.repeat(2, 1)).float()
+            fwd, bwd = h[: len(grid)], h[len(grid):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))
+            back = order.argsort(1)[..., None]                                 # curve position -> raster
+            bi = bi + torch.cat([fwd, bwd], -1).gather(1, back.expand(-1, -1, 2 * h.shape[-1])) / len(curves)
+        if level == "patch":
+            return {"bi": bi}
+        from .data.dataset import per_patch
+        fg = valid & (per_patch(vols, xyz.shape[1], lambda x: x.mean(-1)) > fg_threshold)
+        w = (fg | (valid & ~fg.any(1, keepdim=True))).float()
+        mean = (w[..., None] * bi).sum(1) / w.sum(1, keepdim=True)
+        return {"mean": mean} if level == "volume" else {"bi": bi, "mean": mean}
+    return extract

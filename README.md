@@ -49,34 +49,23 @@ echo /path/to/GatedDeltaNet-2 > "$CONDA_PREFIX"/lib/python3.11/site-packages/gdn
 ## Usage
 
 ```bash
-sfc prepare  configs/datasets/fomo300k.yaml          # scan a local dataset root -> manifest CSV
-sfc split    configs/splits/fomo300k_sex.yaml        # exact subject counts: pretrain/train/val/test
-sfc split    configs/splits/totalseg_mri.yaml        # TotalSegmentator MRI: pretrain + seg probe splits
-sfc pretrain configs/pretrain_lejepa.yaml            # -> <output_root>/lejepa-<hash>/
-sfc probe    configs/probe_{sex,age,totalseg}.yaml --run-dir <run> [...] [--raw configs/pretrain_lejepa.yaml]
-sfc summarize <output_root>                           # -> probe_summary.csv
+sfc pretrain-pool configs/pretrain_lejepa.yaml       # catalog -> pretraining manifest (header pass: a CPU job)
+sfc pretrain      configs/pretrain_lejepa.yaml       # -> <output_root>/lejepa-<hash>/encoder_step*.pt
+sfc bench-split   configs/bench/bench.yaml           # downstream volumes + fixed subject splits
+sfc bench-extract configs/bench/bench.yaml --group <g>   # features of a model group (ours: `sfc`)
+sfc bench-probe   configs/bench/bench.yaml           # volume tasks, every model
+sfc bench-segdec  configs/bench/bench.yaml --stage prep|train ...   # segmentation, full resolution
 ```
 
-Pretraining uses every `pretrain` row of `data.manifests` (FOMO300K brain T1w + TotalSegmentator MRI)
-and saves `encoder_step*.pt` every `save_every` steps, starting with step 0 (the run's own init).
-
-| probe | task | features | head | metric |
-|---|---|---|---|---|
-| `probe_totalseg.yaml` | per-patch majority class, 50 classes + background | patch `bi` token (forward ++ backward pass) | logistic | macro AP (fg) |
-| `probe_age.yaml` | age − cohort mean, IXI/NKI/OASIS1 | mean foreground `bi` token | ridge | R² |
-| `probe_sex.yaml` | sex (sanity check: trivial cues give AUC ~0.81) | mean foreground `bi` token | logistic | AUC |
-
-No model selection: each probe fits with the fixed `l2` of its config (v7's val/CV choices) on train+val and
-scores test once, with a volume-bootstrap 95% CI, for every saved checkpoint (step 0 = init). Encoder features
-are averaged over the run's `view_curves` (test-time augmentation). `test_preds.pt` keeps the test outputs for
-paired comparisons; segmentation also reports `chance_ap`. `--raw` adds encoder-free baselines (patch intensities box-averaged to 8³ as a fixed-length
-input; for segmentation also `position`,
-random Fourier features of patch coordinates). A probe refuses to run if a probe subject was seen in
-pretraining.
+Pretraining pool (`data.pool`, DECISIONS.md Version 1): every scan of MR-RATE (phase-1 brain series), FOMO300K
+after dedup, SALD, CoRR and Petfrog; no subject of the downstream benchmark. Checkpoints `encoder_step*.pt` every
+`save_every` steps, starting with step 0 (the run's own init). Evaluation is the benchmark (`src/sfc_gdn2/bench/`):
+ours is one more model there (`fm/sfc.py`), with the same volumes, splits, probes and segmentation protocol.
 
 Storage: each scan's voxels exactly as stored (dtype kept, canonical reorientation = axis permutation and
-flips only), cached once as `.npy` under `cache_dir/native/` with a `.json` of spacing and the value map
-`a·raw + c` (header slope/intercept over the 99th percentile of the foreground; no clipping). Values become
+flips only) with the value map `a·raw + c` (header slope/intercept over the 99th percentile of the foreground; no
+clipping). With `cache_dir` set, cached once as `.npy` under `cache_dir/native/`; the pretraining pool runs with
+`cache_dir: null` (decoded from the sources, zip members in memory). Values become
 fp32 on the GPU, where the volume is cut into patches; the embedding runs in fp32.
 
 **FOMO300K is a superset of OpenMind:** never pool them as independent cohorts.
@@ -91,15 +80,15 @@ submits it; any `sfc` command or script goes after `--`:
 ```bash
 cp slurm/local.yaml.example slurm/local.yaml      # once: mail, conda base / env path
 python slurm/submit.py slurm/presets/dbg.yaml -- sfc fm configs/fm/brainiac.yaml --images a.nii.gz --out o
-python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/leonardo/pretrain_lejepa.yaml
-python slurm/submit.py slurm/presets/1gpu.yaml --dry-run --set time=02:00:00 -- sfc probe configs/probe_sex.yaml --run-dir <run>
+python slurm/submit.py slurm/presets/cpu.yaml -- sfc pretrain-pool configs/pretrain_lejepa.yaml --workers 8
+python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
 ```
 
 Presets: `dbg` (1 GPU, debug QOS, 30 min), `1gpu`, `4gpu` and `8gpu` (torchrun DDP, 1 and 2 nodes),
 `cpu` (`lrd_all_serial`). Under torchrun the command is `-m <module>` or a script, never `python`.
 Config: `slurm/defaults.yaml` <- `slurm/local.yaml` <- preset <- `--set key=value`; logs in `outputs/slurm/`.
-`configs/leonardo/` holds copies of the pretraining, dataset and split configs with Leonardo paths
-(runs on `$SCRATCH`, native cache on `$FAST`); keep their non-path fields in sync with `configs/`.
+Configs carry Leonardo paths (runs and raw data on `$SCRATCH`, metadata on `$WORK`). `configs/leonardo/` keeps
+aliases of the benchmark configs for jobs queued before the move to `configs/bench/`.
 flash-attn's upstream wheels need GLIBC 2.32 (Leonardo: 2.28); build it with `slurm/build_flash_attn.sh`.
 
 ## External foundation models

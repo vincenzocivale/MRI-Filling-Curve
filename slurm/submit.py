@@ -9,8 +9,8 @@ paths work as interactively. `single` presets run `srun <command>`; `torchrun` p
 script path there, never `python`:
 
     python slurm/submit.py slurm/presets/dbg.yaml -- sfc fm configs/fm/brainiac.yaml --images a.nii.gz --out o
-    python slurm/submit.py slurm/presets/1gpu.yaml --job-name probe_sex -- \\
-        sfc probe configs/probe_sex.yaml --run-dir <run>
+    python slurm/submit.py slurm/presets/1gpu.yaml --job-name probe -- \\
+        sfc bench-probe configs/bench/bench.yaml --models <model>
     python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
     python slurm/submit.py slurm/presets/cpu.yaml --dry-run -- python tests/fm/brainfm_parity.py
 

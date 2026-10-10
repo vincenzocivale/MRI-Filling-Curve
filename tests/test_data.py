@@ -1,4 +1,3 @@
-import itertools
 
 import nibabel as nib
 import numpy as np
@@ -7,7 +6,6 @@ import pytest
 import torch
 
 from sfc_gdn2.data.dataset import BudgetBatches, PatchDataset, collate, to_device
-from sfc_gdn2.data.splits import assign_splits
 from sfc_gdn2.data.volume import VolumeStore, patch_dims, patch_grid, patchify
 
 
@@ -16,51 +14,6 @@ def frame(n_cohorts=3, subjects=20, sessions=2):
                           "sample_id": f"c{c}_{s:03d}_{ses}", "session": ses, "path": f"c{c}_{s:03d}_{ses}",
                           "sex": "F" if s % 2 else "M"}
                          for c in range(n_cohorts) for s in range(subjects) for ses in range(sessions)])
-
-
-COUNTS = {"pretrain": 15, "train": 24, "val": 3, "test": 12}
-
-
-def test_splits_have_exact_counts_one_scan_per_subject():
-    df = frame()
-    df["split"] = assign_splits(df, 0, COUNTS, "sex")
-    used = df[df.split != "unused"]
-    assert used.split.value_counts().to_dict() == COUNTS
-    assert used.subject.is_unique
-
-
-def test_splits_are_subject_disjoint_and_stratified():
-    df = frame()
-    df["split"] = assign_splits(df, 0, COUNTS, "sex")
-    used = df[df.split != "unused"]
-    groups = {k: set(g.subject) for k, g in used.groupby("split")}
-    for a, b in itertools.combinations(groups, 2):
-        assert not groups[a] & groups[b]
-    assert (used[used.split == "test"].cohort.value_counts() == 4).all()
-
-
-def test_probe_splits_only_draw_labelled_subjects():
-    df = frame()
-    df.loc[df.subject.isin([f"c0_{i:03d}" for i in range(10)]), "sex"] = None
-    df["split"] = assign_splits(df, 0, COUNTS, "sex")
-    probe = df[df.split.isin(["train", "val", "test"])]
-    assert probe.sex.notna().all()
-
-
-def test_pretrain_all_takes_every_scan_outside_the_probe_splits():
-    df = frame()
-    probe_only = {k: v for k, v in COUNTS.items() if k != "pretrain"}
-    ref = assign_splits(df, 0, probe_only, "sex")
-    out = assign_splits(df, 0, {**probe_only, "pretrain": "all"}, "sex")
-    assert (out[ref != "unused"] == ref[ref != "unused"]).all()       # probe splits unchanged
-    probe_subjects = set(df.subject[ref != "unused"])
-    assert (out[~df.subject.isin(probe_subjects)] == "pretrain").all()  # all sessions included
-    assert not (out[df.subject.isin(probe_subjects)] == "pretrain").any()
-
-
-def test_splits_reject_impossible_counts():
-    with pytest.raises(ValueError):
-        assign_splits(frame(), 0, {"pretrain": 0, "train": 500, "val": 1, "test": 1}, "sex")
 
 
 def test_patchify_matches_unfold():

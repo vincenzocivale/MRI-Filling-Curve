@@ -1,7 +1,9 @@
 import torch
+from torch import nn
 
 from sfc_gdn2.curves import grid_coords
 from sfc_gdn2.lejepa import LeJEPA, Projector, SIGReg
+from sfc_gdn2.pretrain import param_groups
 
 
 def g(seed=0):
@@ -135,3 +137,12 @@ def test_masks_are_aligned_cubes_and_cell_targets_match():
     out = m(v, g())
     assert out["pairs_cell2"] > 0 and out["pairs_cell4"] >= 0
     assert out["inv_cell2"] < 1e-10 and out["inv_cell4"] < 1e-10 and torch.isfinite(out["loss"])
+
+
+def test_param_groups_decay_matrices_only():
+    m = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
+    m.A_log = nn.Parameter(torch.zeros(2, 2))
+    m.A_log._no_weight_decay = True
+    decay, keep = param_groups(m, 0.05)
+    assert [p.shape for p in decay["params"]] == [torch.Size([4, 4])]
+    assert len(keep["params"]) == 4 and keep["weight_decay"] == 0.0

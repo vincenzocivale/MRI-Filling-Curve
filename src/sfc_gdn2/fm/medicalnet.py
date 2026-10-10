@@ -82,7 +82,7 @@ class MedicalNet(Wrapper):
 
     # ------------------------------------------------------------------ segmentation (fm/segrun.py)
     def seg_input(self, prepared: dict):
-        from ..bench_geom import source_to_input
+        from ..bench.geom import source_to_input
         x = prepared["image"]
         return x, source_to_input("medicalnet", {"source_shape": prepared["source_shape"],
                                                  "input_shape": tuple(x.shape[1:])})

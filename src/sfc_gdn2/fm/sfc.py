@@ -1,14 +1,13 @@
 """Our encoder (LeJEPA, causal GDN-2) as a benchmark model: the same `<out>/<id>.pt` as the external FMs, so
-bench-extract / bench-probe / bench_seg treat it like any of them. Runs in our own env (sfc-gdn2), `repo` = this repo.
+bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in our own env (sfc-gdn2), `repo` = this repo.
 
 - preprocessing: the pretraining one (data/volume.py): canonical orientation (axis permutation / flips only), native
   voxels, values / 99th percentile of the voxels > 0, patches of round(patch_mm / spacing) voxels per axis.
-- features: probe.encoder_extractor, i.e. the probes' own read: the whole patch grid along each curve of
+- features: model.encoder_extractor (the read of every evaluation): the whole patch grid along each curve of
   `args.curves` (default: the run's view_curves, averaged), forward + reversed. `map` = bi tokens on the patch grid
   [2d, gx, gy, gz]; `mean` = bi averaged over the foreground patches (the pyramid top, what volume probes read:
   canonical).
-- meta: `source_to_input` (source voxel index -> canonical voxel index) and `strides` (`map`: the scan's patch k,
-  voxels per axis), read by bench_geom / bench_seg.
+- meta: `source_to_input` (source voxel index -> canonical voxel index), read by bench/geom.py.
 - segmentation (bench-segdec, fm/segrun.py): the frozen encoder + Primus' decoder (`PatchDecode`, the decoder of the
   OpenMind / nnFoundation token models: transposed convs, LayerNorm, GELU, He init 1e-2) from each token to a 16^3
   grid over its patch (1 mm at patch_mm 16), resized trilinearly to the patch's native voxels (k differs per scan).
@@ -41,7 +40,7 @@ class SegNet(nn.Module):
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
 
-        from ..probe import encoder_extractor
+        from ..model import encoder_extractor
 
         self.encoder, self.patch_mm = encoder, patch_mm
         self.decode = PatchDecode((DECODE,) * 3, 2 * encoder.dim, n_out, norm=LayerNormNd, activation=nn.GELU)
@@ -110,7 +109,7 @@ class SFC(Wrapper):
         src = np.linalg.inv(nio.inv_ornt_aff(ornt, img.shape[:3]))  # source voxel -> canonical voxel
         meta = {"source_affine": torch.from_numpy(img.affine.copy()), "source_shape": tuple(img.shape[:3]),
                 "source_to_input": torch.from_numpy(src), "input_shape": tuple(arr.shape),
-                "spacing": tuple(spacing), "strides": {"map": tuple(int(v) for v in k)}}
+                "spacing": tuple(spacing)}
         return {"volume": torch.from_numpy(np.ascontiguousarray(arr)), "value": (a, c), "k": torch.tensor(k),
                 "grid": patch_grid(arr.shape, k), "spacing": torch.tensor(spacing, dtype=torch.float32), "meta": meta}
 
@@ -133,8 +132,7 @@ class SFC(Wrapper):
 
     def extractor(self):
         if self._extract is None:
-            from ..model import Encoder
-            from ..probe import encoder_extractor
+            from ..model import Encoder, encoder_extractor
 
             enc = Encoder.from_config(self.run_cfg)
             enc.load_state_dict(torch.load(self.ckpt, map_location="cpu"))

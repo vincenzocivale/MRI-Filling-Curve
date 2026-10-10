@@ -11,7 +11,7 @@ All references are to the original repo (`cfg["repo"]`, verified at f1731a1):
   only to record the bbox: the repo does not shift the returned affine by the crop offset (bug at
   :155-165 / :258), and the affine it returns is the RAS-aligned one while the image is NOT reoriented (:272-276
   align `final` with the already aligned affine, a no-op): `meta["affine"]` is the true one
-  (`bench_geom.brainfm_input_affine`: 1 mm resize in source axis order, then the crop; checked against the shape). The tensor is unchanged (see the parity script).
+  (`bench/geom.py brainfm_input_affine`: 1 mm resize in source axis order, then the crop; checked against the shape). The tensor is unchanged (see the parity script).
 - network: `Trainer/models/__init__.py:404` `build_model` from `cfgs/generator/default.yaml` +
   `cfgs/generator/test/demo_test.yaml` and `cfgs/trainer/default_train.yaml` + `default_val.yaml` +
   `cfgs/trainer/test/demo_test.yaml` (UNet3D, f_maps 64, 6 levels, 'gcl', unit_feat). The repo's own
@@ -40,7 +40,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from ..bench_geom import brainfm_input_affine
+from ..bench.geom import brainfm_input_affine
 from .base import Image, Wrapper, add_to_path
 
 GEN_CFGS = ("cfgs/generator/default.yaml", "cfgs/generator/test/demo_test.yaml")
@@ -121,8 +121,8 @@ class BrainFM(Wrapper):
     seg_bf16 = False  # the repo infers in fp32; its torch 2.0 has no bf16 upsample_nearest3d
 
     def seg_input(self, prepared: dict):
-        """The 1 mm zero-cropped volume the network sees, in the SOURCE axis order (bench_geom.brainfm_input_affine)."""
-        from ..bench_geom import source_to_input
+        """The 1 mm zero-cropped volume the network sees, in the SOURCE axis order (bench/geom.py brainfm_input_affine)."""
+        from ..bench.geom import source_to_input
         return prepared["input"][0].float().cpu(), source_to_input("brainfm", prepared["meta"])
 
     def seg_net(self, n_out: int, pretrained: bool = True):

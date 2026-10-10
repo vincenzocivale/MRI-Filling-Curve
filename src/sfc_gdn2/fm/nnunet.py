@@ -157,7 +157,7 @@ class NNUNet(Wrapper):
     # ------------------------------------------------------------------ segmentation (fm/segrun.py)
     def seg_input(self, prepared: dict):
         """nnU-Net's preprocessed volume (after TotalSegmentator's canonical + resampling steps)."""
-        from ..bench_geom import source_to_input
+        from ..bench.geom import source_to_input
         meta = {"totalseg": prepared["totalseg"], "nnunet_properties": prepared["properties"],
                 "transpose_forward": self.predictor.plans_manager.transpose_forward,
                 "preprocessed_shape": list(prepared["data"].shape[1:])}

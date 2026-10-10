@@ -1,37 +1,13 @@
-"""`sfc <command> <config>`: prepare | split | pretrain-pool | pretrain | probe | fm | summarize | bench-split |
-bench-extract | bench-probe | bench-segdec."""
+"""`sfc <command> <config>`: pretrain-pool | pretrain | fm | bench-split | bench-extract | bench-probe | bench-segdec."""
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 
 import pandas as pd
 
 from .io import load_yaml
-
-
-def prepare(cfg: dict, _) -> None:
-    from .data.manifest import build
-    df = build(cfg)
-    out = Path(cfg["output"])
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out, index=False)
-    print(f"{len(df)} samples -> {out}")
-
-
-def split(cfg: dict, _) -> None:
-    from .data.labels import attach
-    from .data.manifest import build
-    from .data.splits import assign_splits, summarize
-    df = pd.read_csv(cfg["manifest"]) if cfg.get("manifest") else build(cfg)
-    df = attach(df, cfg["kind"], cfg["root"], cfg["labels"])
-    df["split"] = assign_splits(df, int(cfg["seed"]), cfg["counts"], cfg["labels"][0])
-    out = Path(cfg["output"])
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out, index=False)
-    print(summarize(df, cfg["labels"][0]).to_string(index=False), f"\n{out}")
 
 
 def pretrain_pool(cfg: dict, args) -> None:
@@ -56,27 +32,6 @@ def pretrain(cfg: dict, args) -> None:
         print(path)
 
 
-def probe(cfg: dict, args) -> None:
-    """Under torchrun, candidates (checkpoint x curve x features) are split across GPUs."""
-    import os
-    from datetime import timedelta
-
-    import torch
-    import torch.distributed as dist
-
-    from .probe import probe_raw, probe_run
-    if "WORLD_SIZE" in os.environ:
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        # ranks fit different candidate shards (hours on segmentation): the gather waits for the slowest
-        dist.init_process_group("nccl", timeout=timedelta(hours=12))
-    if args.raw:
-        probe_raw(cfg, load_yaml(args.raw))
-    for run_dir in args.run_dir or []:
-        probe_run(cfg, run_dir)
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
 def fm(_, args) -> None:
     """Features of one external model for a list of images (`--images`, or `--csv` with an `id` column
     plus one column per modality for multi-modal models)."""
@@ -93,7 +48,7 @@ def fm(_, args) -> None:
 
 def bench_split(cfg: dict, _) -> None:
     """Volume list + fixed splits of the downstream benchmark (src/sfc_gdn2/bench.py)."""
-    from . import bench
+    from .bench import split as bench
     out = Path(cfg["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     vols = bench.stage(bench.volumes(pd.read_csv(cfg["catalog"], low_memory=False)), cfg["inputs_dir"])
@@ -131,7 +86,7 @@ def bench_extract(cfg: dict, args) -> None:
 def bench_probe(cfg: dict, args) -> None:
     """Probes of the benchmark tasks on the stored features of `--models` (default: every model under out_root),
     on the volumes all of them have; `--cache-only` just builds each model's `_globals.pt`."""
-    from . import bench_probe as bp
+    from .bench import probe as bp
     from .io import load_yaml
     root = Path(cfg["fm"]["out_root"])
     names = args.models or sorted(p.name for p in root.iterdir() if p.is_dir())
@@ -151,10 +106,10 @@ def bench_probe(cfg: dict, args) -> None:
 
 
 def bench_segdec(cfg: dict, args) -> None:
-    """Segmentation through each model's official decoder on its frozen encoder (bench_segdec.py): `--stage prep
+    """Segmentation through each model's official decoder on its frozen encoder (bench/segdec.py): `--stage prep
     --group g [--shard i/n|auto/n]` caches a group's preprocessed inputs; `--stage train --models m.. --init
     pretrained|random` trains and tests (`--tasks`: default every seg task; `--sample k`, `--iters n`: pilots)."""
-    from . import bench_segdec as bs
+    from .bench import segdec as bs
     from .io import load_yaml
     tasks = load_yaml(cfg["probe"]["tasks"])
     tasks = {t: tasks[t] for t in (args.tasks or [t for t, c in tasks.items() if c["type"] == "seg"])}
@@ -171,35 +126,14 @@ def bench_segdec(cfg: dict, args) -> None:
             bs.train(cfg, m, t, items[t], seed, args.init, args.device, args.iters, args.resume)
 
 
-def summarize(_, args) -> None:
-    """One row per (run, probe, candidate) under <root>: every checkpoint per run, plus the raw baselines."""
-    root, rows = Path(args.config), []
-    for p in sorted([*root.glob("*/probe-*/metrics.json"), *root.glob("raw-probe-*/metrics.json")]):
-        m = json.loads(p.read_text())
-        key = m["metric"]
-        for group, r in m["groups"].items():
-            lo, hi = r[f"test_{key}_ci95"]
-            rows.append({"label": m["label"], "metric": key, "objective": m["objective"], "curve": m["curve"],
-                         "candidate": group, "l2": r["l2"], "test": r["test"][key],
-                         "ci95": f"[{lo:.3f}, {hi:.3f}]", "run": p.parent.parent.name})
-    if not rows:
-        raise SystemExit(f"No probe results under {root}.")
-    df = pd.DataFrame(rows).sort_values(["label", "objective", "run", "candidate"])
-    print(df.to_string(index=False))
-    df.to_csv(root / "probe_summary.csv", index=False)
-
-
-COMMANDS = {"prepare": prepare, "split": split, "pretrain-pool": pretrain_pool, "pretrain": pretrain, "probe": probe, "fm": fm, "summarize": summarize,
-            "bench-split": bench_split, "bench-extract": bench_extract, "bench-probe": bench_probe,
-            "bench-segdec": bench_segdec}
+COMMANDS = {"pretrain-pool": pretrain_pool, "pretrain": pretrain, "fm": fm, "bench-split": bench_split,
+            "bench-extract": bench_extract, "bench-probe": bench_probe, "bench-segdec": bench_segdec}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="sfc")
     ap.add_argument("command", choices=COMMANDS)
-    ap.add_argument("config", help="YAML config (for `summarize`: a pretraining output_root)")
-    ap.add_argument("--run-dir", nargs="+", help="probe: pretraining run directories")
-    ap.add_argument("--raw", help="probe: also run the encoder-free baseline (pass the pretrain config)")
+    ap.add_argument("config", help="YAML config")
     ap.add_argument("--images", nargs="+", help="fm: image files (single-modality models)")
     ap.add_argument("--csv", help="fm: CSV with `id` + one column per modality")
     ap.add_argument("--out", help="fm: output directory (one <id>.pt per image); bench-extract: output root")
@@ -223,8 +157,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):
         ap.error("fm needs --images or --csv, and --out")
-    raw = args.command in ("summarize", "fm")  # fm: the config is resolved (env vars) by fm.api
-    COMMANDS[args.command](None if raw else load_yaml(args.config), args)
+    # fm: the config is resolved (env vars) by fm.api
+    COMMANDS[args.command](None if args.command == "fm" else load_yaml(args.config), args)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+addopts = "-m 'not slow'"   # `pytest -m slow`: L-BFGS probe grid, GPU model (a GPU node)
+markers = ["slow: minutes on the login node or needs a GPU job"]
 
 [tool.ruff]
 line-length = 110

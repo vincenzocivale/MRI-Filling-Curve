@@ -1,18 +1,21 @@
-# LeJEPA over groups of patches: `sfc pretrain configs/pretrain_lejepa.yaml`.
+# LeJEPA over groups of patches: `sfc pretrain-pool` once (CPU job), then `sfc pretrain configs/pretrain_lejepa.yaml`.
 # Per volume, groups (boxes of the patch grid); per group, two views (jittered box, intensity,
 # own curve of `view_curves`; view A masked in aligned cubes). One masked-prediction task per scale (H-JEPA
 # pattern, space for time): patch tokens, cubes of `levels` patches, the whole view (mean token) on top. No held-out set:
-# checkpoints (save_every) are selected on the probe's val split.
+# every checkpoint (save_every) is probed; the benchmark (bench.yaml group `sfc`) reads the last one.
 seed: 17
-output_root: /raid/DATASETS/MRI-US/biomed-fm-results/sfc_pretrain_v8
+output_root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/sfc_pretrain_v8
 
 data:
+  pool:                       # `sfc pretrain-pool <this>` writes manifests[0] from the catalog (data/pool.py)
+    catalog: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/catalog.csv.gz
+    datasets: [MR-RATE, FOMO300K, SALD, CoRR, Petfrog]   # DECISIONS.md Version 1 (MR-RATE: phase-1 brain series)
+    exclude: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench/volumes.csv   # downstream subjects: never
   manifests:                  # pretraining pool = union of each manifest's `pretrain` split
-    - data/manifests/fomo300k_sex.csv     # 4366 brain T1w (every scan of every non-probe subject)
-    - data/manifests/totalseg_mri.csv     # 896 body MRI
-  splits: [pretrain]          # probe splits (train/val/test) stay disjoint by subject
+    - /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/pretrain/pool.csv.gz
+  splits: [pretrain]
   patch_mm: 16.0              # patch = the scan's native voxels, round(16 / spacing) per axis (~16 mm); nothing resampled
-  cache_dir: /raid/DATASETS/MRI-US/biomed-fm-results/.cache_volumes
+  cache_dir: null             # no cache: workers decode the sources (zip members in memory); ~1M scans fit no cache
   num_workers: 8
   patches_per_batch: 16384    # per GPU: whole scans packed up to this many patches (~6 brains; a big body scan alone)
 

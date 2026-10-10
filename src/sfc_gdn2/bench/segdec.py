@@ -1,13 +1,13 @@
 """Segmentation benchmark through each model's official downstream decoder on its frozen pretrained encoder
 (protocol and wrapper hooks in fm/segrun.py, which runs inside the model's env).
 
-Volumes per task: bench_seg.select (seed-fixed: at most 400 train / 100 val, every test volume), the same for every
+Volumes per task: `select` (seed-fixed: at most 400 train / 100 val, every test volume), the same for every
 model. Two stages, as SLURM jobs:
 - prep (per preprocessing group, fm.groups in the bench config): the group's preprocessing + GT on the model grid,
   cached under <segdec.cache>/<group lead>/ for the union of the tasks' volumes;
 - train (per model x task x init): `init` = pretrained (the protocol) or random (same network, encoder randomly
   initialised and frozen: what the decoder gets from the architecture alone). Writes
-  <segdec.out>/<task>/s<seed>/<model>__<init>.json with a 95% CI over test-subject resamples (bench_seg._ci).
+  <segdec.out>/<task>/s<seed>/<model>__<init>.json with a 95% CI over test-subject resamples (`_ci`).
 """
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import bench_seg
-from .bench_probe import task_rows
-from .fm.api import SRC, load_config
+from ..fm.api import SRC, load_config
+from .probe import task_rows
+
+MAX_TRAIN, MAX_VAL = 400, 100  # volumes per task held in RAM
 
 
 def lead_of(fm_cfg: dict, model: str) -> str:
@@ -35,7 +36,7 @@ def task_items(tasks: dict, vols: pd.DataFrame, splits: pd.DataFrame, seed: int,
     out = {}
     for name, cfg in tasks.items():
         rows = task_rows(vols, splits, cfg, seed)
-        sel = {s: idx[:sample] for s, idx in bench_seg.select(rows, cfg, np.random.default_rng(seed)).items()}
+        sel = {s: idx[:sample] for s, idx in select(rows, cfg, np.random.default_rng(seed)).items()}
         out[name] = [{"id": r["id"], "image": r["input"], "seg": r["seg"], "split": s, "subject": r["subject"]}
                      for s, idx in sel.items() for _, r in rows.loc[idx].iterrows()]
     return out
@@ -76,15 +77,34 @@ def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init
         print(f"[segdec] {task} s{seed} {model} {init}: done ({out}), skipped", flush=True)
         return res
     seg = Path(items[0]["seg"])
-    k = 1 + (len(list(seg.glob("*.nii*"))) if seg.is_dir() else 1)  # as bench_geom.gt_labels counts classes
+    k = 1 + (len(list(seg.glob("*.nii*"))) if seg.is_dir() else 1)  # as geom.gt_labels counts classes
     run_job(load_config(f"configs/fm/{model}.yaml"),
             {"stage": "train", "cache": str(Path(s["cache"]) / lead_of(bench["fm"], model)), "items": items,
              "k": k, "init": init, "iters": int(s["iters"]), "val_every": int(s["val_every"]), "batch": int(s["batch"]),
              "lr": float(s["lr"]), "seed": seed, "device": device, "out": str(out)})
     res = json.loads(out.read_text())
     subj = {it["id"]: it["subject"] for it in items}
-    res |= {"task": task, "seed": seed, "test_ci95": bench_seg._ci(np.asarray(res["per_volume"], dtype=float),
+    res |= {"task": task, "seed": seed, "test_ci95": _ci(np.asarray(res["per_volume"], dtype=float),
                                                                   np.array([subj[i] for i in res["test_ids"]]))}
     out.write_text(json.dumps(res, indent=1))
     print(f"[segdec] {task} s{seed} {model} {init}: dice {res['test_dice']:.3f} {res['test_ci95']}", flush=True)
     return res
+
+
+def select(rows: pd.DataFrame, cfg: dict, rng: np.random.Generator) -> dict[str, np.ndarray]:
+    """Row indices per split: at most MAX_TRAIN / MAX_VAL random train / val volumes, every test volume (of
+    `test_query`, if set)."""
+    sel = {s: rows.index[rows["split"] == s].to_numpy() for s in ("train", "val", "test")}
+    sel["train"] = rng.permutation(sel["train"])[:MAX_TRAIN]
+    sel["val"] = rng.permutation(sel["val"])[:MAX_VAL]
+    if cfg.get("test_query"):
+        sel["test"] = rows.loc[sel["test"]].query(cfg["test_query"]).index.to_numpy()
+    return sel
+
+
+def _ci(d: np.ndarray, subj: np.ndarray, n: int = 1000) -> list[float]:
+    rng = np.random.default_rng(0)
+    groups = pd.Series(range(len(subj))).groupby(subj).indices
+    keys = sorted(groups)
+    vals = [np.nanmean(d[np.concatenate([groups[s] for s in rng.choice(keys, len(keys))])]) for _ in range(n)]
+    return [float(np.nanpercentile(vals, 2.5)), float(np.nanpercentile(vals, 97.5))]

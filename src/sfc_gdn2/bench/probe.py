@@ -8,7 +8,7 @@ feature (each 1-D tensor the model stores, and the spatial / token mean of each 
 L2 (on weight matrices). The best (feature, L2) on val is evaluated once on test, with a 95% CI over 1000 bootstrap
 resamples of test subjects (fixed seed: the same resamples for every model, so differences are paired).
 
-Task types (`configs/leonardo/probe_tasks.yaml`):
+Task types (`configs/bench/probe_tasks.yaml`):
 - `class`: softmax cross-entropy, class-balanced; AUROC (binary) or balanced accuracy.
 - `ordinal`: CORAL (one score, K-1 thresholds, BCE on y > k); quadratic weighted kappa (+ MAE).
 - `dex`: DEX / SFCN, softmax over bins of width `bin` with Gaussian soft labels (sigma = 1 bin), prediction =
@@ -308,19 +308,10 @@ def run(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, spl
     vols = vols[vols["id"].isin(common)]
     summary = []
     for tname, cfg in tasks.items():
+        if cfg["type"] == "seg":  # segmentation: bench-segdec (each model's own network, full resolution)
+            continue
         for seed in seeds:
             rows = task_rows(vols, splits, cfg, seed)
-            if cfg["type"] == "seg":
-                from . import bench_seg
-                for m in loaded:
-                    res = bench_seg.run_seg(tname, cfg, rows, m, models[m], seed, device)
-                    bench_seg.write(res, out_dir)
-                    summary += [{"task": tname, "seed": seed, "model": m, "head": h, "metric": "dice",
-                                 "test": res[h]["test_dice"], "ci95": res[h]["test_ci95"], "n_test": res["n"]["test"]}
-                                for h in ("linear", "conv", "oracle")]
-                    print(f"[probe] {tname} s{seed} {m}: " + ", ".join(
-                        f"{h} dice={res[h]['test_dice']:.3f}" for h in ("linear", "conv", "oracle")), flush=True)
-                continue
             for m, (ids, feats) in loaded.items():
                 res = run_task(tname, cfg, rows, feats, {i: k for k, i in enumerate(ids)}, device)
                 dst = out_dir / tname / f"s{seed}" / f"{m}.json"

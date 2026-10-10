@@ -10,11 +10,6 @@ from torch.utils.data import DataLoader, Dataset
 from .volume import VolumeStore, patch_dims, patch_grid, patchify
 
 
-def cohort_key(df: pd.DataFrame) -> pd.Series:
-    """Per-source grouping key: `cohort` when the scanner emitted one, else `dataset`."""
-    return df["cohort"] if "cohort" in df.columns else df["dataset"]
-
-
 class PatchDataset(Dataset):
     """Scans as their native voxels (stored dtype; `to_device` makes the values and the [N, P] patches,
     P = k0*k1*k2, k = the voxels per axis closest to `patch_mm`: `patch_dims`), with spacing (mm), k,

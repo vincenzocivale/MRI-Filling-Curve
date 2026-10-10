@@ -164,7 +164,7 @@ class BrainIAC(Wrapper):
     def seg_input(self, prepared: dict):
         """The 96^3 model input; source voxel -> world (RAS) -> LPS -> inverse of the captured rigid transform ->
         template grid of the registered file (HD-BET keeps it) -> trilinear Resize to 96^3 (align_corners=False)."""
-        from ..bench_geom import _scale
+        from ..bench.geom import _scale
 
         x, reg = prepared["image"], prepared["registration"]
         if reg is None:

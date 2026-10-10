@@ -1,7 +1,0 @@
-name: fomo300k
-kind: zip_bids
-root: /raid/DATASETS/FOMO300K
-output: data/manifests/fomo300k.csv
-split: train
-max_samples: 20000
-modalities: [T1w, MPRAGE, T1]

@@ -77,9 +77,12 @@ def with_patches(df: pd.DataFrame, patch_mm: float, workers: int = 8) -> pd.Data
     """Header shape / spacing / n_patch per row; rows that are not single 3D scans are dropped."""
     archive = df["path"].str.split("::").str[0]
     groups = [g.tolist() for _, g in df["path"].groupby(archive, sort=False)]
-    with mp.get_context("spawn").Pool(workers) as pool:
-        heads = dict(zip((p for g in groups for p in g),
-                         (h for hs in pool.imap(_headers, groups, chunksize=64) for h in hs)))
+    if workers <= 1:
+        heads = dict(zip((p for g in groups for p in g), (h for g in groups for h in _headers(g))))
+    else:
+        with mp.get_context("spawn").Pool(workers) as pool:
+            heads = dict(zip((p for g in groups for p in g),
+                             (h for hs in pool.imap(_headers, groups, chunksize=64) for h in hs)))
     h = [heads[p] for p in df["path"]]
     df = df.assign(shape=["x".join(map(str, x[0])) if x else "" for x in h],
                    spacing=["x".join(f"{z:.4g}" for z in x[1][:3]) if x else "" for x in h],

@@ -220,7 +220,7 @@ class BrainSegFounder(Wrapper):
     # ---------------------------------------------------------------- segmentation (fm/segrun.py)
     def seg_input(self, prepared: dict):
         """The pipeline's network input (ukb: RAS, intensity-scaled, foreground crop; atlas: the 96^3 resize)."""
-        from ..bench_geom import source_to_input
+        from ..bench.geom import source_to_input
 
         x = prepared["image"]
         if self.pipeline == "atlas":

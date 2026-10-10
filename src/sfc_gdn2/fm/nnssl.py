@@ -160,7 +160,7 @@ class NnsslWrapper(Wrapper):
     # ------------------------------------------------------------------ segmentation (fm/segrun.py)
     def seg_input(self, prepared: dict):
         """nnssl's preprocessed volume: the grid nnU-Net fine-tunes and predicts on (before its sliding-window pad)."""
-        from ..bench_geom import _nnunet_crop_resample, _perm
+        from ..bench.geom import _nnunet_crop_resample, _perm
         props = prepared["props"]
         geo = {k: props[k] for k in ("bbox_used_for_cropping", "shape_after_cropping_and_before_resampling")}
         m = _nnunet_crop_resample(geo | {"preprocessed_shape": prepared["data"].shape[1:]},

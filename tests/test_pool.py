@@ -8,7 +8,7 @@ import pytest
 import torch
 import yaml
 
-from sfc_gdn2.bench_geom import source_to_input
+from sfc_gdn2.bench.geom import source_to_input
 from sfc_gdn2.data import pool
 from sfc_gdn2.data.volume import VolumeStore, patch_grid
 
@@ -74,4 +74,4 @@ def test_sfc_wrapper_maps_source_voxels_to_its_canonical_grid(tmp_path):
     for i, j, k in [(0, 0, 0), (3, 5, 4), (1, 2, 3)]:
         c = (m @ [i, j, k, 1])[:3].round().astype(int)
         assert vol[tuple(c)] == raw[i, j, k]
-    assert p["meta"]["strides"]["map"] == (2, 2, 1) and torch.equal(p["grid"], patch_grid(vol.shape, (2, 2, 1)))  # RAS: 1, 1, 2 mm
+    assert torch.equal(p["grid"], patch_grid(vol.shape, (2, 2, 1)))  # RAS: 1, 1, 2 mm

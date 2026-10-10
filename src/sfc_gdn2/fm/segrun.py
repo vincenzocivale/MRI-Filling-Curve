@@ -22,8 +22,8 @@ outside the GT), m, grid_from_gt (4x4 GT voxel -> grid voxel)}; shared by the mo
 train: AdamW(lr, wd 1e-4) on the non-frozen parameters, poly decay, batches of `batch` patches (1/3 centred on a
 voxel of a random foreground class present, nnU-Net's oversampling), loss CE + soft Dice (foreground classes,
 batch Dice), bf16 autocast (fp32 if the wrapper sets `seg_bf16 = False`); every `val_every` iterations Dice on the val volumes (sliding window, Gaussian, step
-0.5, on the grid), the best state kept. Test: class probabilities interpolated (trilinear, from_cells) to every GT
-voxel, argmax, Dice per foreground class present in GT or prediction, mean per volume (as bench_seg.full_res_dice).
+0.5, on the grid), the best state kept. Test: class probabilities interpolated (trilinear) to every GT
+voxel, argmax, Dice per foreground class present in GT or prediction, mean per volume .
 A killed job resumes from what it left next to the result json: the training state (every 10 min, SFC_SEG_SAVE_S),
 the best state, the test volumes done.
 Only stdlib + numpy + torch + nibabel here.
@@ -46,7 +46,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..bench_geom import gt_labels
+from ..bench.geom import gt_labels
 from .worker import build, prepared
 
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds

@@ -3,6 +3,7 @@ import pytest
 import torch
 
 pytest.importorskip("lit_gpt.gdn2")
+pytestmark = pytest.mark.slow  # CUDA + Triton compile: a GPU job
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
@@ -84,7 +85,7 @@ def test_lejepa_step_trains():
 
 
 def test_bidirectional_patch_feature_sees_both_sides():
-    from sfc_gdn2.probe import encoder_extractor
+    from sfc_gdn2.model import encoder_extractor
     torch.manual_seed(0)
     from sfc_gdn2.curves import grid_coords, keys
     enc, grid = encoder().eval(), torch.tensor([[8, 8, 8]], device=DEV)

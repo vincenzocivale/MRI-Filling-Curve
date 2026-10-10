@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from sfc_gdn2 import bench
+from sfc_gdn2.bench import split as bench
 
 
 def test_splits_are_subject_level_stratified_and_keep_totalseg_test(tmp_path):

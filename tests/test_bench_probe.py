@@ -3,7 +3,9 @@ import pandas as pd
 import pytest
 import torch
 
-from sfc_gdn2 import bench_probe as bp
+from sfc_gdn2.bench import probe as bp
+
+pytestmark = pytest.mark.slow  # L-BFGS over the whole feature x L2 grid
 
 
 @pytest.fixture
