@@ -9,6 +9,10 @@ bench-extract / bench-probe / bench_seg treat it like any of them. Runs in our o
   canonical).
 - meta: `source_to_input` (source voxel index -> canonical voxel index) and `strides` (`map`: the scan's patch k,
   voxels per axis), read by bench_geom / bench_seg.
+- segmentation (bench-segdec, fm/segrun.py): the frozen encoder + Primus' decoder (`PatchDecode`, the decoder of the
+  OpenMind / nnFoundation token models: transposed convs, LayerNorm, GELU, He init 1e-2) from each token to a 16^3
+  grid over its patch (1 mm at patch_mm 16), resized trilinearly to the patch's native voxels (k differs per scan).
+  Input: the native canonical grid (`seg_input`), the spacing as `seg_context`; tiles of SEG_PATCH voxels.
 
 `checkpoint`: an `encoder_step*.pt` (its run's config.yaml next to it), a run directory (its last checkpoint, or
 `args.step`), or an output_root holding exactly one run.
@@ -20,8 +24,47 @@ from pathlib import Path
 import nibabel.orientations as nio
 import numpy as np
 import torch
+from torch import nn
+from torch.nn import functional as F
 
 from .base import Image, Wrapper
+
+SEG_PATCH = (160, 160, 160)   # voxels, as the Primus / nnFoundation ViT runs
+DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
+
+
+class SegNet(nn.Module):
+    """`encoder` (frozen: segrun) read along `curves` as in extraction -> bi tokens -> `decode` per token."""
+
+    def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int):
+        super().__init__()
+        from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
+        from dynamic_network_architectures.initialization.weight_init import InitWeights_He
+
+        from ..probe import encoder_extractor
+
+        self.encoder, self.patch_mm = encoder, patch_mm
+        self.decode = PatchDecode((DECODE,) * 3, 2 * encoder.dim, n_out, norm=LayerNormNd, activation=nn.GELU)
+        self.decode.apply(InitWeights_He(1e-2))
+        self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0)
+
+    def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
+        """x [B, 1, *T] native voxels, spacing [B, 3] mm -> logits [B, n_out, *T]."""
+        from ..data.volume import patch_dims, patch_grid, patchify
+
+        T = tuple(x.shape[2:])
+        ks = [patch_dims(s, self.patch_mm) for s in spacing.tolist()]
+        grid = torch.stack([patch_grid(T, k) for k in ks]).to(x.device)
+        with torch.no_grad():
+            bi = self.extract({"patches": [patchify(x[b, 0].float(), k) for b, k in enumerate(ks)], "grid": grid,
+                               "k": torch.tensor(ks, device=x.device), "spacing": spacing.float()})["bi"]
+        out = []
+        for b, k in enumerate(ks):
+            g = grid[b].tolist()
+            m = self.decode(bi[b, : int(grid[b].prod())].T.reshape(1, -1, *g))     # [1, n_out, 16 g]
+            m = F.interpolate(m, size=[a * c for a, c in zip(k, g)], mode="trilinear", align_corners=False)
+            out.append(m[0, :, : T[0], : T[1], : T[2]])
+        return torch.stack(out)
 
 
 def checkpoint_path(path: str | Path, step: int | None = None) -> Path:
@@ -70,6 +113,23 @@ class SFC(Wrapper):
                 "spacing": tuple(spacing), "strides": {"map": tuple(int(v) for v in k)}}
         return {"volume": torch.from_numpy(np.ascontiguousarray(arr)), "value": (a, c), "k": torch.tensor(k),
                 "grid": patch_grid(arr.shape, k), "spacing": torch.tensor(spacing, dtype=torch.float32), "meta": meta}
+
+    # ------------------------------------------------------------------ segmentation (fm/segrun.py)
+    def seg_input(self, prepared: dict):
+        a, c = prepared["value"]
+        return (prepared["volume"].float() * a + c)[None], prepared["meta"]["source_to_input"].numpy()
+
+    def seg_context(self, prepared: dict) -> torch.Tensor:
+        return prepared["spacing"]
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        from ..model import Encoder
+
+        enc = Encoder.from_config(self.run_cfg)
+        if pretrained:
+            enc.load_state_dict(torch.load(self.ckpt, map_location="cpu"))
+        net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out)
+        return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
         if self._extract is None:

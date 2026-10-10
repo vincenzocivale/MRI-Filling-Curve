@@ -66,7 +66,7 @@ def test_patches_and_loss():
     rng = np.random.default_rng(0)
     lab = torch.from_numpy(_labels())
     p = segrun.Patches([{"x": torch.randn(1, *lab.shape), "y": lab}], (8, 8, 8), 3, rng)
-    x, y = p.sample(4)
+    x, y, _ = p.sample(4)
     assert x.shape == (4, 1, 8, 8, 8) and y.shape == (4, 8, 8, 8)
     y[0, 0] = 255
     assert torch.isfinite(segrun.loss_fn(torch.randn(4, 3, 8, 8, 8), y, 3))

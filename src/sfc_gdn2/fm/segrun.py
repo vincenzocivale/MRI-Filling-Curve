@@ -10,6 +10,8 @@ Wrapper hooks (fm/*.py):
 - `seg_net(n_out, pretrained) -> (network, frozen, patch)`: the repo's downstream segmentation network with n_out
   output channels at the input resolution, `frozen` = module-name prefixes of what the repo loads from the
   checkpoint, `patch` = the repo's training patch (also the sliding-window tile; None = whole volume).
+- `seg_context(prepared) -> tensor` (optional): per-volume input the network takes besides the image, called as
+  `net(x, context)` with contexts stacked over the batch (ours: the voxel spacing, fm/sfc.py).
 
 job = {"stage": "prep" | "train", "cfg": model config, "cache": dir, "device", "workers",
        "items": [{"id", "image", "seg", "split"}]  (prep: every volume; train: train/val/test of one task),
@@ -82,13 +84,14 @@ def prep(job: dict) -> None:
                 x = w.preprocess_gpu(x)
             t0 = time.time()
             xin, m = w.seg_input(x)
+            ctx = w.seg_context(x) if hasattr(w, "seg_context") else None
             lab, gt_aff, names = gt_labels(it["seg"])
             grid_from_gt = np.asarray(m, dtype=np.float64) @ np.linalg.inv(nib.load(it["image"]).affine) @ gt_aff
             y = pull_labels(lab, grid_from_gt, tuple(xin.shape[1:]), job["device"])
             dst = cache / f"{it['id']}.pt"
             xin = xin.half() if xin.abs().max() < 6e4 else xin.float()  # raw intensities (BSF atlas) overflow fp16
             torch.save({"x": xin, "y": y, "m": np.asarray(m), "grid_from_gt": grid_from_gt,
-                        "classes": names}, dst.with_suffix(".tmp"))
+                        "classes": names, "ctx": ctx}, dst.with_suffix(".tmp"))
             os.replace(dst.with_suffix(".tmp"), dst)
             print(f"[seg] {it['id']}: grid {tuple(xin.shape)} fg {(y[y < 255] > 0).float().mean():.4f} "
                   f"pre={t_pre:.1f}s lab={time.time() - t0:.1f}s", flush=True)
@@ -112,7 +115,11 @@ def gaussian(patch, device) -> torch.Tensor:
 
 
 @torch.no_grad()
-def sliding(net, x: torch.Tensor, patch, n_out: int, amp) -> torch.Tensor:
+def call(net, x: torch.Tensor, ctx):
+    return net(x) if ctx is None else net(x, ctx.to(x.device))
+
+
+def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch)."""
     S = tuple(x.shape[1:])
     patch = S if patch is None else tuple(patch)
@@ -129,7 +136,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp) -> torch.Tensor:
     for a, b, c in product(*starts):
         sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
         with amp():
-            logits = net(xp[(slice(None), *sl)][None])
+            logits = call(net, xp[(slice(None), *sl)][None], None if ctx is None else ctx[None])
         out[(slice(None), *sl)] += (logits[0].float().softmax(0) * g).to(out)
         wsum[sl] += g
     return out.div_(wsum.to(out.device))[(slice(None),) + tuple(slice(0, s) for s in S)]
@@ -177,9 +184,10 @@ class Patches:
     """Random training patches from volumes held in RAM; 1/3 centred on a voxel of a random present class."""
 
     def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator):
-        self.vols, self.patch, self.rng = [], patch, rng
+        self.vols, self.ctx, self.patch, self.rng = [], [], patch, rng
         for v in vols:
             x, y = pad_to(v["x"], v["y"], patch) if patch else (v["x"], v["y"])
+            self.ctx.append(v.get("ctx"))
             fg = {}
             for c in range(1, k):
                 idx = (y == c).nonzero()
@@ -187,10 +195,12 @@ class Patches:
                     fg[c] = idx[torch.from_numpy(rng.choice(len(idx), min(len(idx), 2000), replace=False))]
             self.vols.append((x, y, fg))
 
-    def sample(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-        xs, ys = [], []
+    def sample(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        xs, ys, cs = [], [], []
         for _ in range(n):
-            x, y, fg = self.vols[self.rng.integers(len(self.vols))]
+            j = self.rng.integers(len(self.vols))
+            x, y, fg = self.vols[j]
+            cs.append(self.ctx[j])
             S = np.array(y.shape)
             P = S if self.patch is None else np.array(self.patch)
             if fg and self.rng.random() < 1 / 3:
@@ -202,7 +212,7 @@ class Patches:
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
             ys.append(y[sl])
-        return torch.stack(xs), torch.stack(ys)
+        return torch.stack(xs), torch.stack(ys), None if cs[0] is None else torch.stack(cs)
 
 
 def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
@@ -249,7 +259,7 @@ def train(job: dict) -> None:
 
     def load(it):
         r = torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)
-        return {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"]}
+        return {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": r.get("ctx")}
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
@@ -308,9 +318,9 @@ def train(job: dict) -> None:
 
         set_mode()
         for it in range(start, iters + 1):
-            x, y = data.sample(int(job["batch"]))
+            x, y, c = data.sample(int(job["batch"]))
             with amp():
-                logits = net(x.to(dev, non_blocking=True).float())
+                logits = call(net, x.to(dev, non_blocking=True).float(), c)
             loss = loss_fn(logits, y.to(dev), k)
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -319,7 +329,7 @@ def train(job: dict) -> None:
             sched.step()
             if it % every == 0 or it == iters:
                 net.eval()
-                ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp).argmax(0).to(dev),
+                ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).argmax(0).to(dev),
                               v["y"].to(dev), k) for v in val_v]
                 val = float(np.nanmean(ds))
                 curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
@@ -346,7 +356,7 @@ def train(job: dict) -> None:
             continue
         t1 = time.time()
         v = load(it)
-        probs = sliding(net, v["x"].to(dev).float(), patch, k, amp)
+        probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])
         lab, _, _ = gt_labels(it["seg"])
         d, per = dice_full_res(probs, v["grid_from_gt"], lab, k, dev)
         res["per_volume"].append(d)
