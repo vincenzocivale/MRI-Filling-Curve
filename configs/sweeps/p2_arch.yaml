@@ -6,8 +6,7 @@ name: p2_arch
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
 fixed: {train.steps: 1200, train.decay_steps: 200, train.warmup_steps: 200, train.save_every: 1200,
-        data.patches_per_batch: 196608, train.batch_size: 72,
-        data.prefetch: 1}
+        data.patches_per_batch: 196608, train.batch_size: 72}
 runs:
   - {}                                            # A0: base
   - {seed: 18}                                    # A0, second seed (noise)

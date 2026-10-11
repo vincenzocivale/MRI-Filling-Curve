@@ -133,6 +133,33 @@ class BudgetBatches:
         return itertools.islice(stream, self.start + self.rank, None, self.world)
 
 
+class _Scans(torch.utils.data.Sampler):
+    """The scans of a batch plan, one after the other (what the per-scan loader's workers fetch)."""
+
+    def __init__(self, plan: BudgetBatches):
+        self.plan = plan
+
+    def __iter__(self):
+        return itertools.chain.from_iterable(self.plan)
+
+
+class ScanBatches:
+    """Training batches: a per-scan DataLoader (each worker loads single scans, so host RAM follows workers x prefetch,
+    not the batch size, and the workers' I/O latencies overlap: a pool scan is ~0.5 s of Lustre reads and gunzip)
+    regrouped in the main process by the same deterministic plan. `batch_sampler` is the plan: its `start` places a
+    resumed run. A whole batch per worker had both costs grow with the batch (2 GPUs x 72 scans: OOM at 240 GB, and
+    25-46% of each step waiting for data)."""
+
+    def __init__(self, ds: Dataset, plan: BudgetBatches, **common):
+        self.batch_sampler = plan
+        self.loader = DataLoader(ds, sampler=_Scans(plan), batch_size=None, **common)
+
+    def __iter__(self):
+        scans = iter(self.loader)
+        for b in self.batch_sampler:
+            yield collate([next(scans) for _ in b])
+
+
 def mix_weights(rows: pd.DataFrame, by: list[str], alpha: float) -> torch.Tensor | None:
     """Per-scan sampling weights giving each stratum (`by`, e.g. dataset x modality) of n scans a share
     proportional to n^alpha: 1 = as in the pool (None), 0 = equal strata."""
@@ -143,19 +170,19 @@ def mix_weights(rows: pd.DataFrame, by: list[str], alpha: float) -> torch.Tensor
 
 
 def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: int = 0, rank: int = 0,
-           world: int = 1, **ds_kwargs) -> DataLoader:
+           world: int = 1, **ds_kwargs) -> DataLoader | ScanBatches:
     """Training: endless `BudgetBatches` over all rows, this rank's share (`rank` of `world`), worker-persistent;
     with `data.patches_per_batch`,
     batches of up to batch_size whole scans holding at most that many patches, else batch_size scans; with
     `data.mix_alpha` (and `mix_by`), strata reweighted; with `subject`/`session` columns, scans batched in pairs of
-    one session (`session_ids`). Evaluation: ordered, batch_size scans."""
+    one session (`session_ids`); scans loaded one per worker (`ScanBatches`). Evaluation: ordered, batch_size scans."""
     store = VolumeStore(data["cache_dir"])
     workers = int(data.get("num_workers", 8))
-    common = {"num_workers": workers, "collate_fn": collate, "pin_memory": True,
-              "persistent_workers": train and workers > 0,
-              "prefetch_factor": int(data.get("prefetch", 4)) if workers else None}  # batches in flight per worker
+    common = {"num_workers": workers, "pin_memory": True, "persistent_workers": train and workers > 0,
+              "prefetch_factor": int(data.get("prefetch", 4)) if workers else None}  # in flight per worker
     if not train:
-        return DataLoader(PatchDataset(rows, store, data["patch_mm"], **ds_kwargs), batch_size=batch_size, **common)
+        return DataLoader(PatchDataset(rows, store, data["patch_mm"], **ds_kwargs), batch_size=batch_size,
+                          collate_fn=collate, **common)
     rows = rows.reset_index(drop=True)
     if not data.get("patches_per_batch"):
         sizes, budget = [1] * len(rows), batch_size
@@ -170,8 +197,8 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: i
             sizes.append(int(patch_grid(arr.shape, patch_dims(spacing, data["patch_mm"])).prod()))
     weights = mix_weights(rows, data.get("mix_by", ["dataset", "modality"]), float(data.get("mix_alpha", 1.0)))
     ds = PatchDataset(rows, store, data["patch_mm"], sizes=sizes, **ds_kwargs)
-    return DataLoader(ds, batch_sampler=BudgetBatches(sizes, budget, batch_size, seed, weights, rank, world,
-                                                      session_ids(rows)), **common)
+    return ScanBatches(ds, BudgetBatches(sizes, budget, batch_size, seed, weights, rank, world, session_ids(rows)),
+                       **common)
 
 
 def session_ids(rows: pd.DataFrame) -> np.ndarray | None:

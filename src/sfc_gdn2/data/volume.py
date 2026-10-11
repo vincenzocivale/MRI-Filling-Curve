@@ -86,7 +86,9 @@ class VolumeStore:
     def decode(path, frame: int | None = None) -> tuple[np.ndarray, tuple, tuple]:
         """-> (raw, spacing, (a, c)); a 4D+ scan's `frame`, scaled on its own (b0 and DWI frames differ)."""
         arr, spacing, slope, inter = load_canonical(path, frame)
-        val = arr.astype(np.float64) * slope + inter
+        # the 99th percentile of the voxels > 0, on every 4th voxel in float32 (in float64 on all of them it was a
+        # quarter of the loader's time and up to 1 GB per worker on the big scans)
+        val = arr.reshape(-1)[::4].astype(np.float32) * slope + inter
         fg = val[val > 0]
         scale = 1.0 / max(float(np.percentile(fg if fg.size else val, 99)), 1e-6)
         return arr, tuple(spacing), (slope * scale, inter * scale)

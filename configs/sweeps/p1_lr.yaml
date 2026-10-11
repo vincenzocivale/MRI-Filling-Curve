@@ -5,8 +5,7 @@ name: p1_lr
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
 fixed: {train.steps: 600, train.decay_steps: 100, train.warmup_steps: 200, train.save_every: 600,
-        data.patches_per_batch: 196608, train.batch_size: 72,
-        data.prefetch: 1}
+        data.patches_per_batch: 196608, train.batch_size: 72}
 runs: [{train.lr: 3.0e-4}, {train.lr: 6.5e-4}, {train.lr: 1.4e-3}, {train.lr: 3.0e-3}]
 tasks: []
 slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "01:45:00"}

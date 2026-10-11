@@ -8,8 +8,7 @@ seed: 0
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
 fixed: {train.steps: 1200, train.decay_steps: 200, train.warmup_steps: 200, train.save_every: 1200,
-        data.patches_per_batch: 196608, train.batch_size: 72,
-        data.prefetch: 1}
+        data.patches_per_batch: 196608, train.batch_size: 72}
 space:
   objective.mask_ratio: {choice: [[0.1, 0.3], [0.2, 0.5], [0.4, 0.7]]}
   objective.mask_cells: {choice: [[1], [1, 2], [1, 2, 4], [1, 4]]}   # 1 always there: cubes must fit small views

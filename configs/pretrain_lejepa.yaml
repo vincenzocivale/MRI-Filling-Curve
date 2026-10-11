@@ -17,9 +17,9 @@ data:
   splits: [pretrain]
   patch_mm: 16.0              # patch = the scan's native voxels, round(16 / spacing) per axis (~16 mm); nothing resampled
   cache_dir: null             # no cache: workers decode the sources (zip members in memory); ~1M scans fit no cache
-  num_workers: 8
-  prefetch: 4                 # batches in flight per worker: host RAM ~ ranks x workers x prefetch x scans per batch
-                              # (2 GPUs x 72 scans: 4 OOM-killed 240 GB, use 1)
+  num_workers: 16             # per GPU; each loads single scans (data.dataset.ScanBatches): I/O-bound (Lustre reads +
+  prefetch: 4                 # gunzip ~0.5 s per scan), so more workers than the GPU's 8 cores; host RAM ~ ranks x
+                              # workers x prefetch scans, whatever the batch
   patches_per_batch: 98304    # per GPU: whole scans packed up to this many patches (~40 brains; a big body scan alone);
                               # 2-GPU dbg, 40 steps: 6x the v8 batch peaks at 10.7 GB (views over checkpoint_tokens are
                               # recomputed), ~31k patches/s per GPU vs ~9k at 16384
