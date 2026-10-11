@@ -16,7 +16,6 @@ data:
     - /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/pretrain/pool.csv.gz
   splits: [pretrain]
   patch_mm: 16.0              # patch = the scan's native voxels, round(16 / spacing) per axis (~16 mm); nothing resampled
-  cache_dir: null             # no cache: workers decode the sources (zip members in memory); ~1M scans fit no cache
   num_workers: 16             # per GPU; each loads single scans (data.dataset.ScanBatches): I/O-bound (Lustre reads +
   prefetch: 4                 # gunzip ~0.5 s per scan), so more workers than the GPU's 8 cores; host RAM ~ ranks x
                               # workers x prefetch scans, whatever the batch

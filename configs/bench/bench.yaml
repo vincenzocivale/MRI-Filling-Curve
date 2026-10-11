@@ -26,7 +26,7 @@ fm:
     medicalnet: {configs: [medicalnet_resnet50_23dataset], workers: 7}
     nnunet: {configs: [nnunet_totalseg_mr_870], workers: 7}   # 871 (muscles) dropped: same net and data as 870
     sfc: {configs: [sfc_gdn2, sfc_gdn2_raster, sfc_gdn2_morton, sfc_gdn2_hilbert], workers: 7}   # ours (fm/sfc.py)
-    sfc_tune: {configs: [sfc_gdn2], workers: 7}   # pretraining tuning: the curve average only
+    sfc_tune: {configs: [sfc_gdn2], workers: 15}  # pretraining tuning: the curve average only; ~6.8k volumes, I/O-bound
   # what is stored (fm/worker.py `trim`): globals + maps at stride >= 16 (their means are volume features).
   # Computation is unchanged. (Stride-8 maps were stored for `dense` volumes until 2026-10-10: segmentation is
   # bench-segdec now.)
