@@ -35,7 +35,7 @@ DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
 class SegNet(nn.Module):
     """`encoder` (frozen: segrun) read along `curves` as in extraction -> bi tokens -> `decode` per token."""
 
-    def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int):
+    def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int, embed_only: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -45,7 +45,7 @@ class SegNet(nn.Module):
         self.encoder, self.patch_mm = encoder, patch_mm
         self.decode = PatchDecode((DECODE,) * 3, 2 * encoder.dim, n_out, norm=LayerNormNd, activation=nn.GELU)
         self.decode.apply(InitWeights_He(1e-2))
-        self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0)
+        self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only)
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
         """x [B, 1, *T] native voxels, spacing [B, 3] mm -> logits [B, n_out, *T]."""
@@ -132,7 +132,7 @@ class SFC(Wrapper):
 
     def seg_net(self, n_out: int, pretrained: bool = True):
         net = SegNet(self._encoder(pretrained), self.curves, int(self.run_cfg["seed"]),
-                     self.run_cfg["data"]["patch_mm"], n_out)
+                     self.run_cfg["data"]["patch_mm"], n_out, embed_only=self.args.get("encoder") == "none")
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
