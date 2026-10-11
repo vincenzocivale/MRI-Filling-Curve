@@ -88,12 +88,14 @@ class BudgetBatches:
     """Shuffled (seed + epoch) batches of whole scans filled up to `budget` patches (NaViT-style packing) and
     at most `max_batch` scans; a scan larger than the budget gets a batch of its own. Last partial batch dropped.
     With `weights`: an epoch is len(sizes) scans drawn with replacement in proportion to them (mixing).
-    Each epoch depends on (seed, epoch) only, so `seek(n)` puts the sampler after n batches (resume)."""
+    One endless stream for every rank: epochs (seed + epoch) back to back, rank r of `world` takes batches
+    r, r + world, ...; the first `start` batches of the stream are skipped. A step consumes `world` batches, so a
+    run resumes on any number of GPUs from the count consumed so far."""
 
     def __init__(self, sizes: list[int], budget: int, max_batch: int, seed: int,
-                 weights: torch.Tensor | None = None):
+                 weights: torch.Tensor | None = None, rank: int = 0, world: int = 1):
         self.sizes, self.budget, self.max_batch, self.seed, self.weights = sizes, budget, max_batch, seed, weights
-        self.epoch, self.skip = 0, 0
+        self.rank, self.world, self.start = rank, world, 0
 
     def batches(self, epoch: int):
         g = torch.Generator().manual_seed(self.seed + epoch)
@@ -108,19 +110,8 @@ class BudgetBatches:
             total += self.sizes[i]
 
     def __iter__(self):
-        epoch, skip = self.epoch, self.skip
-        self.epoch, self.skip = epoch + 1, 0
-        return itertools.islice(self.batches(epoch), skip, None)
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self.batches(0))
-
-    def seek(self, n: int) -> None:
-        """Next batch = the (n+1)-th since epoch 0 (epochs replayed from their seeds: no scan is read)."""
-        self.epoch = 0
-        while n >= (k := sum(1 for _ in self.batches(self.epoch))):
-            n, self.epoch = n - k, self.epoch + 1
-        self.skip = n
+        stream = itertools.chain.from_iterable(self.batches(e) for e in itertools.count())
+        return itertools.islice(stream, self.start + self.rank, None, self.world)
 
 
 def mix_weights(rows: pd.DataFrame, by: list[str], alpha: float) -> torch.Tensor | None:
@@ -132,9 +123,10 @@ def mix_weights(rows: pd.DataFrame, by: list[str], alpha: float) -> torch.Tensor
     return torch.from_numpy(n ** (alpha - 1))
 
 
-def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: int = 0,
-           **ds_kwargs) -> DataLoader:
-    """Training: `BudgetBatches` (shuffled, seeded, seekable), worker-persistent; with `data.patches_per_batch`,
+def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: int = 0, rank: int = 0,
+           world: int = 1, **ds_kwargs) -> DataLoader:
+    """Training: endless `BudgetBatches` over all rows, this rank's share (`rank` of `world`), worker-persistent;
+    with `data.patches_per_batch`,
     batches of up to batch_size whole scans holding at most that many patches, else batch_size scans; with
     `data.mix_alpha` (and `mix_by`), strata reweighted. Evaluation: ordered, batch_size scans."""
     store = VolumeStore(data["cache_dir"])
@@ -157,4 +149,5 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: i
             sizes.append(int(patch_grid(arr.shape, patch_dims(spacing, data["patch_mm"])).prod()))
     weights = mix_weights(rows, data.get("mix_by", ["dataset", "modality"]), float(data.get("mix_alpha", 1.0)))
     ds = PatchDataset(rows, store, data["patch_mm"], sizes=sizes, **ds_kwargs)
-    return DataLoader(ds, batch_sampler=BudgetBatches(sizes, budget, batch_size, seed, weights), **common)
+    return DataLoader(ds, batch_sampler=BudgetBatches(sizes, budget, batch_size, seed, weights, rank, world),
+                      **common)

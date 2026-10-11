@@ -53,12 +53,14 @@ def param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
 class Pretrainer:
     """LeJEPA pretraining on every row of the pretraining split: no held-out set; checkpoints are
     selected downstream on the probe's val split. All randomness derives from cfg['seed'].
-    Under torchrun: one process per GPU, each on a disjoint shard of the rows with its own
+    Under torchrun: one process per GPU, each taking its share of one batch stream with its own
     `batch_size` (effective batch = world size x batch_size); only rank 0 writes.
-    Every `ckpt_every` steps `ckpt.pt` holds the whole state (model with heads, optimizer, scheduler, every rank's
-    RNG; the sampler is placed by the step) and `history.csv` is rewritten: a run whose directory has a ckpt.pt
-    resumes from it (same config = same directory, so a chain of identical jobs continues one run), else from
-    `train.resume_from` (another run's ckpt.pt, e.g. a WSD decay branch)."""
+    Every `ckpt_every` steps `ckpt.pt` holds the whole state (model with heads, optimizer, scheduler, batches of
+    the stream consumed; the objective's RNG is reseeded from (seed, step, rank) every step) and `history.csv` is
+    rewritten. A run whose directory has a ckpt.pt resumes from it (same config = same directory, so a chain of
+    identical jobs continues one run), else from `train.resume_from` (another run's ckpt.pt, e.g. a WSD decay
+    branch), on any number of GPUs: the stream continues where it stopped (exactly as before on the same number;
+    the global batch, and so the effective lr per scan, follows the GPUs)."""
 
     def __init__(self, cfg: dict, run: RunDir):
         self.cfg, self.run, t = cfg, run, cfg["train"]
@@ -71,8 +73,8 @@ class Pretrainer:
         rows = pretrain_rows(cfg)
         if self.rank == 0:
             run.save_table(rows[["dataset", "subject", "sample_id"]], "split.csv")
-        self.loader = loader(rows.iloc[self.rank::world], cfg["data"], t["batch_size"], train=True,
-                             seed=self.seed + self.rank)
+        self.loader = loader(rows, cfg["data"], t["batch_size"], train=True, seed=self.seed, rank=self.rank,
+                             world=world)
         self.net = LeJEPA.from_config(cfg).to(self.device)
         self.model = DistributedDataParallel(self.net, device_ids=[self.device.index]) if world > 1 else self.net
         self.opt = torch.optim.AdamW(param_groups(self.net, t["weight_decay"]), lr=t["lr"], fused=True)
@@ -81,7 +83,7 @@ class Pretrainer:
         self.log = print if self.rank == 0 else (lambda *a, **k: None)
         self.log(f"[lejepa] world={world} curves={cfg['objective']['view_curves']} volumes={len(rows)} "
               f"params={sum(p.numel() for p in self.net.parameters()) / 1e6:.1f}M", flush=True)
-        self.step, self.skipped, self.seconds, self.hist = 0, 0, 0.0, []
+        self.step, self.consumed, self.skipped, self.seconds, self.hist = 0, 0, 0, 0.0, []
         ckpt = run.path / "ckpt.pt"
         src = ckpt if ckpt.exists() else t.get("resume_from")
         if src:
@@ -89,37 +91,22 @@ class Pretrainer:
 
     def _restore(self, path: Path) -> None:
         c = torch.load(path, map_location="cpu", weights_only=False)
-        if c["world"] != self.world:
-            raise RuntimeError(f"{path}: saved with {c['world']} GPUs, running on {self.world} (rank shards differ)")
         self.net.load_state_dict(c["model"])
         self.opt.load_state_dict(c["opt"])
         self.sched.load_state_dict(c["sched"])
-        r = c["rng"][self.rank]
-        torch.set_rng_state(r["cpu"])
-        torch.cuda.set_rng_state(r["cuda"], self.device)
-        self.gen.set_state(r["gen"])
-        self.step, self.skipped, self.seconds = c["step"], c["skipped"], c["seconds"]
-        self.loader.batch_sampler.seek(self.step)
+        self.step, self.consumed, self.skipped, self.seconds = c["step"], c["consumed"], c["skipped"], c["seconds"]
+        self.loader.batch_sampler.start = self.consumed
         if (path.parent / "history.csv").exists():
             h = pd.read_csv(path.parent / "history.csv")
             self.hist = h[h["step"] <= self.step].to_dict("records")
-        self.log(f"[lejepa] resumed {path} at step {self.step}", flush=True)
+        self.log(f"[lejepa] resumed {path} at step {self.step} ({c['world']} -> {self.world} GPUs)", flush=True)
 
     def _checkpoint(self) -> None:
-        """Collective (every rank's RNG gathered on rank 0); written to a temporary file, then renamed."""
-        rng = {"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(self.device),
-               "gen": self.gen.get_state()}
-        rngs = [None] * self.world
-        if dist.is_initialized():
-            dist.all_gather_object(rngs, rng)
-        else:
-            rngs = [rng]
-        if self.rank != 0:
-            return
+        """Rank 0; written to a temporary file, then renamed."""
         tmp = self.run.path / "ckpt.pt.tmp"
-        torch.save({"step": self.step, "world": self.world, "skipped": self.skipped,
-                    "seconds": self.seconds + time.time() - self.t0, "model": self.net.state_dict(),
-                    "opt": self.opt.state_dict(), "sched": self.sched.state_dict(), "rng": rngs}, tmp)
+        torch.save({"step": self.step, "consumed": self.consumed, "world": self.world, "skipped": self.skipped,
+                    "seconds": time.time() - self.t0, "model": self.net.state_dict(),
+                    "opt": self.opt.state_dict(), "sched": self.sched.state_dict()}, tmp)
         os.replace(tmp, self.run.path / "ckpt.pt")
         self.run.save_table(pd.DataFrame(self.hist), "history.csv")
 
@@ -145,6 +132,7 @@ class Pretrainer:
             batch = next(batches)   # the previous step already synced (isfinite(gnorm)): this wait is a GPU stall
             wait += time.time() - t_w
             patches += int(batch["grid"].prod(1).sum())
+            gen.manual_seed((self.seed * 1_000_003 + step) * 4096 + self.rank)  # resumable on any number of GPUs
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = self.model(to_device(batch, self.device), gen)
             self.opt.zero_grad(set_to_none=True)
@@ -155,7 +143,7 @@ class Pretrainer:
             else:
                 self.skipped += 1
             self.sched.step()
-            self.step = step
+            self.step, self.consumed = step, self.consumed + self.world
             if step % t.get("log_every", 50) == 0 or step == t["steps"]:
                 dt = time.time() - t_log
                 hist.append({"step": step, **{k: v.item() for k, v in out.items()}, "grad_norm": gnorm.item(),
@@ -166,7 +154,7 @@ class Pretrainer:
                 self.log("[lejepa] " + " ".join(f"{k}={v:.4g}" for k, v in hist[-1].items()), flush=True)
             if save and (step % t["save_every"] == 0 or step == t["steps"]):
                 torch.save(self.net.encoder.state_dict(), self.run.path / f"encoder_step{step:06d}.pt")
-            if step % t.get("ckpt_every", 500) == 0 or step == t["steps"]:
+            if save and (step % t.get("ckpt_every", 500) == 0 or step == t["steps"]):
                 self._checkpoint()
         if not save:
             return
