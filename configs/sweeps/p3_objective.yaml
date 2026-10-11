@@ -1,5 +1,5 @@
 # Phase 3 (notes/PIANO_TARATURA.md, D6): the objective's task/data choices, 12 random draws, 760 steps (d=512/8, 2 GPUs, ~3 h), skill
-# (mean over tasks); the SSL loss does not compare across objectives. Before launching: train.lr from p1_lr and the
+# (mean over tasks); the SSL loss does not compare across objectives. train.lr from p1_lr; before launching, the
 # architecture fixed at gate G2 (view_curves, view_pos, patch_mm) in `fixed`. Then: the 3 best with a second seed +
 # the dense signal, and the winner with objective.top_levels: [] (A/B of the volume/session levels).
 name: p3_objective
@@ -7,7 +7,7 @@ n: 12
 seed: 0
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
-fixed: {train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
         data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8}
 space:
   objective.mask_ratio: {choice: [[0.1, 0.3], [0.2, 0.5], [0.4, 0.7]]}

@@ -1,11 +1,11 @@
 # Phase 2 (notes/PIANO_TARATURA.md, D3-D5): architecture arms, 760 steps (300M patches, ~0.13 epoch), d=512/8 on 2 GPUs (~3 h), skill + dense signal.
-# Set train.lr in `fixed` from p1_lr first. A4 (shuffle + view position) only if A3 beats A0: run it then.
+# train.lr from p1_lr (final SSL loss 0.508/0.511/0.536/0.613 at 3e-4/6.5e-4/1.4e-3/3e-3: the log-parabola minimum). A4 (shuffle + view position) only if A3 beats A0: run it then.
 # A5 (8 mm): patch-unit geometry x2, same mm as at 16 mm (levels 32/64 mm, local views 48-128 mm, mask cubes 16-64 mm);
 # the batch is in patches, so its compute equals the others' (it sees ~7x fewer volumes).
 name: p2_arch
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
-fixed: {train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
         data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8}
 runs:
   - {}                                            # A0: base
@@ -17,4 +17,4 @@ runs:
      objective.max_view_tokens: 32768}  # A5: the view cap x8 too (a brain is ~18k patches at 8 mm)
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
 dense: {task: tumor_ucsf, iters: 2500}
-slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "04:30:00"}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "05:00:00"}
