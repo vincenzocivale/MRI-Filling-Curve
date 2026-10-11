@@ -6,9 +6,9 @@ Configs: `runs` (a list of explicit configs, e.g. the arms of an ablation) or `n
 {uniform: [lo, hi]} | {choice: [...]}; with `scales: {key: base}` one draw multiplies every base (several parameters on
 one axis). One SLURM job per config (preset 1gpu + the `slurm` --set fields, e.g. gres: "gpu:2"), so the evaluations
 wait in no second queue: <run>/job.sh pretrains (torchrun on the job's GPUs, output_root <root>/<name>/<i>), then
-- `tasks` (non-empty): skill (bench-extract --tune + bench-probe --tune -> <run>/tune/tune.csv),
+- `tasks` (non-empty): skill (bench-extract --tune, split over the GPUs, + bench-probe --tune -> <run>/tune/tune.csv),
 - `dense: {task, iters}`: segdec pilot, best val Dice (bench-segdec --val-only -> <run>/segdec/),
-the two side by side on GPUs 0 and 1 when the job has two. <root>/<name>/sweep.csv lists configs and jobs.
+the probe and the pilot side by side on GPUs 0 and 1 when the job has two. <root>/<name>/sweep.csv lists configs and jobs.
 (boost_qos_dbg takes at most 2 submitted jobs per user: no place for evaluations of a whole sweep.)
 """
 from __future__ import annotations
@@ -41,18 +41,23 @@ def draw(space: dict, rng: random.Random) -> dict:
 
 
 def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
+    """Pretraining on all the job's GPUs, then: the tuning extraction split over them (--shard), and the probe (GPU 0)
+    beside the segdec pilot (GPU 1, or after the probe with one GPU)."""
     over = " ".join(shlex.quote(f"{k}={json.dumps(v)}") for k, v in cfg.items())
-    evals, fm = [], f"--fm-set checkpoint={run}"
-    if spec.get("tasks"):
-        evals.append(f"sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune {fm} --out {run}/features"
-                     f" && sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune"
-                     f" --tasks {' '.join(spec['tasks'])} --out {run}/tune --override fm.out_root={run}/features")
-    if d := spec.get("dense"):
-        evals.append(f"sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --tasks {d['task']}"
-                     f" --iters {d['iters']} --val-only {fm} --override segdec.out={run}/segdec")
+    fm = f"--fm-set checkpoint={run}"
     lines = ["#!/bin/bash", f"# {run.name} of sweep {spec['name']}: pretraining, then its evaluations", "set -eo pipefail",
              (f"torchrun --standalone --nproc_per_node={gpus} -m sfc_gdn2.cli pretrain {spec['config']} --override {over}"
               f" output_root={run}")]
+    evals = []
+    if spec.get("tasks"):
+        lines += [f"CUDA_VISIBLE_DEVICES={g} sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune {fm}"
+                  f" --shard {g}/{gpus} --out {run}/features & x{g}=$!" for g in range(gpus)]
+        lines += [f"wait $x{g}" for g in range(gpus)]
+        evals.append(f"sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune --tasks {' '.join(spec['tasks'])}"
+                     f" --out {run}/tune --override fm.out_root={run}/features")
+    if d := spec.get("dense"):
+        evals.append(f"sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --tasks {d['task']}"
+                     f" --iters {d['iters']} --val-only {fm} --override segdec.out={run}/segdec")
     if gpus > 1:
         lines += [f"CUDA_VISIBLE_DEVICES={g} bash -c {shlex.quote(e)} & p{g}=$!" for g, e in enumerate(evals)]
         lines += [f"wait $p{g}" for g in range(len(evals))]
