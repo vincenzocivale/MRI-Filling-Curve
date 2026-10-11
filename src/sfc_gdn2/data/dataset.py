@@ -152,7 +152,8 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: i
     store = VolumeStore(data["cache_dir"])
     workers = int(data.get("num_workers", 8))
     common = {"num_workers": workers, "collate_fn": collate, "pin_memory": True,
-              "persistent_workers": train and workers > 0, "prefetch_factor": 4 if workers else None}
+              "persistent_workers": train and workers > 0,
+              "prefetch_factor": int(data.get("prefetch", 4)) if workers else None}  # batches in flight per worker
     if not train:
         return DataLoader(PatchDataset(rows, store, data["patch_mm"], **ds_kwargs), batch_size=batch_size, **common)
     rows = rows.reset_index(drop=True)
