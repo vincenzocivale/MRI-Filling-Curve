@@ -5,11 +5,9 @@ import json
 import os
 import platform
 import random
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 import yaml
 
@@ -47,28 +45,13 @@ def environment() -> dict:
             "host": platform.node(), "pid": os.getpid()}
 
 
-@dataclass
-class RunDir:
-    """`<root>/<prefix>-<sha1(cfg)>/`: identical configs land in the same directory."""
-
-    path: Path
-
-    @classmethod
-    def create(cls, root: str | Path, cfg: dict, prefix: str) -> RunDir:
-        run = cls(Path(root) / f"{prefix}-{stable_id(cfg)}")
-        run.path.mkdir(parents=True, exist_ok=True)
-        with open(run.path / "config.yaml", "w") as f:
-            yaml.safe_dump(cfg, f, sort_keys=False)
-        run.save_json(environment(), "environment.json")
-        return run
-
-    @property
-    def config(self) -> dict:
-        return load_yaml(self.path / "config.yaml")
-
-    def save_json(self, obj, name: str) -> None:
-        with open(self.path / name, "w") as f:
-            json.dump(obj, f, indent=2)
-
-    def save_table(self, df: pd.DataFrame, name: str) -> None:
-        df.to_csv(self.path / name, index=False)
+def run_dir(root: str | Path, cfg: dict, prefix: str) -> Path:
+    """`<root>/<prefix>-<sha1(cfg)>/` with config.yaml and environment.json: identical configs land in the same
+    directory."""
+    path = Path(root) / f"{prefix}-{stable_id(cfg)}"
+    path.mkdir(parents=True, exist_ok=True)
+    with open(path / "config.yaml", "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    with open(path / "environment.json", "w") as f:
+        json.dump(environment(), f, indent=2)
+    return path

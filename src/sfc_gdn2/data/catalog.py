@@ -185,10 +185,6 @@ def soop(raw: Path) -> pd.DataFrame:
     return df
 
 
-def unlabelled(raw: Path, name: str) -> pd.DataFrame:  # SALD, Petfrog
-    return _bids(raw / name, name)
-
-
 # ---- non-BIDS datasets
 
 def ixi(raw: Path) -> pd.DataFrame:  # labels: IXI.csv (= IXI.xls converted with xlrd; SEX_ID 1=m, 2=f)
@@ -404,8 +400,9 @@ def dedup(fomo: pd.DataFrame, orig: pd.DataFrame, raw: Path) -> tuple[pd.DataFra
 
 def build(raw: Path, mrrate_root: Path, region_csv: Path) -> pd.DataFrame:
     orig = pd.concat([abide(raw), aomic(raw), calgary(raw), corr_nyu2(raw), dlbs(raw), long579(raw), pixar(raw),
-                      soop(raw), unlabelled(raw, "SALD"), unlabelled(raw, "Petfrog"), ixi(raw), oasis1(raw),
-                      oasis2(raw), ucsf_pdgm(raw), upenn_gbm(raw), totalseg(raw)], ignore_index=True)
+                      soop(raw), _bids(raw / "SALD", "SALD"), _bids(raw / "Petfrog", "Petfrog"),  # unlabelled
+                      ixi(raw), oasis1(raw), oasis2(raw), ucsf_pdgm(raw), upenn_gbm(raw), totalseg(raw)],
+                     ignore_index=True)
     fomo, orig = dedup(fomo300k(raw / "FOMO300K"), orig, raw)
     mr = mrrate_labels(mrrate(mrrate_root), mrrate_root, region_csv)
     df = pd.concat([orig.drop(columns="_id"), fomo, mr], ignore_index=True)

@@ -294,7 +294,7 @@ class LeJEPA(nn.Module):
 
     def forward(self, vols: dict, generator: torch.Generator) -> dict[str, torch.Tensor]:
         """vols (`dataset.to_device`): patches = per scan [N_b, P_b] native voxel values, spacing [B,3] mm,
-        k [B,3] voxels per patch axis, grid [B,3] patch grid; optional session [B] (any ids, default: one per scan)."""
+        k [B,3] voxels per patch axis, grid [B,3] patch grid, session [B] (any ids)."""
         grid, gen = vols["grid"], generator
         b, n_patch = len(grid), int(grid.prod(1).max())
         xyz = grid_coords(grid, n_patch)                                                  # [B,N,3]
@@ -366,7 +366,7 @@ class LeJEPA(nn.Module):
             out[f"pairs_cell{cs}"] = torch.tensor(float(len(p)), device=z.device)
         tops = torch.cat(tops, 1)                                                          # [B,V,2d], globals first
         groups = {"volume": torch.arange(b, device=grid.device),
-                  "session": vols.get("session", torch.arange(b, device=grid.device)).unique(return_inverse=True)[1]}
+                  "session": vols["session"].unique(return_inverse=True)[1]}
         for name, head in self.top.items():
             grp = groups[name]
             n = int(grp.max()) + 1

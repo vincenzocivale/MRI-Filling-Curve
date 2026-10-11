@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -12,7 +13,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from .data.dataset import loader, session_ids, to_device
-from .io import RunDir, seed_all
+from .io import run_dir, seed_all
 from .lejepa import LeJEPA
 
 # grids differ ~30x in size between a brain and a whole body: with the default allocator the cache
@@ -62,7 +63,7 @@ class Pretrainer:
     branch), on any number of GPUs: the stream continues where it stopped (exactly as before on the same number;
     the global batch, and so the effective lr per scan, follows the GPUs)."""
 
-    def __init__(self, cfg: dict, run: RunDir):
+    def __init__(self, cfg: dict, run: Path):
         self.cfg, self.run, t = cfg, run, cfg["train"]
         self.seed = int(cfg["seed"])
         seed_all(self.seed)
@@ -72,12 +73,11 @@ class Pretrainer:
         torch.cuda.set_device(self.device)
         rows = pretrain_rows(cfg)
         if self.rank == 0:
-            run.save_table(rows[["dataset", "subject", "sample_id"]], "split.csv")
-        self.loader = loader(rows, cfg["data"], t["batch_size"], train=True, seed=self.seed, rank=self.rank,
-                             world=world)
-        self.net = LeJEPA.from_config(cfg).to(self.device)
+            rows[["dataset", "subject", "sample_id"]].to_csv(run / "split.csv", index=False)
         ses = session_ids(rows)  # the objective's session level (scans of one session batched together)
-        self.session = torch.tensor(ses) if ses is not None else torch.arange(len(rows))
+        self.loader = loader(rows, cfg["data"], t["batch_size"], ses, seed=self.seed, rank=self.rank, world=world)
+        self.net = LeJEPA.from_config(cfg).to(self.device)
+        self.session = torch.tensor(ses)
         self.model = DistributedDataParallel(self.net, device_ids=[self.device.index]) if world > 1 else self.net
         self.opt = torch.optim.AdamW(param_groups(self.net, t["weight_decay"]), lr=t["lr"], fused=True)
         self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lambda s: lr_factor(s, t))
@@ -86,7 +86,7 @@ class Pretrainer:
         self.log(f"[lejepa] world={world} curves={cfg['objective']['view_curves']} volumes={len(rows)} "
               f"params={sum(p.numel() for p in self.net.parameters()) / 1e6:.1f}M", flush=True)
         self.step, self.consumed, self.skipped, self.seconds, self.hist = 0, 0, 0, 0.0, []
-        ckpt = run.path / "ckpt.pt"
+        ckpt = run / "ckpt.pt"
         src = ckpt if ckpt.exists() else t.get("resume_from")
         if src:
             self._restore(Path(src))
@@ -105,16 +105,12 @@ class Pretrainer:
 
     def _checkpoint(self) -> None:
         """Rank 0; written to a temporary file, then renamed."""
-        tmp = self.run.path / "ckpt.pt.tmp"
+        tmp = self.run / "ckpt.pt.tmp"
         torch.save({"step": self.step, "consumed": self.consumed, "world": self.world, "skipped": self.skipped,
                     "seconds": time.time() - self.t0, "model": self.net.state_dict(),
                     "opt": self.opt.state_dict(), "sched": self.sched.state_dict()}, tmp)
-        os.replace(tmp, self.run.path / "ckpt.pt")
-        self.run.save_table(pd.DataFrame(self.hist), "history.csv")
-
-    def _batches(self):
-        while True:
-            yield from self.loader
+        os.replace(tmp, self.run / "ckpt.pt")
+        pd.DataFrame(self.hist).to_csv(self.run / "history.csv", index=False)
 
     def fit(self) -> None:
         t = self.cfg["train"]
@@ -122,9 +118,9 @@ class Pretrainer:
         save = self.rank == 0
         clip = float(t.get("grad_clip", float("inf")))
         self.t0 = t0 = time.time() - self.seconds
-        batches, wait, patches, t_log = self._batches(), 0.0, 0, time.time()  # wait share, patches/s
+        batches, wait, patches, t_log = iter(self.loader), 0.0, 0, time.time()  # endless; wait share, patches/s
         if save and self.step == 0:
-            torch.save(self.net.encoder.state_dict(), self.run.path / "encoder_step000000.pt")  # init baseline
+            torch.save(self.net.encoder.state_dict(), self.run / "encoder_step000000.pt")  # init baseline
         if self.step >= t["steps"]:
             self.log(f"[lejepa] already at step {self.step} of {t['steps']}", flush=True)
             return
@@ -156,25 +152,23 @@ class Pretrainer:
                 wait, patches, t_log = 0.0, 0, time.time()
                 self.log("[lejepa] " + " ".join(f"{k}={v:.4g}" for k, v in hist[-1].items()), flush=True)
             if save and (step % t["save_every"] == 0 or step == t["steps"]):
-                torch.save(self.net.encoder.state_dict(), self.run.path / f"encoder_step{step:06d}.pt")
+                torch.save(self.net.encoder.state_dict(), self.run / f"encoder_step{step:06d}.pt")
             if save and (step % t.get("ckpt_every", 500) == 0 or step == t["steps"]):
                 self._checkpoint()
         if not save:
             return
-        self.run.save_table(pd.DataFrame(hist), "history.csv")
-        self.run.save_json({**hist[-1],
-                            "peak_vram_mb": torch.cuda.max_memory_allocated(self.device) / 2 ** 20},
-                           "metrics.json")
-        torch.save(self.net.state_dict(), self.run.path / "model.pt")  # encoder + objective heads
+        with open(self.run / "metrics.json", "w") as f:  # the last step: logged (hist[-1]), history.csv written
+            json.dump(hist[-1], f, indent=2)
+        torch.save(self.net.state_dict(), self.run / "model.pt")  # encoder + objective heads
 
 
 def pretrain(cfg: dict) -> Path | None:
     """Returns the run directory on rank 0 (None on other ranks)."""
     if "WORLD_SIZE" in os.environ:
         dist.init_process_group("nccl")
-    run = RunDir.create(cfg["output_root"], cfg, prefix="lejepa")
+    run = run_dir(cfg["output_root"], cfg, prefix="lejepa")
     trainer = Pretrainer(cfg, run)
     trainer.fit()
     if dist.is_initialized():
         dist.destroy_process_group()
-    return run.path if trainer.rank == 0 else None
+    return run if trainer.rank == 0 else None

@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import gzip
-import hashlib
-import json
-import os
-import uuid
 import zipfile
 from pathlib import Path
 
@@ -13,14 +9,6 @@ import nibabel.orientations as nio
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-
-def _atomic_write(dest: Path, write) -> None:
-    """Unique tmp name + os.replace: safe when several workers/runs fill the same cache."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(f"{dest.name}.{os.getpid()}.{uuid.uuid4().hex}.part")
-    write(tmp)
-    os.replace(tmp, dest)
 
 
 def patch_dims(spacing, patch_mm: float) -> tuple[int, int, int]:
@@ -67,67 +55,18 @@ def load_canonical(path, frame: int | None = None) -> tuple[np.ndarray, tuple, f
     return np.ascontiguousarray(raw), tuple(zooms), slope or 1.0, inter
 
 
-class VolumeStore:
+def decode(path, frame: int | None = None) -> tuple[np.ndarray, tuple, tuple]:
     """A scan exactly as acquired: canonical orientation (no value changed), stored dtype, native voxels.
-    `load` -> (raw array, spacing mm [3], (a, c)): a * raw + c is the scan's value (header slope and
-    intercept) divided by the 99th percentile of its voxels > 0, i.e. ~[0, 1] without clipping anything.
-
-    The first access decodes the NIfTI (extracting it from its zip if needed) and writes the array to
-    `cache_dir/native/` (+ a .json with spacing and scale); every later access is a memory-mapped
-    .npy read, which is what keeps the data loader off the critical path. `cache_dir=None`: every access
-    decodes the source (zip members in memory), nothing is written (the pretraining pool, ~1M scans, would
-    not fit any cache we have).
-    """
-
-    def __init__(self, cache_dir: str | Path | None):
-        self.root = Path(cache_dir) if cache_dir else None
-
-    @staticmethod
-    def decode(path, frame: int | None = None) -> tuple[np.ndarray, tuple, tuple]:
-        """-> (raw, spacing, (a, c)); a 4D+ scan's `frame`, scaled on its own (b0 and DWI frames differ)."""
-        arr, spacing, slope, inter = load_canonical(path, frame)
-        # the 99th percentile of the voxels > 0, on every 4th voxel in float32 (in float64 on all of them it was a
-        # quarter of the loader's time and up to 1 GB per worker on the big scans)
-        val = arr.reshape(-1)[::4].astype(np.float32) * slope + inter
-        fg = val[val > 0]
-        scale = 1.0 / max(float(np.percentile(fg if fg.size else val, 99)), 1e-6)
-        return arr, tuple(spacing), (slope * scale, inter * scale)
-
-    def _cache_path(self, path: str) -> Path:
-        key = hashlib.sha1(f"{path}|native-v1".encode()).hexdigest()[:20]
-        return self.root / "native" / key[:2] / f"{key}.npy"
-
-    def _materialize(self, path: str) -> Path:
-        if not path.startswith("zip://"):
-            return Path(path)
-        archive, member = path[len("zip://"):].split("::", 1)
-        archive = Path(archive)
-        # archive.parent.name disambiguates layouts where every subject's archive is `ses-01.zip`.
-        dest = self.root / archive.parent.name / archive.stem / member
-        if not dest.exists():
-            def write(tmp):
-                with zipfile.ZipFile(archive) as zf, zf.open(member) as src, open(tmp, "wb") as out:
-                    out.write(src.read())
-            _atomic_write(dest, write)
-        return dest
-
-    def load(self, path: str, frame: int | None = None) -> tuple[np.ndarray, tuple, tuple]:
-        if self.root is None:
-            return self.decode(path, frame)
-        arr_path = self._cache_path(path if frame is None else f"{path}#{frame}")
-        meta_path = arr_path.with_suffix(".json")
-        if not meta_path.exists():
-            arr, spacing, affine = self.decode(str(self._materialize(path)), frame)
-            meta = {"spacing": spacing, "affine": list(affine)}
-
-            def write_arr(tmp):
-                with open(tmp, "wb") as f:
-                    np.save(f, arr)
-            _atomic_write(arr_path, write_arr)
-            _atomic_write(meta_path, lambda tmp: Path(tmp).write_text(json.dumps(meta)))
-            return arr, spacing, affine
-        meta = json.loads(meta_path.read_text())
-        return np.load(arr_path, mmap_mode="r"), tuple(meta["spacing"]), tuple(meta["affine"])
+    `path`: a file, a zip member (read in memory, nothing written) or a loaded image -> (raw, spacing mm [3], (a, c)):
+    a * raw + c is the scan's value (header slope and intercept) divided by the 99th percentile of its voxels > 0,
+    i.e. ~[0, 1] without clipping anything; a 4D+ scan's `frame`, scaled on its own (b0 and DWI frames differ)."""
+    arr, spacing, slope, inter = load_canonical(path, frame)
+    # the 99th percentile of the voxels > 0, on every 4th voxel in float32 (in float64 on all of them it was a
+    # quarter of the loader's time and up to 1 GB per worker on the big scans)
+    val = arr.reshape(-1)[::4].astype(np.float32) * slope + inter
+    fg = val[val > 0]
+    scale = 1.0 / max(float(np.percentile(fg if fg.size else val, 99)), 1e-6)
+    return arr, tuple(spacing), (slope * scale, inter * scale)
 
 
 def patchify(vol: torch.Tensor, k) -> torch.Tensor:

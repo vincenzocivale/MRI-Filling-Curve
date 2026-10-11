@@ -85,15 +85,13 @@ def bench_extract(cfg: dict, args) -> None:
     cfgs = [override(load_config(f"configs/fm/{s}.yaml"), args.fm_set) | {"save": fm_cfg["save"][s] | {"dtype": "float16"}}
             for s in group["configs"]]
     extract(cfgs, vols["input"].tolist(), [root / s for s in group["configs"]], device=args.device,
-            ids=vols["id"].tolist(), dense=vols["dense"].tolist(), workers=int(group["workers"]),
-            verify_shared=args.verify_shared)
+            ids=vols["id"].tolist(), workers=int(group["workers"]))
 
 
 def bench_probe(cfg: dict, args) -> None:
     """Probes of the benchmark tasks on the stored features of `--models` (default: every model under out_root),
     on the volumes all of them have; `--cache-only` just builds each model's `_globals.pt`."""
     from .bench import probe as bp
-    from .io import load_yaml
     root = Path(cfg["fm"]["out_root"])
     names = args.models or sorted(p.name for p in root.iterdir() if p.is_dir())
     models = {m: root / m for m in names}
@@ -119,7 +117,6 @@ def bench_segdec(cfg: dict, args) -> None:
     --group g [--shard i/n|auto/n]` caches a group's preprocessed inputs; `--stage train --models m.. --init
     pretrained|random` trains and tests (`--tasks`: default every seg task; `--sample k`, `--iters n`: pilots)."""
     from .bench import segdec as bs
-    from .io import load_yaml
     tasks = load_yaml(cfg["probe"]["tasks"])
     tasks = {t: tasks[t] for t in (args.tasks or [t for t, c in tasks.items() if c["type"] == "seg"])}
     vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv", low_memory=False, dtype={"session": str})
@@ -170,7 +167,6 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=8, help="pretrain-pool: header-reading processes")
     ap.add_argument("--override", nargs="+", default=[], metavar="KEY=VALUE",
                     help="config fields, dotted keys and YAML values, e.g. train.steps=200 data.manifests=[a.csv]")
-    ap.add_argument("--verify-shared", action="store_true", help="bench-extract: check the shared preprocessing")
     args = ap.parse_args()
     if args.command == "fm" and not ((args.images or args.csv) and args.out):
         ap.error("fm needs --images or --csv, and --out")

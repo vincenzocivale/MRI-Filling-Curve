@@ -101,10 +101,10 @@ class SFC(Wrapper):
     def preprocess(self, image: Image) -> dict:
         if not isinstance(image, str):
             raise TypeError("sfc: single-modality, pass a NIfTI path")
-        from ..data.volume import VolumeStore, open_image, patch_dims, patch_grid
+        from ..data.volume import decode, open_image, patch_dims, patch_grid
 
         img = open_image(image)
-        arr, spacing, (a, c) = VolumeStore.decode(img)
+        arr, spacing, (a, c) = decode(img)
         k = patch_dims(spacing, self.run_cfg["data"]["patch_mm"])
         ornt = nio.io_orientation(img.affine)
         src = np.linalg.inv(nio.inv_ornt_aff(ornt, img.shape[:3]))  # source voxel -> canonical voxel
@@ -122,22 +122,24 @@ class SFC(Wrapper):
     def seg_context(self, prepared: dict) -> torch.Tensor:
         return prepared["spacing"]
 
-    def seg_net(self, n_out: int, pretrained: bool = True):
+    def _encoder(self, pretrained: bool = True):
         from ..model import Encoder
 
         enc = Encoder.from_config(self.run_cfg)
         if pretrained:
             enc.load_state_dict(torch.load(self.ckpt, map_location="cpu"))
-        net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out)
+        return enc
+
+    def seg_net(self, n_out: int, pretrained: bool = True):
+        net = SegNet(self._encoder(pretrained), self.curves, int(self.run_cfg["seed"]),
+                     self.run_cfg["data"]["patch_mm"], n_out)
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
         if self._extract is None:
-            from ..model import Encoder, encoder_extractor
+            from ..model import encoder_extractor
 
-            enc = Encoder.from_config(self.run_cfg)
-            enc.load_state_dict(torch.load(self.ckpt, map_location="cpu"))
-            enc = enc.to(self.device).eval().requires_grad_(False)
+            enc = self._encoder().to(self.device).eval().requires_grad_(False)
             obj = self.run_cfg["objective"]
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
                                               obj.get("fg_threshold", 0.05), crop=bool(self.args.get("crop")),
@@ -163,5 +165,4 @@ class SFC(Wrapper):
         return super().provenance() | {"checkpoint": str(self.ckpt), "torch": torch.__version__}
 
 
-def build(cfg: dict, device: str) -> SFC:
-    return SFC(cfg, device)
+build = SFC

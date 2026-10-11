@@ -13,7 +13,7 @@ import itertools
 
 import torch
 
-CURVES = ("raster", "snake", "morton", "hilbert", "random", "shuffle")
+CURVES = ("raster", "morton", "hilbert", "random", "shuffle")
 
 
 def grid_coords(grid: torch.Tensor, n_patch: int) -> torch.Tensor:
@@ -86,10 +86,6 @@ def keys(name: str, c: torch.Tensor, dims: torch.Tensor, seed: int = 17,
     x, y, z = c.unbind(-1)
     ny, nz = dims[..., 1], dims[..., 2]
     if name == "raster":
-        return (x * ny + y) * nz + z
-    if name == "snake":
-        y = torch.where(x % 2 == 0, y, ny - 1 - y)
-        z = torch.where((x + c[..., 1]) % 2 == 0, z, nz - 1 - z)
         return (x * ny + y) * nz + z
     if name == "morton":
         return _morton(c, bits)

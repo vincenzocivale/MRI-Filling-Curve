@@ -131,10 +131,6 @@ class Encoder(nn.Module):
                    m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
                    **m.get("embed", {}))
 
-    def tokens(self, patches: torch.Tensor, w: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        """[...,N,P] native patches of one scan, its `patch_embed.weights` [P,d] (+ [...,N] mask) -> [...,N,d]."""
-        return self.apply_mask(self.patch_embed(patches, w), mask)
-
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         """[...,N,d] tokens, masked ones replaced by the learned mask token."""
         return x if mask is None else torch.where(mask[..., None], self.mask_token.to(x.dtype), x)
@@ -161,8 +157,8 @@ class Encoder(nn.Module):
         return out.new_zeros(*valid.shape, out.shape[-1]).index_put((valid,), out)
 
 
-# scans on the device (`dataset.to_device`) -> {name: [B,F] (volume level) or [B,N,F] (patch level, N = the
-# batch's largest grid)}
+# scans on the device (`dataset.to_device`) -> {"bi": [B,N,F] (patch level, N = the batch's largest grid),
+# "mean": [B,F] (volume level)}
 Extractor = Callable[[dict], dict[str, torch.Tensor]]
 
 
@@ -170,8 +166,8 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
                       crop: bool = False, embed_only: bool = False) -> Extractor:
     """Each volume read along each of `curves` over its whole patch grid (untransformed view), forwards and
     backwards; `bi` = forward ++ backward output per patch, averaged over the curves (test-time augmentation).
-    patch: `bi` per patch (raster order). volume: `mean`, bi averaged over the foreground patches (the top of the
-    pretraining pyramid). both: the two (the benchmark wrapper, fm/sfc.py).
+    patch: `bi` per patch (raster order). both: `bi` and `mean`, bi averaged over the foreground patches (the top of
+    the pretraining pyramid; the benchmark wrapper, fm/sfc.py).
     crop: only the foreground's bounding box is read, as the training's global views (patches outside: bi 0);
     embed_only: no encoder, bi = the patch embedding twice (what the encoder adds to its input). The view position
     (`Encoder.pos`) is the coordinate inside the box read."""
@@ -195,7 +191,8 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
         rev = torch.where(valid, (n[:, None] - 1 - j).clamp_min(0), j)
         t = torch.zeros(len(grid), xyz.shape[1], encoder.dim, device=grid.device)
         for i, x in enumerate(vols["patches"]):                             # per scan: its own kernel weights
-            t[i, : len(x)] = encoder.tokens(x, encoder.patch_embed.weights(vols["spacing"][i], vols["k"][i].tolist()))
+            kw = encoder.patch_embed.weights(vols["spacing"][i], vols["k"][i].tolist())
+            t[i, : len(x)] = encoder.patch_embed(x, kw)
         if encoder.pos is not None:
             t = t + encoder.pos(local) * inside[..., None]
         bi = torch.cat([t, t], -1) * inside[..., None] if embed_only else 0
@@ -212,5 +209,5 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
             return {"bi": bi}
         w = (fg | (inside & ~fg.any(1, keepdim=True))).float()
         mean = (w[..., None] * bi).sum(1) / w.sum(1, keepdim=True)
-        return {"mean": mean} if level == "volume" else {"bi": bi, "mean": mean}
+        return {"bi": bi, "mean": mean}
     return extract

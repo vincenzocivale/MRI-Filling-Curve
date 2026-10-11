@@ -8,9 +8,11 @@ and scans with no positive spacing are dropped. The header pass reads ~1M header
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
 import hashlib
 import io
+import itertools
 import math
 import multiprocessing as mp
 import zipfile
@@ -49,8 +51,8 @@ def _header(f, name: str) -> tuple[tuple, tuple]:
 def _headers(paths: list[str]) -> list:
     """[(shape, zooms) | None] of files / members of ONE archive (one open per archive)."""
     out = []
-    zf = zipfile.ZipFile(paths[0][len("zip://"):].split("::", 1)[0]) if paths[0].startswith("zip://") else None
-    try:
+    zipped = paths[0].startswith("zip://")
+    with zipfile.ZipFile(paths[0][len("zip://"):].split("::", 1)[0]) if zipped else contextlib.nullcontext() as zf:
         for p in paths:
             try:
                 if zf is None:
@@ -62,9 +64,6 @@ def _headers(paths: list[str]) -> list:
                         out.append(_header(f, member))
             except Exception:  # noqa: BLE001 -- unreadable scan: dropped from the pool
                 out.append(None)
-    finally:
-        if zf is not None:
-            zf.close()
     return out
 
 
@@ -79,12 +78,9 @@ def with_patches(df: pd.DataFrame, patch_mm: float, workers: int = 8) -> pd.Data
     """Header shape / spacing / frames / n_patch per row; unusable rows are dropped."""
     archive = df["path"].str.split("::").str[0]
     groups = [g.tolist() for _, g in df["path"].groupby(archive, sort=False)]
-    if workers <= 1:
-        heads = dict(zip((p for g in groups for p in g), (h for g in groups for h in _headers(g))))
-    else:
-        with mp.get_context("spawn").Pool(workers) as pool:
-            heads = dict(zip((p for g in groups for p in g),
-                             (h for hs in pool.imap(_headers, groups, chunksize=64) for h in hs)))
+    with mp.get_context("spawn").Pool(workers) if workers > 1 else contextlib.nullcontext() as pool:
+        hs = map(_headers, groups) if pool is None else pool.imap(_headers, groups, chunksize=64)
+        heads = dict(zip(itertools.chain.from_iterable(groups), itertools.chain.from_iterable(hs)))
     h = [heads[p] for p in df["path"]]
     df = df.assign(shape=["x".join(map(str, x[0])) if x else "" for x in h],
                    spacing=["x".join(f"{z:.4g}" for z in x[1][:3]) if x else "" for x in h],
