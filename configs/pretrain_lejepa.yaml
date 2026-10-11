@@ -16,9 +16,9 @@ data:
     - /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/pretrain/pool.csv.gz
   splits: [pretrain]
   patch_mm: 16.0              # patch = the scan's native voxels, round(16 / spacing) per axis (~16 mm); nothing resampled
-  num_workers: 16             # per GPU; each loads single scans (data.dataset.ScanBatches): I/O-bound (Lustre reads +
-  prefetch: 4                 # gunzip ~0.5 s per scan), so more workers than the GPU's 8 cores; host RAM ~ ranks x
-                              # workers x prefetch scans, whatever the batch
+  num_workers: 32             # per GPU; each loads single scans (data.dataset.ScanBatches): I/O-bound (Lustre reads +
+  prefetch: 4                 # gunzip ~0.5 s per scan), so 4x the GPU's 8 cores (m6: no data wait at 72 scans/GPU);
+                              # raised to >= 2 batches in flight; host RAM ~ ranks x workers x prefetch scans
   patches_per_batch: 98304    # per GPU: whole scans packed up to this many patches (~40 brains; a big body scan alone);
                               # 2-GPU dbg, 40 steps: 6x the v8 batch peaks at 10.7 GB (views over checkpoint_tokens are
                               # recomputed), ~31k patches/s per GPU vs ~9k at 16384
@@ -44,7 +44,8 @@ objective:
   global_frac: [0.3, 1.0]     # volume fraction of the foreground bounding box
   local_edge: [3, 8]          # patches per edge (27-512 tokens)
   jitter: 0.25                # view box = group box rescaled/shifted by up to this fraction of its edge
-  max_view_tokens: null       # no cap: a global view can span a whole volume (whole body ~37k patches)
+  max_view_tokens: 4096       # views are padded to the longest in the batch, so one big scan set the memory of all
+                              # (m5: OOM at 144 scans/GPU); brains are ~2.3k patches, the cap shrinks ~0.3% of views
   thick_prob: 0.3             # per view: native slices averaged into slabs along a random axis ...
   thick_mm: [4, 8]            # ... ~4 or 8 mm thick (skipped where the scan's slices already are): thick-slice acquisitions
   mask_ratio: [0.2, 0.5]      # fraction of view A's cubes whose foreground patches get the mask token

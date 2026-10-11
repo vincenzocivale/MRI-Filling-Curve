@@ -1,11 +1,12 @@
-# Phase 1 (notes/PIANO_TARATURA.md, D1): lr of the small model, 4 log-spaced values, 600 steps (~0.1 epoch);
-# only optimisation changes, so the SSL loss at the end of the decay (history.csv) decides: no evaluation.
-# 2 GPUs with the global batch unchanged (196,608 patches, 72 scans per GPU): half a node schedules sooner.
+# Phase 1 (notes/PIANO_TARATURA.md, D1): lr at the tuning size (d=512, 8 blocks: ~1.6x the d=256 time per patch, m8;
+# the GPU is overhead-bound), 4 log-spaced values, 400 steps (157M patches, ~0.07 epoch); only optimisation changes,
+# so the SSL loss at the end of the decay (history.csv) decides: no evaluation. 2 GPUs x 72 scans (47 GB each, m8):
+# half a node schedules far sooner than a whole one. ~14k patches/s per GPU -> ~1.6 h per run.
 name: p1_lr
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
-fixed: {train.steps: 600, train.decay_steps: 100, train.warmup_steps: 200, train.save_every: 600,
-        data.patches_per_batch: 196608, train.batch_size: 72}
+fixed: {train.steps: 400, train.decay_steps: 80, train.warmup_steps: 100, train.save_every: 400,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8}
 runs: [{train.lr: 3.0e-4}, {train.lr: 6.5e-4}, {train.lr: 1.4e-3}, {train.lr: 3.0e-3}]
 tasks: []
-slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "01:45:00"}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "02:30:00"}

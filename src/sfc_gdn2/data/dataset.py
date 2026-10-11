@@ -130,8 +130,8 @@ class _Scans(torch.utils.data.Sampler):
 
 
 class ScanBatches:
-    """Training batches: a per-scan DataLoader (each worker loads single scans, so host RAM follows workers x prefetch,
-    not the batch size, and the workers' I/O latencies overlap: a pool scan is ~0.5 s of Lustre reads and gunzip)
+    """Training batches: a per-scan DataLoader (each worker loads single scans, so host RAM follows the scans in flight (workers x prefetch, at least two batches), not a whole batch per
+    worker, and the workers' I/O latencies overlap: a pool scan is ~0.5 s of Lustre reads and gunzip)
     regrouped in the main process by the same deterministic plan. `batch_sampler` is the plan: its `start` places a
     resumed run. A whole batch per worker had both costs grow with the batch (2 GPUs x 72 scans: OOM at 240 GB, and
     25-46% of each step waiting for data)."""
@@ -163,8 +163,10 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, sessions, seed: int 
     strata reweighted; scans batched in pairs of one session (`sessions`: `session_ids`); scans loaded one per
     worker (`ScanBatches`)."""
     workers = int(data.get("num_workers", 8))
+    # scans in flight: at least two batches (m7: 32 workers x 4 = 128 < a 144-scan batch, 33% of each step waiting)
+    prefetch = max(int(data.get("prefetch", 4)), -(-2 * batch_size // max(workers, 1)))
     common = {"num_workers": workers, "pin_memory": True, "persistent_workers": workers > 0,
-              "prefetch_factor": int(data.get("prefetch", 4)) if workers else None}  # in flight per worker
+              "prefetch_factor": prefetch if workers else None}
     rows = rows.reset_index(drop=True)
     sizes = [n_patch(tuple(map(int, s.split("x"))), tuple(map(float, z.split("x"))), data["patch_mm"])
              for s, z in zip(rows["shape"], rows["spacing"])]
