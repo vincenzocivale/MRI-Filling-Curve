@@ -18,7 +18,9 @@ data:
   patch_mm: 16.0              # patch = the scan's native voxels, round(16 / spacing) per axis (~16 mm); nothing resampled
   cache_dir: null             # no cache: workers decode the sources (zip members in memory); ~1M scans fit no cache
   num_workers: 8
-  patches_per_batch: 16384    # per GPU: whole scans packed up to this many patches (~6 brains; a big body scan alone)
+  patches_per_batch: 98304    # per GPU: whole scans packed up to this many patches (~40 brains; a big body scan alone);
+                              # 2-GPU dbg, 40 steps: 6x the v8 batch peaks at 10.7 GB (views over checkpoint_tokens are
+                              # recomputed), ~31k patches/s per GPU vs ~9k at 16384
   mix_by: [dataset, modality] # strata of the mixing (pool: MR-RATE T1w 26% ... FOMO300K ADC 159 scans)
   mix_alpha: 1.0              # stratum share ~ n^alpha: 1 = as in the pool (MR-RATE 72%); 0.5-0.7 to try in the ablations
 
@@ -53,7 +55,7 @@ objective:
   fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
   proj_hidden: 1024
   proj_dim: 64                # every head (view mean, patch, each cube level); LeJEPA Tab. 1d: small is better
-  tokens_per_volume: 32       # B foreground tokens per volume fed to the token SIGReg (4 GPUs x 6 vols x 32 = 768 samples)
+  tokens_per_volume: 5        # B foreground tokens per volume fed to the token SIGReg (4 GPUs x 36 vols x 5 = 720 samples)
   lam: 0.05                   # loss = (1-lam)*invariance + lam*SIGReg
   sigreg_slices: 256
   sigreg_knots: 17
@@ -61,7 +63,8 @@ objective:
 
 train:
   steps: 15000
-  batch_size: 6                # per GPU, at most (data.patches_per_batch packs whole scans); 4 GPUs
+  batch_size: 36               # per GPU, at most (data.patches_per_batch packs whole scans); 4 GPUs: 144 volumes per step,
+                               # the samples of the volume level's SIGReg (~72 sessions for the session level)
   lr: 0.0005
   weight_decay: 0.05          # matrices only (see pretrain.param_groups)
   grad_clip: 1.0              # rare single-token gradient spikes (50-1500x median) otherwise; skip non-finite steps
