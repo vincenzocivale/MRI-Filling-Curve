@@ -114,11 +114,11 @@ def gaussian(patch, device) -> torch.Tensor:
     return (g / g.max()).clamp_min(1e-3)
 
 
-@torch.no_grad()
 def call(net, x: torch.Tensor, ctx):
     return net(x) if ctx is None else net(x, ctx.to(x.device))
 
 
+@torch.no_grad()
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch)."""
     S = tuple(x.shape[1:])
