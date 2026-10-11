@@ -84,7 +84,8 @@ def checkpoint_path(path: str | Path, step: int | None = None) -> Path:
 
 
 class SFC(Wrapper):
-    """args: curves (list, default the run's view_curves), step (int, default the last checkpoint)."""
+    """args: curves (list, default the run's view_curves), step (int, default the last checkpoint), crop (read only
+    the foreground's bounding box, as the training's global views), encoder: none (the patch embedding alone)."""
 
     name = "sfc_gdn2"
 
@@ -139,7 +140,8 @@ class SFC(Wrapper):
             enc = enc.to(self.device).eval().requires_grad_(False)
             obj = self.run_cfg["objective"]
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
-                                              obj.get("fg_threshold", 0.05))
+                                              obj.get("fg_threshold", 0.05), crop=bool(self.args.get("crop")),
+                                              embed_only=self.args.get("encoder") == "none")
         return self._extract
 
     @torch.no_grad()

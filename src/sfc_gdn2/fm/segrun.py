@@ -344,6 +344,14 @@ def train(job: dict) -> None:
         del val_v, data
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
         last.unlink(missing_ok=True)
+    if job.get("val_only"):  # pretraining tuning: the best val Dice, no test volume read
+        best.pop("state")
+        out_p.write_text(json.dumps({"model": job["cfg"]["model"], "init": job["init"], "iters": iters,
+                                     "best": best, "curve": curve, "val_dice": best["val"],
+                                     "n": {s: len(v) for s, v in split.items() if s != "test"}}, indent=1))
+        ckpt.unlink()
+        print(f"[seg] best val dice {best['val']:.4f} (iter {best['iter']}) -> {job['out']}", flush=True)
+        return
     load_trained(best.pop("state"))
     net.eval()
     tkey = key | {"best_iter": best["iter"]}

@@ -1,0 +1,19 @@
+# Phase 2 (notes/PIANO_TARATURA.md, D3-D5): architecture arms, 1,200 steps (~0.2 epoch), skill + dense signal.
+# Set train.lr in `fixed` from p1_lr first. A4 (shuffle + view position) only if A3 beats A0: run it then.
+# A5 (8 mm): patch-unit geometry x2, same mm as at 16 mm (levels 32/64 mm, local views 48-128 mm, mask cubes 16-64 mm);
+# the batch is in patches, so its compute equals the others' (it sees ~7x fewer volumes).
+name: p2_arch
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.steps: 1200, train.decay_steps: 200, train.warmup_steps: 200, train.save_every: 1200,
+        data.patches_per_batch: 196608, train.batch_size: 72}
+runs:
+  - {}                                            # A0: base
+  - {seed: 18}                                    # A0, second seed (noise)
+  - {objective.view_curves: [shuffle]}            # A1: no order (fresh random order per view)
+  - {objective.view_curves: [raster]}             # A2: raster only
+  - {model.view_pos: true}                        # A3: view position
+  - {data.patch_mm: 8.0, objective.levels: [4, 8], objective.local_edge: [6, 16], objective.mask_cells: [2, 4, 8]}  # A5
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500, time: "02:00:00"}
+slurm: {gres: "gpu:2", launch.nproc_per_node: 2, cpus_per_task: 16, mem: 240G, time: "03:00:00"}

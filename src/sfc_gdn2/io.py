@@ -19,6 +19,18 @@ def load_yaml(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
+def override(cfg: dict, items: list[str]) -> dict:
+    """KEY=VALUE items (dotted keys, YAML values) set in `cfg`, in place; returns it."""
+    for kv in items or []:
+        key, value = kv.split("=", 1)
+        *path, last = key.split(".")
+        node = cfg
+        for k in path:
+            node = node.setdefault(k, {})
+        node[last] = yaml.safe_load(value)
+    return cfg
+
+
 def seed_all(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)

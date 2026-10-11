@@ -30,6 +30,7 @@ model:
   head_dim: 64
   num_heads: 4
   use_short_conv: true
+  view_pos: false             # model.ViewPos: coordinates inside each view's own box (ablation A3, PIANO_TARATURA)
   grad_checkpoint: true         # GDN-2 blocks recomputed in backward when a step's views exceed objective.checkpoint_tokens
   embed:                      # continuous-kernel patch embedding (model.KernelEmbed), any spacing
     rank: 16                  # learned 1D basis functions per axis (kernel = G . phi_x phi_y phi_z)
@@ -64,6 +65,7 @@ objective:
   sigreg_samples: 768         # every SIGReg rescaled to this many samples (it grows with its sample count): same weight
                               # for every term whatever batch, tokens_per_volume, groups or GPUs; 768 = what lam was tuned on
   w_top: 1.0                  # weight of the view, volume and session terms (token and cells: 1), in both means
+  top_levels: [volume, session]   # the levels above the view ([] for the A/B check)
 
 train:
   steps: 15000

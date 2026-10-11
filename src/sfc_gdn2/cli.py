@@ -6,9 +6,8 @@ import os
 from pathlib import Path
 
 import pandas as pd
-import yaml
 
-from .io import load_yaml
+from .io import load_yaml, override
 
 
 def pretrain_pool(cfg: dict, args) -> None:
@@ -83,8 +82,7 @@ def bench_extract(cfg: dict, args) -> None:
         vols = vols.iloc[i::int(n)]
     group, fm_cfg = cfg["fm"]["groups"][args.group], cfg["fm"]
     root = Path(args.out or fm_cfg["out_root"])
-    ckpt = {"checkpoint": args.checkpoint} if args.checkpoint else {}  # ours: another run (pretraining tuning)
-    cfgs = [load_config(f"configs/fm/{s}.yaml") | ckpt | {"save": fm_cfg["save"][s] | {"dtype": "float16"}}
+    cfgs = [override(load_config(f"configs/fm/{s}.yaml"), args.fm_set) | {"save": fm_cfg["save"][s] | {"dtype": "float16"}}
             for s in group["configs"]]
     extract(cfgs, vols["input"].tolist(), [root / s for s in group["configs"]], device=args.device,
             ids=vols["id"].tolist(), dense=vols["dense"].tolist(), workers=int(group["workers"]),
@@ -130,11 +128,12 @@ def bench_segdec(cfg: dict, args) -> None:
     items = bs.task_items(tasks, vols, splits, seed, args.sample)
     if args.stage == "prep":
         shard = args.shard and args.shard.replace("auto", os.environ.get("SLURM_ARRAY_TASK_ID", "auto"))
-        bs.prep(cfg, args.group, items, args.device, shard)
+        bs.prep(cfg, args.group, items, args.device, shard, args.fm_set)
         return
     for m in args.models:
         for t in tasks:
-            bs.train(cfg, m, t, items[t], seed, args.init, args.device, args.iters, args.resume)
+            bs.train(cfg, m, t, items[t], seed, args.init, args.device, args.iters, args.resume, args.val_only,
+                     args.fm_set)
 
 
 COMMANDS = {"pretrain-pool": pretrain_pool, "pretrain": pretrain, "fm": fm, "bench-split": bench_split,
@@ -161,7 +160,9 @@ def main() -> None:
     ap.add_argument("--cache-only", action="store_true", help="bench-probe: only build the feature caches")
     ap.add_argument("--tune", action="store_true",
                     help="bench-extract: only subjects in no seed's test split; bench-probe: their tuning skill")
-    ap.add_argument("--checkpoint", help="bench-extract: our run / encoder file in place of the fm config's")
+    ap.add_argument("--fm-set", nargs="+", default=[], metavar="KEY=VALUE",
+                    help="bench-extract / bench-segdec: fm config fields, e.g. checkpoint=<run> args.crop=true")
+    ap.add_argument("--val-only", action="store_true", help="bench-segdec: best val Dice only, no test volume read")
     ap.add_argument("--stage", choices=["prep", "train"], help="bench-segdec: prep (group inputs) | train")
     ap.add_argument("--init", default="pretrained", choices=["pretrained", "random"], help="bench-segdec: encoder")
     ap.add_argument("--iters", type=int, help="bench-segdec: training iterations (pilot override)")
@@ -175,13 +176,7 @@ def main() -> None:
         ap.error("fm needs --images or --csv, and --out")
     # fm: the config is resolved (env vars) by fm.api
     cfg = None if args.command == "fm" else load_yaml(args.config)
-    for kv in args.override:
-        key, value = kv.split("=", 1)
-        *path, last = key.split(".")
-        node = cfg
-        for k in path:
-            node = node.setdefault(k, {})
-        node[last] = yaml.safe_load(value)
+    override(cfg, args.override)
     COMMANDS[args.command](cfg, args)
 
 

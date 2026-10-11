@@ -1,12 +1,14 @@
-# Stage S2 (notes/IPERPARAMETRI.md): the objective's task/data choices, random search, scored by the tuning skill
-# (bench-probe --tune: mean over tasks); the SSL loss does not compare across objectives. Set train.lr in `fixed` from
-# s1_lr first. `python slurm/sweep.py configs/sweeps/s2_objective.yaml`
-name: s2_objective
-n: 16
+# Phase 3 (notes/PIANO_TARATURA.md, D6): the objective's task/data choices, 12 random draws, 1,200 steps, skill
+# (mean over tasks); the SSL loss does not compare across objectives. Before launching: train.lr from p1_lr and the
+# architecture fixed at gate G2 (view_curves, view_pos, patch_mm) in `fixed`. Then: the 3 best with a second seed +
+# the dense signal, and the winner with objective.top_levels: [] (A/B of the volume/session levels).
+name: p3_objective
+n: 12
 seed: 0
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
-fixed: {train.steps: 1200, train.decay_steps: 200, train.warmup_steps: 200, train.save_every: 1200}
+fixed: {train.steps: 1200, train.decay_steps: 200, train.warmup_steps: 200, train.save_every: 1200,
+        data.patches_per_batch: 196608, train.batch_size: 72}
 space:
   objective.mask_ratio: {choice: [[0.1, 0.3], [0.2, 0.5], [0.4, 0.7]]}
   objective.mask_cells: {choice: [[1], [1, 2], [1, 2, 4], [1, 4]]}   # 1 always there: cubes must fit small views
@@ -17,4 +19,4 @@ space:
   data.mix_alpha: {choice: [1.0, 0.7, 0.5]}
   aug: {log: [1.0, 3.0], scales: {objective.gamma: 0.3, objective.scale: 0.1, objective.shift: 0.05, objective.noise: 0.02}}
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
-slurm: {time: "03:00:00"}
+slurm: {gres: "gpu:2", launch.nproc_per_node: 2, cpus_per_task: 16, mem: 240G, time: "03:00:00"}

@@ -38,6 +38,9 @@ bounds the tokens per step whatever the field of view.
 - session: the same over the scans of one session in the batch (the loader batches each scan with a random other
   scan of its session): what all its sequences share (anatomy, age, sex), not the acquisition signature that
   alone tells a volume's boxes from the rest of the batch. Its own head; SIGReg one sample per session.
+  `top_levels` lists which of the two are on (both by default; [] for the A/B check).
+View position (model.view_pos, `model.ViewPos`): each token gets its coordinates inside its own view's box after
+the view's symmetry, so A and B place a patch differently and position alone cannot pair them.
 loss = (1 - lam) * wmean(invariances) + lam * wmean(SIGRegs), one of each per scale, weight `w_top` for the view,
 volume and session terms and 1 for token and cells.
 SIGReg sees every rank's samples. Its statistic grows with their count M (a test statistic), which made every
@@ -117,7 +120,7 @@ class LeJEPA(nn.Module):
                  shift: float = 0.05, noise: float = 0.02, fg_threshold: float = 0.05, proj_hidden: int = 1024,
                  proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
-                 w_top: float = 1.0):
+                 w_top: float = 1.0, top_levels: tuple = ("volume", "session")):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -133,8 +136,7 @@ class LeJEPA(nn.Module):
         self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.cell = nn.ModuleList(Projector(2 * encoder.dim, proj_hidden, proj_dim) for _ in self.levels)
-        self.volume = Projector(2 * encoder.dim, proj_hidden, proj_dim)
-        self.session = Projector(2 * encoder.dim, proj_hidden, proj_dim)
+        self.top = nn.ModuleDict({n: Projector(2 * encoder.dim, proj_hidden, proj_dim) for n in top_levels})
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
         perms, flips = symmetries()
         self.register_buffer("perms", perms, persistent=False)
@@ -180,7 +182,8 @@ class LeJEPA(nn.Module):
 
     def serialize(self, xyz, corner, edge, gen):
         """Coords [V,N,3], boxes [V,3] -> patch indices [V,L] in the order of a random curve of
-        `view_curves` under a random cube symmetry, traced within the box; valid [V,L]."""
+        `view_curves` under a random cube symmetry, traced within the box; valid [V,L]; their coordinates in the box
+        after the symmetry [V,L,3] (the view position)."""
         inside = ((xyz >= corner[:, None]) & (xyz < (corner + edge)[:, None])).all(-1)     # [V,N]
         dev, dims = corner.device, edge[:, None]
         sym = torch.randint(len(self.perms), (len(corner),), device=dev, generator=gen)[:, None]
@@ -189,11 +192,12 @@ class LeJEPA(nn.Module):
         curve = torch.randint(len(self.curves), (len(corner), 1), device=dev, generator=gen)
         key = torch.zeros_like(inside, dtype=torch.long)
         for i, name in enumerate(self.curves):
-            key = torch.where(curve == i, keys(name, local, dims, self.seed), key)
+            key = torch.where(curve == i, keys(name, local, dims, self.seed, gen), key)
         order = key.masked_fill(~inside, 1 << 62).argsort(1)
         n = inside.sum(1)
         order = order[:, : int(n.max())]
-        return order, torch.arange(order.shape[1], device=order.device) < n[:, None]
+        return (order, torch.arange(order.shape[1], device=order.device) < n[:, None],
+                local.gather(1, order[..., None].expand(-1, -1, 3)))
 
     @staticmethod
     def cell_ids(p: torch.Tensor, grid: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -235,7 +239,7 @@ class LeJEPA(nn.Module):
         """Views [V] -> patch indices, valid, foreground, mask [V,L], bi tokens [V,L,2d]. Masking applies only to foreground patches of views with `masked`; the
         backward pass reads each view's valid tokens in reverse (padding stays at the end, zero in the outputs).
         Tokens are embedded per scan (its own voxels per patch and kernel weights `ws`)."""
-        idx, valid = self.serialize(xyz[vol], corner, edge, gen)
+        idx, valid, vpos = self.serialize(xyz[vol], corner, edge, gen)
         fgv = valid & fg[vol[:, None], idx]
         n, nv, dev = valid.sum(1), len(idx), idx.device
         u = lambda lo, hi: self._u((nv, 1, 1), lo, hi, gen)
@@ -266,6 +270,8 @@ class LeJEPA(nn.Module):
                 t[rows_v[rc], pos[rc]] = checkpoint(self._embed, x, idx[rows_v[rc], pos[rc]], rows_v[rc], ws[b], aug, k,
                                                     sp, seed + b * 1_000_003 + c, use_reentrant=False).to(t.dtype)
         t = self.encoder.apply_mask(t, mask)
+        if self.encoder.pos is not None:   # masked patches too: the mask token learns where it is
+            t = t + self.encoder.pos(vpos).to(t.dtype)
         j = torch.arange(idx.shape[1], device=dev)
         rev = torch.where(j < n[:, None], (n[:, None] - 1 - j).clamp_min(0), j)            # an involution
         seqs, ok = torch.cat([t, t.gather(1, rev[..., None].expand_as(t))]), torch.cat([valid, valid])
@@ -359,9 +365,11 @@ class LeJEPA(nn.Module):
             out[f"sigreg_cell{cs}"] = sig(z[self._sample(vb, torch.ones_like(vb, dtype=torch.bool), b, gen)][None])
             out[f"pairs_cell{cs}"] = torch.tensor(float(len(p)), device=z.device)
         tops = torch.cat(tops, 1)                                                          # [B,V,2d], globals first
-        ses = vols.get("session", torch.arange(b, device=grid.device)).unique(return_inverse=True)[1]
-        for name, grp in (("volume", torch.arange(b, device=grid.device)), ("session", ses)):
-            head, n = getattr(self, name), int(grp.max()) + 1
+        groups = {"volume": torch.arange(b, device=grid.device),
+                  "session": vols.get("session", torch.arange(b, device=grid.device)).unique(return_inverse=True)[1]}
+        for name, head in self.top.items():
+            grp = groups[name]
+            n = int(grp.max()) + 1
             z = head(tops.flatten(0, 1)).float().view(b, -1, head[-1].out_features)       # [B,V,D]
             cnt = torch.bincount(grp, minlength=n).clamp_min(1)[:, None]
             centre = z.new_zeros(n, z.shape[-1]).index_add_(0, grp, z[:, : 2 * self.gg].mean(1)) / cnt
@@ -373,9 +381,9 @@ class LeJEPA(nn.Module):
             means = torch.zeros(b, zt.shape[1], device=zt.device).index_add_(0, tv, zt)
             means /= torch.bincount(tv, minlength=b).clamp_min(1)[:, None]
             vol_share = 1 - (zt - means[tv]).var(0).sum() / zt.var(0).sum()
-        inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels), out["inv_volume"], out["inv_session"]]
-        sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels), out["sigreg_volume"], out["sigreg_session"]]
-        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), self.w_top, self.w_top]
+        inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels), *(out[f"inv_{n}"] for n in self.top)]
+        sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels), *(out[f"sigreg_{n}"] for n in self.top)]
+        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), *(self.w_top for _ in self.top)]
         wmean = lambda xs: sum(a * x for a, x in zip(w, xs)) / sum(w)
         return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs),
                 "inv_global": inv_g, "inv_token": inv_t, "sigreg_global": sig_g, "sigreg_token": sig_t, **out,

@@ -13,7 +13,7 @@ import itertools
 
 import torch
 
-CURVES = ("raster", "snake", "morton", "hilbert", "random")
+CURVES = ("raster", "snake", "morton", "hilbert", "random", "shuffle")
 
 
 def grid_coords(grid: torch.Tensor, n_patch: int) -> torch.Tensor:
@@ -74,9 +74,14 @@ def _morton(c: torch.Tensor, bits: int) -> torch.Tensor:
     return key
 
 
-def keys(name: str, c: torch.Tensor, dims: torch.Tensor, seed: int = 17) -> torch.Tensor:
+def keys(name: str, c: torch.Tensor, dims: torch.Tensor, seed: int = 17,
+         generator: torch.Generator | None = None) -> torch.Tensor:
     """Curve sort key of box-local coords c [...,3] (int64, 0 <= c < dims) in boxes of size dims [...,3].
-    Distinct within a box."""
+    Distinct within a box. `shuffle`: no order at all, fresh random keys at every call (from `generator`, else seeded
+    by `seed`); `random` is one fixed permutation, which a model can learn."""
+    if name == "shuffle":
+        g = generator if generator is not None else torch.Generator(c.device).manual_seed(seed)
+        return torch.randint(1 << 62, c.shape[:-1], device=c.device, generator=g)
     bits = max(int(dims.max()) - 1, 1).bit_length()
     x, y, z = c.unbind(-1)
     ny, nz = dims[..., 1], dims[..., 2]

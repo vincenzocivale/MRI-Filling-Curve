@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from ..fm.api import SRC, load_config
+from ..io import override
 from .probe import task_rows
 
 MAX_TRAIN, MAX_VAL = 400, 100  # volumes per task held in RAM
@@ -54,35 +55,41 @@ def run_job(cfg: dict, job: dict) -> None:
         os.unlink(f.name)
 
 
-def prep(bench: dict, group: str, items: dict[str, list[dict]], device: str = "cuda", shard: str | None = None) -> None:
-    """`shard` = "i/n": every n-th volume from the i-th."""
+def prep(bench: dict, group: str, items: dict[str, list[dict]], device: str = "cuda", shard: str | None = None,
+         fm_set: list[str] | None = None) -> None:
+    """`shard` = "i/n": every n-th volume from the i-th; `fm_set`: KEY=VALUE fields of the fm config."""
     g, s = bench["fm"]["groups"][group], bench["segdec"]
     lead = g["configs"][0]
     every = {it["id"]: it for its in items.values() for it in its}
     if shard:
         i, n = (int(v) for v in shard.split("/"))
         every = dict(list(every.items())[i::n])
-    run_job(load_config(f"configs/fm/{lead}.yaml"),
+    run_job(override(load_config(f"configs/fm/{lead}.yaml"), fm_set),
             {"stage": "prep", "cache": str(Path(s["cache"]) / lead), "items": list(every.values()),
              "device": device, "workers": int(g["workers"])})
 
 
 def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init: str, device: str = "cuda",
-          iters: int | None = None, resume: bool = False) -> dict:
+          iters: int | None = None, resume: bool = False, val_only: bool = False,
+          fm_set: list[str] | None = None) -> dict:
     """`resume`: a run whose json is written (same iters) is skipped, for chained jobs (a killed run always resumes
-    from its checkpoints, fm/segrun.py)."""
+    from its checkpoints, fm/segrun.py). `val_only` (pretraining tuning): the best val Dice, no test volume read."""
     s = bench["segdec"] | ({"iters": iters, "val_every": max(iters // 2, 1)} if iters else {})
     out = Path(s["out"]) / task / f"s{seed}" / f"{model}__{init}.json"
-    if resume and out.exists() and "test_ci95" in (res := json.loads(out.read_text())) and res["iters"] == int(s["iters"]):
+    done = "val_dice" if val_only else "test_ci95"
+    if resume and out.exists() and done in (res := json.loads(out.read_text())) and res["iters"] == int(s["iters"]):
         print(f"[segdec] {task} s{seed} {model} {init}: done ({out}), skipped", flush=True)
         return res
     seg = Path(items[0]["seg"])
     k = 1 + (len(list(seg.glob("*.nii*"))) if seg.is_dir() else 1)  # as geom.gt_labels counts classes
-    run_job(load_config(f"configs/fm/{model}.yaml"),
-            {"stage": "train", "cache": str(Path(s["cache"]) / lead_of(bench["fm"], model)), "items": items,
+    run_job(override(load_config(f"configs/fm/{model}.yaml"), fm_set),
+            {"stage": "train", "val_only": val_only, "cache": str(Path(s["cache"]) / lead_of(bench["fm"], model)), "items": items,
              "k": k, "init": init, "iters": int(s["iters"]), "val_every": int(s["val_every"]), "batch": int(s["batch"]),
              "lr": float(s["lr"]), "seed": seed, "device": device, "out": str(out)})
     res = json.loads(out.read_text())
+    if val_only:
+        print(f"[segdec] {task} s{seed} {model} {init}: best val dice {res['val_dice']:.3f}", flush=True)
+        return res
     subj = {it["id"]: it["subject"] for it in items}
     res |= {"task": task, "seed": seed, "test_ci95": _ci(np.asarray(res["per_volume"], dtype=float),
                                                                   np.array([subj[i] for i in res["test_ids"]]))}

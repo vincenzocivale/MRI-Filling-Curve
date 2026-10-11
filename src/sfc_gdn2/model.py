@@ -84,6 +84,25 @@ class KernelEmbed(nn.Module):
             return patches.float() @ w.float() + self.bias
 
 
+class ViewPos(nn.Module):
+    """View position: a patch's coordinates inside the box its view reads (after the view's cube symmetry; patch
+    units), Fourier features (periods 2..256 patches) -> linear, zero-initialised (the encoder starts as without it).
+    A and B of a box differ in box (jitter) and symmetry, so a patch has different coordinates in the two views:
+    position alone cannot pair them, as an absolute embedding could (the reason the encoder had none)."""
+
+    def __init__(self, d: int, freqs: int = 8):
+        super().__init__()
+        self.register_buffer("w", 2 * math.pi / torch.logspace(1, 8, freqs, base=2), persistent=False)
+        self.proj = nn.Linear(6 * freqs, d)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, c: torch.Tensor) -> torch.Tensor:
+        """[..., 3] coordinates -> [..., d]."""
+        a = c.float()[..., None] * self.w
+        return self.proj(torch.cat([a.sin(), a.cos()], -1).flatten(-2))
+
+
 class Encoder(nn.Module):
     """Causal GDN-2 over curve-ordered patch tokens.
 
@@ -91,14 +110,16 @@ class Encoder(nn.Module):
     `KernelEmbed`; masked patches replaced by a learned mask token) and only then gathered into curve order. There is no coordinate embedding: the curve
     order is the only spatial signal, and it differs between views, so an embedding cannot be made
     view-invariant through absolute position. Any grid size: sequences are packed, not padded.
+    `view_pos`: adds `ViewPos` (coordinates relative to the view's own box: no absolute position).
     """
 
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
-                 grad_checkpoint: bool = False, patch_mm: float = 16.0, **embed):
+                 grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, **embed):
         super().__init__()
         self.dim, self.grad_checkpoint = d_model, grad_checkpoint
         self.patch_embed = KernelEmbed(d_model, patch_mm, **embed)
         self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.pos = ViewPos(d_model) if view_pos else None
         self.blocks = nn.ModuleList(GDN2Block(d_model, head_dim, num_heads, use_short_conv, i)
                                     for i in range(depth))
         self.norm = nn.LayerNorm(d_model)
@@ -107,7 +128,8 @@ class Encoder(nn.Module):
     def from_config(cls, cfg: dict) -> Encoder:
         m = cfg["model"]
         return cls(m["d_model"], m["depth"], m["head_dim"], m["num_heads"], m.get("use_short_conv", True),
-                   m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], **m.get("embed", {}))
+                   m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
+                   **m.get("embed", {}))
 
     def tokens(self, patches: torch.Tensor, w: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """[...,N,P] native patches of one scan, its `patch_embed.weights` [P,d] (+ [...,N] mask) -> [...,N,d]."""
@@ -144,25 +166,42 @@ class Encoder(nn.Module):
 Extractor = Callable[[dict], dict[str, torch.Tensor]]
 
 
-def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int, fg_threshold: float) -> Extractor:
+def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int, fg_threshold: float,
+                      crop: bool = False, embed_only: bool = False) -> Extractor:
     """Each volume read along each of `curves` over its whole patch grid (untransformed view), forwards and
     backwards; `bi` = forward ++ backward output per patch, averaged over the curves (test-time augmentation).
     patch: `bi` per patch (raster order). volume: `mean`, bi averaged over the foreground patches (the top of the
-    pretraining pyramid). both: the two (the benchmark wrapper, fm/sfc.py)."""
+    pretraining pyramid). both: the two (the benchmark wrapper, fm/sfc.py).
+    crop: only the foreground's bounding box is read, as the training's global views (patches outside: bi 0);
+    embed_only: no encoder, bi = the patch embedding twice (what the encoder adds to its input). The view position
+    (`Encoder.pos`) is the coordinate inside the box read."""
+    from .data.dataset import per_patch
+
     def extract(vols):
         grid = vols["grid"]
-        n = grid.prod(1)
-        xyz = grid_coords(grid, int(n.max()))
+        xyz = grid_coords(grid, int(grid.prod(1).max()))
+        real = xyz[..., 0] >= 0
+        fg = real & (per_patch(vols, xyz.shape[1], lambda x: x.mean(-1)) > fg_threshold)
+        lo, hi = torch.zeros_like(grid), grid - 1
+        if crop:  # the foreground's bounding box (the whole grid when there is no foreground)
+            has = fg.any(1)[:, None]
+            lo = torch.where(has, torch.where(fg[..., None], xyz, 1 << 30).amin(1), lo)
+            hi = torch.where(has, torch.where(fg[..., None], xyz, -1).amax(1), hi)
+        inside = real & ((xyz >= lo[:, None]) & (xyz <= hi[:, None])).all(-1)
+        local, dims = (xyz - lo[:, None]).clamp_min(0), hi - lo + 1
+        n = inside.sum(1)
         j = torch.arange(xyz.shape[1], device=grid.device)
         valid = j < n[:, None]
         rev = torch.where(valid, (n[:, None] - 1 - j).clamp_min(0), j)
         t = torch.zeros(len(grid), xyz.shape[1], encoder.dim, device=grid.device)
         for i, x in enumerate(vols["patches"]):                             # per scan: its own kernel weights
             t[i, : len(x)] = encoder.tokens(x, encoder.patch_embed.weights(vols["spacing"][i], vols["k"][i].tolist()))
-        bi = 0
-        for curve in curves:
-            order = torch.stack([keys(curve, c.clamp_min(0), g, seed).masked_fill(c[:, 0] < 0, 1 << 62).argsort()
-                                 for c, g in zip(xyz, grid)])              # per volume: no batch-dependent curve
+        if encoder.pos is not None:
+            t = t + encoder.pos(local) * inside[..., None]
+        bi = torch.cat([t, t], -1) * inside[..., None] if embed_only else 0
+        for curve in [] if embed_only else curves:
+            order = torch.stack([keys(curve, c, d, seed).masked_fill(~m, 1 << 62).argsort()
+                                 for c, d, m in zip(local, dims, inside)])  # per volume: no batch-dependent curve
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s = t.gather(1, order[..., None].expand(-1, -1, encoder.dim))
                 h = encoder.packed(torch.cat([s, s.gather(1, rev[..., None].expand_as(s))]), valid.repeat(2, 1)).float()
@@ -171,9 +210,7 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
             bi = bi + torch.cat([fwd, bwd], -1).gather(1, back.expand(-1, -1, 2 * h.shape[-1])) / len(curves)
         if level == "patch":
             return {"bi": bi}
-        from .data.dataset import per_patch
-        fg = valid & (per_patch(vols, xyz.shape[1], lambda x: x.mean(-1)) > fg_threshold)
-        w = (fg | (valid & ~fg.any(1, keepdim=True))).float()
+        w = (fg | (inside & ~fg.any(1, keepdim=True))).float()
         mean = (w[..., None] * bi).sum(1) / w.sum(1, keepdim=True)
         return {"mean": mean} if level == "volume" else {"bi": bi, "mean": mean}
     return extract
