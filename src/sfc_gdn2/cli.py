@@ -36,17 +36,9 @@ def pretrain(cfg: dict, args) -> None:
 
 
 def fm(_, args) -> None:
-    """Features of one external model for a list of images (`--images`, or `--csv` with an `id` column
-    plus one column per modality for multi-modal models)."""
+    """Features of one external model for a list of images (`--images`)."""
     from .fm.api import extract
-    if args.csv:
-        df = pd.read_csv(args.csv)
-        mods = [c for c in df.columns if c != "id"]
-        images = df[mods[0]].tolist() if len(mods) == 1 else df[mods].to_dict("records")
-        ids = df["id"].astype(str).tolist() if "id" in df else None
-    else:
-        images, ids = args.images, None
-    extract(args.config, images, args.out, device=args.device, overwrite=args.overwrite, ids=ids)
+    extract(args.config, args.images, args.out, device=args.device, overwrite=args.overwrite)
 
 
 def bench_split(cfg: dict, _) -> None:
@@ -141,8 +133,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="sfc")
     ap.add_argument("command", choices=COMMANDS)
     ap.add_argument("config", help="YAML config")
-    ap.add_argument("--images", nargs="+", help="fm: image files (single-modality models)")
-    ap.add_argument("--csv", help="fm: CSV with `id` + one column per modality")
+    ap.add_argument("--images", nargs="+", help="fm: image files")
     ap.add_argument("--out", help="fm: output dir; bench-extract: output root; pretrain-pool: manifest path")
     ap.add_argument("--device", default="cuda", help="fm: cuda | cpu")
     ap.add_argument("--overwrite", action="store_true", help="fm: recompute existing outputs")
@@ -168,8 +159,8 @@ def main() -> None:
     ap.add_argument("--override", nargs="+", default=[], metavar="KEY=VALUE",
                     help="config fields, dotted keys and YAML values, e.g. train.steps=200 data.manifests=[a.csv]")
     args = ap.parse_args()
-    if args.command == "fm" and not ((args.images or args.csv) and args.out):
-        ap.error("fm needs --images or --csv, and --out")
+    if args.command == "fm" and not (args.images and args.out):
+        ap.error("fm needs --images and --out")
     # fm: the config is resolved (env vars) by fm.api
     cfg = None if args.command == "fm" else load_yaml(args.config)
     override(cfg, args.override)

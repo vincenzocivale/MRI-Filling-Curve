@@ -13,7 +13,7 @@ Users are responsible for accepting and complying with the current upstream term
 
 No weights or model code are redistributed. Adapters in `src/sfc_gdn2/fm/` build each encoder from the
 original library (MONAI, `dynamic-network-architectures`, Apache-2.0) or re-implement it in torch with the
-original state_dict keys (MedicalNet, BrainMVP, BrainFM, MoME, AMAES), and load checkpoints in each repo's own format.
+original state_dict keys (MedicalNet, BrainFM, AMAES), and load checkpoints in each repo's own format.
 Upstream repos: BrainIAC, BrainSegFounder, nnssl (CC-BY-SA-4.0; OpenMind / nnFoundation), AMAES and FOMO26
-baseline (no LICENSE file upstream: licence undetermined), BrainMVP, BrainFM (Apache-2.0), MoME / MoME+,
+baseline (no LICENSE file upstream: licence undetermined), BrainFM (Apache-2.0),
 MedicalNet, nnU-Net (Apache-2.0). Check each repo's and checkpoint's current terms before use.

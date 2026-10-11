@@ -39,7 +39,7 @@ The first GPU run spends minutes compiling Triton kernels (`TRITON_CACHE_DIR` on
 - `pretrain.py`: `Pretrainer` (bf16, fused AdamW, decay on matrices only, warmup + WSD or cosine, grad clip,
   non-finite steps skipped, `encoder_step*.pt` incl. step 0; `ckpt.pt` every `ckpt_every` steps, resumed
   automatically: same config = same run directory).
-- `data/`: `catalog` (every volume + labels), `pool` (`sfc pretrain-pool`: pretraining manifest, header pass with `n_patch` per scan), `VolumeStore` (native, cache optional), loader (volumes as a list;
+- `data/`: `catalog` (every volume + labels), `pool` (`sfc pretrain-pool`: pretraining manifest, header pass with `n_patch` per scan), `volume.decode` (native voxels, no cache), loader (volumes as a list;
   `to_device` makes values + per-scan [N,P] patches; `grid`, `k`, `spacing` [B,3]).
 - `fm/`: external foundation models, image -> the model's own features. `api.extract` (`sfc fm`) runs `worker.py` under the model's conda env (`envs/fm/`, path in `configs/fm/*.yaml`); each wrapper (`base.Wrapper`) imports the ORIGINAL repo code for preprocessing, network, inference and outputs. Parity scripts in `tests/fm/`.
 - `bench/` (config `configs/bench/bench.yaml`): `split.py` volume list (one per subject/session/sequence), input

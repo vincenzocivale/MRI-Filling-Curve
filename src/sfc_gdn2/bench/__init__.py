@@ -4,6 +4,6 @@
 - `probe`: frozen-feature probes of the volume tasks on the stored features (`sfc bench-probe`).
 - `segdec`: segmentation through each model's own network on its frozen encoder, full resolution (`sfc bench-segdec`).
 - `geom`: source voxel -> model input grid, GT reader (used by the wrappers and fm/segrun.py in the model envs:
-  numpy / torch / nibabel only).
+  numpy / nibabel only).
 Config: configs/bench/bench.yaml, tasks in configs/bench/probe_tasks.yaml.
 """

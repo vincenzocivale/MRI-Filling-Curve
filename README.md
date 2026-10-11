@@ -64,8 +64,7 @@ ours is one more model there (`fm/sfc.py`), with the same volumes, splits, probe
 
 Storage: each scan's voxels exactly as stored (dtype kept, canonical reorientation = axis permutation and
 flips only) with the value map `a·raw + c` (header slope/intercept over the 99th percentile of the foreground; no
-clipping). With `cache_dir` set, cached once as `.npy` under `cache_dir/native/`; the pretraining pool runs with
-`cache_dir: null` (decoded from the sources, zip members in memory). Values become
+clipping), decoded from the sources at every access (zip members in memory; ~1M scans fit no cache). Values become
 fp32 on the GPU, where the volume is cut into patches; the embedding runs in fp32.
 
 **FOMO300K is a superset of OpenMind:** never pool them as independent cohorts.
@@ -91,7 +90,6 @@ conda env. Nothing of ours sits between the NIfTI and the model.
 source configs/fm/leonardo.env        # SFC_FM_ENVS / SFC_FM_REPOS / SFC_FM_MODELS (see configs/fm/README.md)
 conda env create -p $SFC_FM_ENVS/fm-<family> -f envs/fm/fm-<family>.yml     # once per family
 sfc fm configs/fm/<name>.yaml --images a.nii.gz b.nii.gz --out feats/<name> [--device cpu]
-sfc fm configs/fm/mome_plus.yaml --csv cases.csv --out feats/mome_plus   # multi-modal: id,<modality>,...
 ```
 
 Each image gives `<out>/<id>.pt` = `{features: {name: tensor}, canonical, derived, meta, provenance}`:

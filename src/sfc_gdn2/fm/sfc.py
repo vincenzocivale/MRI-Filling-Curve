@@ -7,7 +7,7 @@ bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in ou
   `args.curves` (default: the run's view_curves, averaged), forward + reversed. `map` = bi tokens on the patch grid
   [2d, gx, gy, gz]; `mean` = bi averaged over the foreground patches (the pyramid top, what volume probes read:
   canonical).
-- meta: `source_to_input` (source voxel index -> canonical voxel index), read by bench/geom.py.
+- meta: `source_to_input` (source voxel index -> canonical voxel index), returned by `seg_input`.
 - segmentation (bench-segdec, fm/segrun.py): the frozen encoder + Primus' decoder (`PatchDecode`, the decoder of the
   OpenMind / nnFoundation token models: transposed convs, LayerNorm, GELU, He init 1e-2) from each token to a 16^3
   grid over its patch (1 mm at patch_mm 16), resized trilinearly to the patch's native voxels (k differs per scan).
