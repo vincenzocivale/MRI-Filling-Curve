@@ -71,6 +71,9 @@ def bench_extract(cfg: dict, args) -> None:
     vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv")
     if args.query:
         vols = vols.query(args.query)
+    if args.tune:  # pretraining tuning: no subject of any seed's test split is even read
+        from .bench.probe import tune_subjects
+        vols = vols[vols["subject"].isin(tune_subjects(pd.read_csv(Path(cfg["out_dir"]) / "splits.csv")))]
     if args.sample:
         vols = pd.concat([g.sort_values("dense", ascending=False, kind="stable").head(args.sample)
                           for _, g in vols.groupby("dataset")])
@@ -80,7 +83,8 @@ def bench_extract(cfg: dict, args) -> None:
         vols = vols.iloc[i::int(n)]
     group, fm_cfg = cfg["fm"]["groups"][args.group], cfg["fm"]
     root = Path(args.out or fm_cfg["out_root"])
-    cfgs = [load_config(f"configs/fm/{s}.yaml") | {"save": fm_cfg["save"][s] | {"dtype": "float16"}}
+    ckpt = {"checkpoint": args.checkpoint} if args.checkpoint else {}  # ours: another run (pretraining tuning)
+    cfgs = [load_config(f"configs/fm/{s}.yaml") | ckpt | {"save": fm_cfg["save"][s] | {"dtype": "float16"}}
             for s in group["configs"]]
     extract(cfgs, vols["input"].tolist(), [root / s for s in group["configs"]], device=args.device,
             ids=vols["id"].tolist(), dense=vols["dense"].tolist(), workers=int(group["workers"]),
@@ -104,6 +108,9 @@ def bench_probe(cfg: dict, args) -> None:
     tasks = {t: tasks[t] for t in (args.tasks or tasks)}
     vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv", low_memory=False, dtype={"session": str})
     splits = pd.read_csv(Path(cfg["out_dir"]) / "splits.csv")
+    if args.tune:
+        bp.tune(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), args.device)
+        return
     seeds = [int(s) for s in args.seeds.split(",")]
     common = {m: root / m for m in args.common} if args.common else None
     bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device, common)
@@ -152,6 +159,9 @@ def main() -> None:
     ap.add_argument("--seeds", default="0", help="bench-probe: split seeds, e.g. 0,1,2,3,4")
     ap.add_argument("--common", nargs="+", help="bench-probe: models whose shared volumes are used (default: --models)")
     ap.add_argument("--cache-only", action="store_true", help="bench-probe: only build the feature caches")
+    ap.add_argument("--tune", action="store_true",
+                    help="bench-extract: only subjects in no seed's test split; bench-probe: their tuning skill")
+    ap.add_argument("--checkpoint", help="bench-extract: our run / encoder file in place of the fm config's")
     ap.add_argument("--stage", choices=["prep", "train"], help="bench-segdec: prep (group inputs) | train")
     ap.add_argument("--init", default="pretrained", choices=["pretrained", "random"], help="bench-segdec: encoder")
     ap.add_argument("--iters", type=int, help="bench-segdec: training iterations (pilot override)")

@@ -14,6 +14,9 @@ Task types (`configs/bench/probe_tasks.yaml`):
 - `dex`: DEX / SFCN, softmax over bins of width `bin` with Gaussian soft labels (sigma = 1 bin), prediction =
   expectation; MAE (+ Pearson r, MAE per dataset, MAE after the linear bias correction fitted on val).
 - `cox`: Cox partial likelihood (Breslow); Harrell's C.
+
+Pretraining tuning (`tune`, `bench-probe --tune`): only subjects that are in no seed's test split (`tune_subjects`),
+out-of-fold predictions, a cross-fitted choice of head; one `skill` per task (0 = chance, 1 = perfect).
 """
 from __future__ import annotations
 
@@ -327,4 +330,87 @@ def run(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, spl
                     f"{v} {key}={res[v]['test'][key]:.3f} {res[v]['test_ci95']}" for v in HIDDEN), flush=True)
     df = pd.DataFrame(summary)
     df.to_csv(out_dir / "summary.csv", index=False, mode="a", header=not (out_dir / "summary.csv").exists())
+    return df
+
+
+# ------------------------------------------------------------------------------------------- pretraining tuning
+def tune_subjects(splits: pd.DataFrame) -> set:
+    """Subjects in no seed's test split, the only ones pretraining choices may be scored on: the seeds' splits are
+    drawn independently, so a seed-0 val subject is often another seed's test subject."""
+    cols = [c for c in splits if c.startswith("split_s")]
+    return set(splits.loc[(splits[cols] != "test").all(axis=1), "subject"])
+
+
+CHANCE = {"auroc": 0.5, "c_index": 0.5, "qwk": 0.0}
+
+
+def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Tensor], index: dict[str, int],
+              device: str = "cuda", folds: int = 5) -> dict:
+    """Skill of one task on `rows` (tune_subjects only, no split used): out-of-fold predictions over `folds` subject
+    folds for every (head, feature, L2) of the benchmark grid; the candidate is chosen on one half of the subjects and
+    scored on the other, and vice versa (cross-fitted: no selection bias), averaged. skill: AUROC and C-index
+    2(m - 0.5), QWK as is, balanced accuracy (m - 1/k) / (1 - 1/k); dex: 1 - mean over datasets of the MAE within the
+    dataset over that of its out-of-fold train median (the site-constant predictor), so site is no help."""
+    y, _ = targets(rows, cfg)
+    y = y.to(device)
+    kind = KINDS[cfg["type"]](cfg, y.cpu())
+    subjects = rows["subject"].unique()
+    p = rows["subject"].map(dict(zip(subjects, np.random.default_rng(0).permutation(len(subjects))))).to_numpy()
+    half, fold = p % 2, (p // 2) % folds
+    ds, yy = rows["dataset"].to_numpy(), y.cpu().numpy()
+    if cfg["type"] == "dex":  # out-of-fold train median of the volume's dataset
+        base = np.full(len(rows), np.nan)
+        for k in range(folds):
+            med = pd.Series(yy[fold != k]).groupby(ds[fold != k]).median()
+            base[fold == k] = pd.Series(ds[fold == k]).map(med).to_numpy()
+        base = np.abs(base - yy)
+
+    def skill(pred, idx):
+        if cfg["type"] == "dex":
+            err = (pred[idx] - y[idx]).abs().cpu().numpy()
+            r = [err[g].mean() / base[idx][g].mean() for g in pd.Series(ds[idx]).groupby(ds[idx]).indices.values()
+                 if base[idx][g].mean() > 0]
+            return 1 - float(np.mean(r))
+        m = kind.metrics(pred[idx], y[idx], rows.iloc[idx])[kind.key]
+        lo = 1 / kind.k if kind.key == "balanced_accuracy" else CHANCE[kind.key]
+        return (m - lo) / (1 - lo)
+
+    rid = torch.tensor([index[i] for i in rows["id"]])
+    halves = [np.flatnonzero(half == h) for h in (0, 1)]
+    cands = []
+    for variant, hidden in HIDDEN.items():
+        for fname, f in feats.items():
+            x = f[rid].float().to(device)
+            for l2 in L2_GRID:
+                pred = None
+                for k in range(folds):
+                    tr, te = (torch.as_tensor(np.flatnonzero(m), device=device) for m in (fold != k, fold == k))
+                    mu, sd = x[tr].mean(0), x[tr].std(0).clamp_min(1e-6)
+                    pk = kind.predict(fit((x[tr] - mu) / sd, y[tr], kind, l2, hidden)((x[te] - mu) / sd))
+                    pred = pk.new_zeros(len(rows), *pk.shape[1:]) if pred is None else pred
+                    pred[te] = pk
+                cands.append({"head": variant, "feature": fname, "l2": l2, "skill": [skill(pred, h) for h in halves]})
+    a, b = (max(cands, key=lambda c, h=h: c["skill"][h]) for h in (0, 1))
+    return {"task": name, "metric": kind.key, "skill": (a["skill"][1] + b["skill"][0]) / 2, "n": len(rows),
+            "subjects": len(subjects), "chosen": [{k: c[k] for k in ("head", "feature", "l2")} for c in (a, b)]}
+
+
+def tune(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, splits: pd.DataFrame, out_dir: Path,
+         device: str = "cuda") -> pd.DataFrame:
+    """tune_task for every model x non-seg task on the tune_subjects -> <out>/tune.csv (+ the mean skill per model).
+    No test subject of any seed is read."""
+    keep, out = tune_subjects(splits), []
+    for m, d in models.items():
+        ids, feats = load_globals(d)
+        v = vols[vols["id"].isin(set(ids)) & vols["subject"].isin(keep)]
+        for tname, cfg in tasks.items():
+            if cfg["type"] == "seg":
+                continue
+            r = tune_task(tname, cfg, task_rows(v, splits, cfg, 0), feats, {i: k for k, i in enumerate(ids)}, device)
+            out.append({"model": m, **{k: r[k] for k in ("task", "skill", "subjects")}, "chosen": r["chosen"]})
+            print(f"[tune] {m} {tname}: skill {r['skill']:.3f} ({r['subjects']} subjects)", flush=True)
+    df = pd.DataFrame(out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "tune.csv", index=False)
+    print(df.groupby("model")["skill"].mean().rename("mean skill").to_string(), flush=True)
     return df
