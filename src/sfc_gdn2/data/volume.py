@@ -54,6 +54,7 @@ def load_canonical(path, frame: int | None = None) -> tuple[np.ndarray, tuple, f
             raise ValueError(f"{path}: {raw.shape[3]} frames, pass `frame`")
         raw = raw[..., frame or 0]
     raw = nio.apply_orientation(raw, ornt)
+    raw = raw.astype(raw.dtype.newbyteorder("="), copy=False)   # big-endian files: torch needs native order
     if raw.dtype == np.uint16:   # torch has no uint16 tensors
         raw = raw.astype(np.int32)
     elif raw.dtype == np.float64:
