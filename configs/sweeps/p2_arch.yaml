@@ -15,5 +15,5 @@ runs:
   - {model.view_pos: true}                        # A3: view position
   - {data.patch_mm: 8.0, objective.levels: [4, 8], objective.local_edge: [6, 16], objective.mask_cells: [2, 4, 8]}  # A5
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
-dense: {task: tumor_ucsf, iters: 2500, time: "02:00:00"}
-slurm: {gres: "gpu:2", launch.nproc_per_node: 2, cpus_per_task: 16, mem: 240G, time: "03:00:00"}
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}

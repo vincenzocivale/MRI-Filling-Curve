@@ -19,4 +19,4 @@ space:
   data.mix_alpha: {choice: [1.0, 0.7, 0.5]}
   aug: {log: [1.0, 3.0], scales: {objective.gamma: 0.3, objective.scale: 0.1, objective.shift: 0.05, objective.noise: 0.02}}
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
-slurm: {gres: "gpu:2", launch.nproc_per_node: 2, cpus_per_task: 16, mem: 240G, time: "03:00:00"}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}
