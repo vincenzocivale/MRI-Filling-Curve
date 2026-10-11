@@ -8,7 +8,8 @@ one axis). One SLURM job per config (preset 1gpu + the `slurm` --set fields, e.g
 wait in no second queue: <run>/job.sh pretrains (torchrun on the job's GPUs, output_root <root>/<name>/<i>), then
 - `tasks` (non-empty): skill (bench-extract --tune, split over the GPUs, + bench-probe --tune -> <run>/tune/tune.csv),
 - `dense: {task, iters}`: segdec pilot, best val Dice (bench-segdec --val-only -> <run>/segdec/),
-the probe and the pilot side by side on GPUs 0 and 1 when the job has two. <root>/<name>/sweep.csv lists configs and jobs.
+the probe and the pilot side by side on GPUs 0 and 1 when the job has two. <root>/<name>/sweep.csv lists configs and jobs;
+`--collect` adds what the finished runs wrote (last SSL loss, skill per task and mean, val Dice): results.csv.
 (boost_qos_dbg takes at most 2 submitted jobs per user: no place for evaluations of a whole sweep.)
 """
 from __future__ import annotations
@@ -66,13 +67,35 @@ def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def collect(root: Path) -> None:
+    """<root>/results.csv: sweep.csv + per run the last logged SSL loss, the skill per task and its mean, the val Dice."""
+    import pandas as pd
+    rows = pd.read_csv(root / "sweep.csv").to_dict("records")
+    for r in rows:
+        run = root / f"{r['i']:02d}"
+        if h := sorted(run.glob("*/history.csv")):
+            r |= pd.read_csv(h[0]).iloc[-1][["step", "loss"]].to_dict()
+        if (t := run / "tune" / "tune.csv").exists():
+            skill = pd.read_csv(t).set_index("task")["skill"]
+            r |= {"skill": skill.mean(), "tasks": len(skill), **skill.add_prefix("skill_").to_dict()}
+        for p in run.glob("segdec/*/*/*.json"):
+            r["val_dice"] = json.loads(p.read_text())["val_dice"]
+    df = pd.DataFrame(rows)
+    df.to_csv(root / "results.csv", index=False)
+    show = [c for c in df if df[c].astype(str).nunique(dropna=False) > 1 or c in ("i", "loss", "skill", "tasks", "val_dice")]
+    print(df[[c for c in show if c != "job" and not c.startswith("skill_")]].to_string(index=False, float_format="%.4g"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("spec", type=Path)
     ap.add_argument("--dry-run", action="store_true", help="print the configs and the first job script, submit nothing")
+    ap.add_argument("--collect", action="store_true", help="gather the finished runs' results into results.csv")
     a = ap.parse_args()
     spec = yaml.safe_load(a.spec.read_text())
     rng, root = random.Random(spec.get("seed", 0)), Path(spec["root"]) / spec["name"]
+    if a.collect:
+        return collect(root)
     slurm = spec.get("slurm") or {}
     gpus = int(str(slurm.get("gres", "gpu:1")).split(":")[-1])
     sets = [x for k, v in slurm.items() for x in ("--set", f"{k}={v}")]
