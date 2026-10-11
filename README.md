@@ -74,21 +74,9 @@ No dataset or GDN-2 code is redistributed here (`THIRD_PARTY.md`).
 
 ## SLURM (CINECA Leonardo)
 
-`slurm/submit.py` turns a YAML preset into a batch script (repo root as cwd, conda env active) and
-submits it; any `sfc` command or script goes after `--`:
-
-```bash
-cp slurm/local.yaml.example slurm/local.yaml      # once: mail, conda base / env path
-python slurm/submit.py slurm/presets/dbg.yaml -- sfc fm configs/fm/brainiac.yaml --images a.nii.gz --out o
-python slurm/submit.py slurm/presets/cpu.yaml -- sfc pretrain-pool configs/pretrain_lejepa.yaml --workers 8
-python slurm/submit.py slurm/presets/4gpu.yaml --chain 5 -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
-```
-`--chain N`: N jobs one after the other; each resumes the run's `ckpt.pt` (full state, every `train.ckpt_every`
-steps), so a run can outlast the 24 h limit.
-
-Presets: `dbg` (1 GPU, debug QOS, 30 min), `1gpu`, `4gpu` and `8gpu` (torchrun DDP, 1 and 2 nodes),
-`cpu` (`lrd_all_serial`). Under torchrun the command is `-m <module>` or a script, never `python`.
-Config: `slurm/defaults.yaml` <- `slurm/local.yaml` <- preset <- `--set key=value`; logs in `outputs/slurm/`.
+`slurm/submit.py` turns a YAML preset (`slurm/presets/`: `dbg` 1 GPU on the debug QOS, `1gpu`, `4gpu` torchrun
+DDP, `cpu` on `lrd_all_serial`) into a batch script and submits it: usage, examples, multi-node and `--chain` (runs
+past the 24 h limit) in `python slurm/submit.py -h`. Mail: `cp slurm/local.yaml.example slurm/local.yaml` once.
 Configs carry Leonardo paths (runs and raw data on `$SCRATCH`, metadata on `$WORK`). `configs/leonardo/` keeps
 aliases of the benchmark configs for jobs queued before the move to `configs/bench/`.
 flash-attn's upstream wheels need GLIBC 2.32 (Leonardo: 2.28); build it with `slurm/build_flash_attn.sh`.
@@ -110,4 +98,4 @@ Each image gives `<out>/<id>.pt` = `{features: {name: tensor}, canonical, derive
 `canonical` names the embedding the repo itself uses, `derived` lists anything we added (e.g. a pooling
 the repo does not define), `meta` maps the feature grid back to the image (for voxel/patch probes).
 `tests/fm/<family>_parity.py` (run in the model's env) checks a wrapper against the untouched original
-pipeline. Linear probing on these features is not wired yet.
+pipeline.

@@ -12,7 +12,9 @@ script path there, never `python`:
     python slurm/submit.py slurm/presets/1gpu.yaml --job-name probe -- \\
         sfc bench-probe configs/bench/bench.yaml --models <model>
     python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
-    python slurm/submit.py slurm/presets/cpu.yaml --dry-run -- python tests/fm/brainfm_parity.py
+    python slurm/submit.py slurm/presets/cpu.yaml -- sfc pretrain-pool configs/pretrain_lejepa.yaml --workers 8
+
+Multi-node: `4gpu.yaml --set nodes=2` (2 nodes x 4 GPUs; torchrun --nnodes follows `nodes`).
 
 Runs longer than the 24 h limit: `--chain N` submits N copies, each after the previous ends (afterany);
 `sfc pretrain` resumes its run directory's ckpt.pt, so the copies continue one run:
@@ -20,6 +22,7 @@ Runs longer than the 24 h limit: `--chain N` submits N copies, each after the pr
     python slurm/submit.py slurm/presets/4gpu.yaml --chain 5 -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
 
 Config = slurm/defaults.yaml <- slurm/local.yaml (per user, gitignored) <- preset <- --set key=value.
+Logs in outputs/slurm/.
 """
 from __future__ import annotations
 
@@ -28,23 +31,17 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 SLURM_DIR = Path(__file__).resolve().parent
 REPO = SLURM_DIR.parent
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
-    try:
-        import yaml
-    except ImportError as e:
-        raise SystemExit("PyYAML is needed: activate the repo's conda env (sfc-gdn2) first.") from e
-    data = yaml.safe_load(path.read_text()) or {}
-    if not isinstance(data, dict):
-        raise SystemExit(f"{path}: expected a YAML mapping")
-    return data
+    return yaml.safe_load(path.read_text()) or {}
 
 
 def merge(base: dict, over: dict) -> dict:
@@ -71,15 +68,6 @@ def load_config(preset: Path, overrides: list[str]) -> dict[str, Any]:
     return cfg
 
 
-def conda_base(explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    try:
-        return subprocess.check_output(["conda", "info", "--base"], text=True, stderr=subprocess.DEVNULL).strip()
-    except (OSError, subprocess.CalledProcessError) as e:
-        raise SystemExit("Cannot find conda: set conda.base in slurm/local.yaml") from e
-
-
 def directive(key: str, value: Any) -> str | None:
     if value is None or value is False:
         return None
@@ -89,13 +77,12 @@ def directive(key: str, value: Any) -> str | None:
 
 def build_script(cfg: dict[str, Any], command: list[str]) -> tuple[str, str]:
     logs_dir = cfg["logs"]["dir"].format(repo=REPO)
-    logs = {k: cfg["logs"][k].format(logs_dir=logs_dir, repo=REPO) for k in ("output", "error")}
     launch = cfg.get("launch") or {}
     mail = cfg.get("mail") or {}
     head = [directive(k, cfg.get(k)) for k in
             ("partition", "account", "qos", "job_name", "nodes", "ntasks_per_node", "cpus_per_task", "gres",
-             "mem", "time", "signal", "array")]
-    head += [directive("output", logs["output"]), directive("error", logs["error"]),
+             "mem", "time")]
+    head += [directive("output", f"{logs_dir}/%x_%j.out"), directive("error", f"{logs_dir}/%x_%j.err"),
              directive("mail_type", mail.get("type") if mail.get("user") else None),
              directive("mail_user", mail.get("user"))]
 
@@ -112,19 +99,16 @@ def build_script(cfg: dict[str, Any], command: list[str]) -> tuple[str, str]:
 
     body = [f"cd {shlex.quote(str(REPO))}",
             *(f"module load {m}" for m in cfg.get("modules") or []),
-            f"source {shlex.quote(conda_base((cfg.get('conda') or {}).get('base')) + '/etc/profile.d/conda.sh')}",
+            f"source {shlex.quote(str(cfg['conda']['base']) + '/etc/profile.d/conda.sh')}",
             f"conda activate {shlex.quote(str(cfg['conda']['env']))}",
             *(f"export {k}={shlex.quote(str(v))}" for k, v in (cfg.get("env") or {}).items()),
-            *(str(line) for line in cfg.get("setup") or []),
             'echo "[sfc] $(date) job $SLURM_JOB_ID on $SLURM_NODELIST, commit $(git rev-parse --short HEAD)"',
             *run]
     return "\n".join(["#!/bin/bash", *filter(None, head), "set -eo pipefail", "", *body]) + "\n", logs_dir
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    if "--" not in argv:
-        raise SystemExit("Missing '--' before the command; see `python slurm/submit.py -h`.")
-    sep = argv.index("--")
+    sep = argv.index("--") if "--" in argv else len(argv)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("preset", type=Path, help="slurm/presets/<name>.yaml")
     ap.add_argument("--job-name", help="override the job name")
@@ -132,11 +116,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--after-job", metavar="JOB_ID", help="start after JOB_ID ends (--dependency=afterany)")
     ap.add_argument("--chain", type=int, default=1, metavar="N", help="submit N copies, each after the previous")
     ap.add_argument("--dry-run", action="store_true", help="print the batch script, do not submit")
-    ap.add_argument("--script-out", type=Path, help="also write the batch script here")
     args = ap.parse_args(argv[:sep])
     args.command = argv[sep + 1:]
     if not args.command:
-        raise SystemExit("Empty command after '--'.")
+        raise SystemExit("Missing command after '--'; see `python slurm/submit.py -h`.")
     return args
 
 
@@ -149,25 +132,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.job_name:
         cfg["job_name"] = args.job_name
     script, logs_dir = build_script(cfg, args.command)
-    if args.script_out:
-        args.script_out.parent.mkdir(parents=True, exist_ok=True)
-        args.script_out.write_text(script)
     if args.dry_run:
         print(script)
         return 0
     if not shutil.which("sbatch"):
         raise SystemExit("sbatch not found (not on a SLURM login node?)")
     Path(logs_dir).mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
-        f.write(script)
     after, jobs = args.after_job, []
-    try:
-        for _ in range(args.chain):
-            cmd = ["sbatch", "--parsable", *([f"--dependency=afterany:{after}"] if after else []), f.name]
-            after = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip().split(";")[0]
-            jobs.append(after)
-    finally:
-        Path(f.name).unlink()
+    for _ in range(args.chain):
+        cmd = ["sbatch", "--parsable", *([f"--dependency=afterany:{after}"] if after else [])]
+        out = subprocess.run(cmd, input=script, check=True, capture_output=True, text=True).stdout
+        after = out.strip().split(";")[0]
+        jobs.append(after)
     print(f"Submitted batch job {' -> '.join(jobs)} (logs: {logs_dir})")
     return 0
 

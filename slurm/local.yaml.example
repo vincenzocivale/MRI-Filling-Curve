@@ -1,6 +1,3 @@
 # Per-user overrides: cp slurm/local.yaml.example slurm/local.yaml
 mail:
   user: you@example.com
-conda:
-  base: /path/to/miniconda3
-  env: /path/to/envs/sfc-gdn2

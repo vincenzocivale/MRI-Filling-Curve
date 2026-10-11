@@ -4,4 +4,3 @@ job_name: sfc_cpu
 partition: lrd_all_serial
 gres: null
 mem: 30G
-time: "04:00:00"

@@ -9,7 +9,7 @@ This repository contains no third-party model or dataset files.
 
 Users are responsible for accepting and complying with the current upstream terms before use.
 
-## Foundation-model comparison (`sfc fm`, optional `fm` extra)
+## Foundation-model comparison (`sfc fm`)
 
 No weights or model code are redistributed. Adapters in `src/sfc_gdn2/fm/` build each encoder from the
 original library (MONAI, `dynamic-network-architectures`, Apache-2.0) or re-implement it in torch with the

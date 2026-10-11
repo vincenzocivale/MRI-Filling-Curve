@@ -25,7 +25,8 @@ ruff check .
 GDN-2 is at `/leonardo_work/IscrC_SFMRI/fcorrent/repos/GatedDeltaNet-2` (on the env's path via `gdn2.pth`).
 flash-attn is built from source (`slurm/build_flash_attn.sh`): the upstream wheels need GLIBC 2.32, Leonardo has 2.28.
 Configs carry Leonardo paths (runs and raw data on $SCRATCH); `configs/leonardo/` only aliases the benchmark configs.
-GPU work goes through SLURM (`slurm/submit.py`, 4x A100 64GB per node; short tests on `slurm/presets/dbg.yaml`);
+GPU work goes through SLURM (`python slurm/submit.py slurm/presets/<p>.yaml -- <cmd>`, 4x A100 64GB per node; short
+tests on the `dbg` preset);
 compute nodes are offline, so data, weights and sdists are fetched on a login node.
 The first GPU run spends minutes compiling Triton kernels (`TRITON_CACHE_DIR` on $WORK keeps them across jobs).
 
@@ -38,7 +39,7 @@ The first GPU run spends minutes compiling Triton kernels (`TRITON_CACHE_DIR` on
 - `pretrain.py`: `Pretrainer` (bf16, fused AdamW, decay on matrices only, warmup + WSD or cosine, grad clip,
   non-finite steps skipped, `encoder_step*.pt` incl. step 0; `ckpt.pt` every `ckpt_every` steps, resumed
   automatically: same config = same run directory).
-- `data/`: `catalog` (every volume + labels), `pool` (pretraining manifest), `VolumeStore` (native, cache optional), loader (volumes as a list;
+- `data/`: `catalog` (every volume + labels), `pool` (`sfc pretrain-pool`: pretraining manifest, header pass with `n_patch` per scan), `VolumeStore` (native, cache optional), loader (volumes as a list;
   `to_device` makes values + per-scan [N,P] patches; `grid`, `k`, `spacing` [B,3]).
 - `fm/`: external foundation models, image -> the model's own features. `api.extract` (`sfc fm`) runs `worker.py` under the model's conda env (`envs/fm/`, path in `configs/fm/*.yaml`); each wrapper (`base.Wrapper`) imports the ORIGINAL repo code for preprocessing, network, inference and outputs. Parity scripts in `tests/fm/`.
 - `bench/` (config `configs/bench/bench.yaml`): `split.py` volume list (one per subject/session/sequence), input
@@ -48,9 +49,7 @@ The first GPU run spends minutes compiling Triton kernels (`TRITON_CACHE_DIR` on
   segmentation through each model's OFFICIAL downstream decoder (wrapper hooks `seg_input` / `seg_net` / optional
   `seg_preprocess`, `seg_context`) on its frozen pretrained encoder, same recipe for all, `init: random` baseline, full
   resolution; `geom.py`: source voxel -> model grid. Ours: `fm/sfc.py` (Primus PatchDecode on the frozen encoder).
-- `data/pool.py` (`sfc pretrain-pool`): pretraining manifest from the catalog, header pass (`n_patch` per scan).
 - `cli.py`: `sfc pretrain-pool|pretrain|fm|bench-split|bench-extract|bench-probe|bench-segdec`.
-- `slurm/`: `submit.py` + YAML presets to sbatch any command on Leonardo (`python slurm/submit.py slurm/presets/<p>.yaml -- <cmd>`).
 
 ## Invariants (do not break)
 
