@@ -33,6 +33,11 @@ bounds the tokens per step whatever the field of view.
   share them whatever their boxes): mean foreground bi token per cell; every cell whose foreground is
   entirely masked in A is pulled to the same cell in B (`cell<c>` head); SIGReg on `tokens_per_volume` of
   B's cells per volume.
+- volume (LeJEPA's multi-crop over the volume's boxes): the top of every view of every box -> `volume` head; each
+  view pulled to the mean of the volume's global views; SIGReg per view slot, one sample per volume.
+- session: the same over the scans of one session in the batch (the loader batches each scan with a random other
+  scan of its session): what all its sequences share (anatomy, age, sex), not the acquisition signature that
+  alone tells a volume's boxes from the rest of the batch. Its own head; SIGReg one sample per session.
 loss = (1 - lam) * mean(invariances) + lam * mean(SIGRegs), one of each per scale.
 SIGReg sees every rank's samples; its statistic scales with their count, so it is rescaled by
 sigreg_gpus / world size: the objective (lam tuned on 4 GPUs) does not change with the number of GPUs.
@@ -124,6 +129,8 @@ class LeJEPA(nn.Module):
         self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.cell = nn.ModuleList(Projector(2 * encoder.dim, proj_hidden, proj_dim) for _ in self.levels)
+        self.volume = Projector(2 * encoder.dim, proj_hidden, proj_dim)
+        self.session = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
         perms, flips = symmetries()
         self.register_buffer("perms", perms, persistent=False)
@@ -277,7 +284,7 @@ class LeJEPA(nn.Module):
 
     def forward(self, vols: dict, generator: torch.Generator) -> dict[str, torch.Tensor]:
         """vols (`dataset.to_device`): patches = per scan [N_b, P_b] native voxel values, spacing [B,3] mm,
-        k [B,3] voxels per patch axis, grid [B,3] patch grid."""
+        k [B,3] voxels per patch axis, grid [B,3] patch grid; optional session [B] (any ids, default: one per scan)."""
         grid, gen = vols["grid"], generator
         b, n_patch = len(grid), int(grid.prod(1).max())
         xyz = grid_coords(grid, n_patch)                                                  # [B,N,3]
@@ -290,7 +297,7 @@ class LeJEPA(nn.Module):
         ws = [memo[(*sp, *k)] for sp, k in zip(vols["spacing_list"], vols["k_list"])]
         corner, edge = self.jittered(*self.boxes(fg, xyz, grid, gen), grid, gen)           # [B,G,2,3]
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
-        zg, pred, tgt, ztok, tvol, tfg, lens = [], [], [], [], [], [], []
+        zg, pred, tgt, ztok, tvol, tfg, lens, tops = [], [], [], [], [], [], [], []
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
             c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
@@ -299,6 +306,7 @@ class LeJEPA(nn.Module):
             w = fgv | (valid & ~fgv.any(1, keepdim=True))                              # foreground (all if none)
             top = torch.bmm(w[:, None].to(bi.dtype), bi)[:, 0].float() / w.sum(1, keepdim=True)
             zg.append(self.glob(top).float().view(b, -1, 2, self.glob[-1].out_features))
+            tops.append(top.view(b, -1, top.shape[-1]))
             a, bb = masked.nonzero()[:, 0], (~masked).nonzero()[:, 0]
             pxyz, gv = xyz[v[:, None], idx], grid[v]
             for i, (cs, head) in enumerate(zip(self.levels, self.cell)):
@@ -344,13 +352,23 @@ class LeJEPA(nn.Module):
             out[f"inv_cell{cs}"] = (p - q).square().mean(-1).sum() / max(len(p), 1) / 4
             out[f"sigreg_cell{cs}"] = sig(z[self._sample(vb, torch.ones_like(vb, dtype=torch.bool), b, gen)][None])
             out[f"pairs_cell{cs}"] = torch.tensor(float(len(p)), device=z.device)
+        tops = torch.cat(tops, 1)                                                          # [B,V,2d], globals first
+        ses = vols.get("session", torch.arange(b, device=grid.device)).unique(return_inverse=True)[1]
+        for name, grp in (("volume", torch.arange(b, device=grid.device)), ("session", ses)):
+            head, n = getattr(self, name), int(grp.max()) + 1
+            z = head(tops.flatten(0, 1)).float().view(b, -1, head[-1].out_features)       # [B,V,D]
+            cnt = torch.bincount(grp, minlength=n).clamp_min(1)[:, None]
+            centre = z.new_zeros(n, z.shape[-1]).index_add_(0, grp, z[:, : 2 * self.gg].mean(1)) / cnt
+            out[f"inv_{name}"] = (z - centre[grp][:, None]).square().mean()
+            per = z.new_zeros(n, *z.shape[1:]).index_add_(0, grp, z) / cnt[..., None]      # one sample per group
+            out[f"sigreg_{name}"] = sig(per.transpose(0, 1))                               # [V,n,D]: per view slot
         with torch.no_grad():                                   # between-volume share of token-embedding variance
             zt, tv = ztok[keep], tvol[keep]
             means = torch.zeros(b, zt.shape[1], device=zt.device).index_add_(0, tv, zt)
             means /= torch.bincount(tv, minlength=b).clamp_min(1)[:, None]
             vol_share = 1 - (zt - means[tv]).var(0).sum() / zt.var(0).sum()
-        inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels)]
-        sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels)]
+        inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels), out["inv_volume"], out["inv_session"]]
+        sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels), out["sigreg_volume"], out["sigreg_session"]]
         return {"loss": (1 - self.lam) * sum(inv) / len(inv) + self.lam * sum(sigs) / len(sigs),
                 "inv_global": inv_g, "inv_token": inv_t, "sigreg_global": sig_g, "sigreg_token": sig_t, **out,
                 "vol_share": vol_share, "len_global": lens[0], "len_local": lens[1]}

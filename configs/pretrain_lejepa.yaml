@@ -1,7 +1,8 @@
 # LeJEPA over groups of patches: `sfc pretrain-pool` once (CPU job), then `sfc pretrain configs/pretrain_lejepa.yaml`.
 # Per volume, groups (boxes of the patch grid); per group, two views (jittered box, intensity,
 # own curve of `view_curves`; view A masked in aligned cubes). One masked-prediction task per scale (H-JEPA
-# pattern, space for time): patch tokens, cubes of `levels` patches, the whole view (mean token) on top. No held-out set:
+# pattern, space for time): patch tokens, cubes of `levels` patches, the whole view (mean token), then every view of a
+# volume, then every view of a session (the loader batches scans in pairs of one session). No held-out set:
 # every checkpoint (save_every) is probed; the benchmark (bench.yaml group `sfc`) reads the last one.
 seed: 17
 output_root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/sfc_pretrain_v8

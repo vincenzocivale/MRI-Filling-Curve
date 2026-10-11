@@ -90,24 +90,43 @@ class BudgetBatches:
     With `weights`: an epoch is len(sizes) scans drawn with replacement in proportion to them (mixing).
     One endless stream for every rank: epochs (seed + epoch) back to back, rank r of `world` takes batches
     r, r + world, ...; the first `start` batches of the stream are skipped. A step consumes `world` batches, so a
-    run resumes on any number of GPUs from the count consumed so far."""
+    run resumes on any number of GPUs from the count consumed so far.
+    With `groups` (session per scan): each drawn scan comes with a random other scan of its group in the same batch
+    (alone if it has none, or if the two exceed the budget)."""
 
     def __init__(self, sizes: list[int], budget: int, max_batch: int, seed: int,
-                 weights: torch.Tensor | None = None, rank: int = 0, world: int = 1):
+                 weights: torch.Tensor | None = None, rank: int = 0, world: int = 1, groups=None):
         self.sizes, self.budget, self.max_batch, self.seed, self.weights = sizes, budget, max_batch, seed, weights
         self.rank, self.world, self.start = rank, world, 0
+        self.groups = None if groups is None else torch.tensor(groups)
+        if self.groups is not None:  # scans sorted by group: a group's scans are members[first : first + count]
+            self.members = torch.argsort(self.groups, stable=True)
+            self.count = torch.bincount(self.groups)
+            self.first = self.count.cumsum(0) - self.count
+            self.slot = torch.empty_like(self.groups)
+            self.slot[self.members] = torch.arange(len(self.groups)) - self.first[self.groups[self.members]]
 
     def batches(self, epoch: int):
         g = torch.Generator().manual_seed(self.seed + epoch)
         order = (torch.randperm(len(self.sizes), generator=g) if self.weights is None
                  else torch.multinomial(self.weights, len(self.sizes), replacement=True, generator=g))
+        units = [[i] for i in order.tolist()]
+        if self.groups is not None:
+            grp = self.groups[order]
+            n = self.count[grp]
+            j = (torch.rand(len(order), generator=g) * (n - 1)).long()
+            j += j >= self.slot[order]                                    # any member but the scan itself
+            mate = self.members[self.first[grp] + j.minimum(n - 1)]
+            units = [[i, m] if k > 1 and self.sizes[i] + self.sizes[m] <= self.budget else [i]
+                     for i, m, k in zip(order.tolist(), mate.tolist(), n.tolist())]
         batch, total = [], 0
-        for i in order.tolist():
-            if batch and (total + self.sizes[i] > self.budget or len(batch) == self.max_batch):
+        for u in units:
+            size = sum(self.sizes[i] for i in u)
+            if batch and (total + size > self.budget or len(batch) + len(u) > self.max_batch):
                 yield batch
                 batch, total = [], 0
-            batch.append(i)
-            total += self.sizes[i]
+            batch += u
+            total += size
 
     def __iter__(self):
         stream = itertools.chain.from_iterable(self.batches(e) for e in itertools.count())
@@ -128,7 +147,8 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: i
     """Training: endless `BudgetBatches` over all rows, this rank's share (`rank` of `world`), worker-persistent;
     with `data.patches_per_batch`,
     batches of up to batch_size whole scans holding at most that many patches, else batch_size scans; with
-    `data.mix_alpha` (and `mix_by`), strata reweighted. Evaluation: ordered, batch_size scans."""
+    `data.mix_alpha` (and `mix_by`), strata reweighted; with `subject`/`session` columns, scans batched in pairs of
+    one session (`session_ids`). Evaluation: ordered, batch_size scans."""
     store = VolumeStore(data["cache_dir"])
     workers = int(data.get("num_workers", 8))
     common = {"num_workers": workers, "collate_fn": collate, "pin_memory": True,
@@ -149,5 +169,13 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, train: bool, seed: i
             sizes.append(int(patch_grid(arr.shape, patch_dims(spacing, data["patch_mm"])).prod()))
     weights = mix_weights(rows, data.get("mix_by", ["dataset", "modality"]), float(data.get("mix_alpha", 1.0)))
     ds = PatchDataset(rows, store, data["patch_mm"], sizes=sizes, **ds_kwargs)
-    return DataLoader(ds, batch_sampler=BudgetBatches(sizes, budget, batch_size, seed, weights, rank, world),
-                      **common)
+    return DataLoader(ds, batch_sampler=BudgetBatches(sizes, budget, batch_size, seed, weights, rank, world,
+                                                      session_ids(rows)), **common)
+
+
+def session_ids(rows: pd.DataFrame) -> np.ndarray | None:
+    """Session index per row (subject x session; a missing session is one per subject), None without those columns."""
+    if not {"subject", "session"} <= set(rows):
+        return None
+    key = [rows["subject"], rows["session"].astype(str)]  # read_csv may mix int and str sessions across chunks
+    return rows.groupby(key, dropna=False, sort=False).ngroup().to_numpy()

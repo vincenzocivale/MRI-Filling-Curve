@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-from .data.dataset import loader, to_device
+from .data.dataset import loader, session_ids, to_device
 from .io import RunDir, seed_all
 from .lejepa import LeJEPA
 
@@ -76,6 +76,8 @@ class Pretrainer:
         self.loader = loader(rows, cfg["data"], t["batch_size"], train=True, seed=self.seed, rank=self.rank,
                              world=world)
         self.net = LeJEPA.from_config(cfg).to(self.device)
+        ses = session_ids(rows)  # the objective's session level (scans of one session batched together)
+        self.session = torch.tensor(ses) if ses is not None else torch.arange(len(rows))
         self.model = DistributedDataParallel(self.net, device_ids=[self.device.index]) if world > 1 else self.net
         self.opt = torch.optim.AdamW(param_groups(self.net, t["weight_decay"]), lr=t["lr"], fused=True)
         self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lambda s: lr_factor(s, t))
@@ -134,7 +136,8 @@ class Pretrainer:
             patches += int(batch["grid"].prod(1).sum())
             gen.manual_seed((self.seed * 1_000_003 + step) * 4096 + self.rank)  # resumable on any number of GPUs
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = self.model(to_device(batch, self.device), gen)
+                vols = to_device(batch, self.device) | {"session": self.session[batch["index"]].to(self.device)}
+                out = self.model(vols, gen)
             self.opt.zero_grad(set_to_none=True)
             out["loss"].backward()
             gnorm = nn.utils.clip_grad_norm_(self.model.parameters(), clip)
