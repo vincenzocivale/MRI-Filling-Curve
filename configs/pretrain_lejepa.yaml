@@ -55,11 +55,15 @@ objective:
   fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
   proj_hidden: 1024
   proj_dim: 64                # every head (view mean, patch, each cube level); LeJEPA Tab. 1d: small is better
-  tokens_per_volume: 5        # B foreground tokens per volume fed to the token SIGReg (4 GPUs x 36 vols x 5 = 720 samples)
+  tokens_per_volume: 32       # B foreground tokens (and cells) per volume fed to their SIGReg: the estimate's sample
+                              # count only (4 GPUs x 36 vols x 32 = 4608), not its weight (sigreg_samples); <32 also
+                              # biases vol_share up (within-volume variance from too few tokens: floor 0.2 at 5)
   lam: 0.05                   # loss = (1-lam)*invariance + lam*SIGReg
   sigreg_slices: 256
   sigreg_knots: 17
-  sigreg_gpus: 4              # SIGReg rescaled by this / world size: same objective on any number of GPUs (lam tuned on 4)
+  sigreg_samples: 768         # every SIGReg rescaled to this many samples (it grows with its sample count): same weight
+                              # for every term whatever batch, tokens_per_volume, groups or GPUs; 768 = what lam was tuned on
+  w_top: 1.0                  # weight of the view, volume and session terms (token and cells: 1), in both means
 
 train:
   steps: 15000

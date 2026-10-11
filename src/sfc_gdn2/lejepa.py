@@ -26,9 +26,9 @@ bounds the tokens per step whatever the field of view.
   Token targets are foreground only (as Vol-JEPA's head mask): background patches stay in the
   sequence (with no position embedding their count is spatial signal) but are never masked, paired or
   sampled for SIGReg, so near-identical air tokens neither give free pairs nor a degenerate mass.
-  SIGReg on B's foreground token embeddings: `tokens_per_volume` per volume, so the sample count stays in
-  LeJEPA's calibrated range (scaled by ~20k tokens it gave per-patch noise; by #volumes it let a
-  per-volume code through).
+  SIGReg on B's foreground token embeddings, `tokens_per_volume` per volume (only the estimate's sample count:
+  the weight is fixed by `sigreg_samples`; when SIGReg still scaled with it, ~20k tokens gave per-patch noise and
+  #volumes let a per-volume code through).
 - cells (`levels`, e.g. 2, 4, 8 patches = 32, 64, 128 mm per edge, aligned on the patch grid, so A and B
   share them whatever their boxes): mean foreground bi token per cell; every cell whose foreground is
   entirely masked in A is pulled to the same cell in B (`cell<c>` head); SIGReg on `tokens_per_volume` of
@@ -38,9 +38,12 @@ bounds the tokens per step whatever the field of view.
 - session: the same over the scans of one session in the batch (the loader batches each scan with a random other
   scan of its session): what all its sequences share (anatomy, age, sex), not the acquisition signature that
   alone tells a volume's boxes from the rest of the batch. Its own head; SIGReg one sample per session.
-loss = (1 - lam) * mean(invariances) + lam * mean(SIGRegs), one of each per scale.
-SIGReg sees every rank's samples; its statistic scales with their count, so it is rescaled by
-sigreg_gpus / world size: the objective (lam tuned on 4 GPUs) does not change with the number of GPUs.
+loss = (1 - lam) * wmean(invariances) + lam * wmean(SIGRegs), one of each per scale, weight `w_top` for the view,
+volume and session terms and 1 for token and cells.
+SIGReg sees every rank's samples. Its statistic grows with their count M (a test statistic), which made every
+term's weight its sample count (view ~1152 vs session ~72 per step): each is rescaled by sigreg_samples / M, so
+every term weighs as one of sigreg_samples samples (768: the token term lam was tuned on) whatever the batch,
+`tokens_per_volume`, groups or number of GPUs.
 """
 from __future__ import annotations
 
@@ -82,7 +85,7 @@ class SIGReg(nn.Module):
 
     def forward(self, z: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         """z: [..., M, D] -> scalar (mean over leading dims and slices). Scaled by M like a test
-        statistic: lam=0.05 assumes M in LeJEPA's range (~hundreds to ~1000 samples)."""
+        statistic (LeJEPA's); LeJEPA.forward rescales it to a fixed M."""
         with torch.autocast(z.device.type, enabled=False):  # cos/sin of bf16 projections is too coarse
             z = z.float()
             a = torch.randn(z.shape[-1], self.slices, device=z.device, generator=generator)
@@ -113,7 +116,8 @@ class LeJEPA(nn.Module):
                  thick_mm: tuple = (4.0, 8.0), mask_ratio: tuple = (0.2, 0.5), gamma: float = 0.3, scale: float = 0.1,
                  shift: float = 0.05, noise: float = 0.02, fg_threshold: float = 0.05, proj_hidden: int = 1024,
                  proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
-                 sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_gpus: int = 4):
+                 sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
+                 w_top: float = 1.0):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -121,7 +125,7 @@ class LeJEPA(nn.Module):
         self.embed_chunk_voxels, self.max_packed_tokens = embed_chunk_voxels, max_packed_tokens
         self.checkpoint_tokens = checkpoint_tokens
         self.thick_prob, self.thick_mm = thick_prob, tuple(float(t) for t in thick_mm)
-        self.tokens_per_volume, self.sigreg_gpus = tokens_per_volume, sigreg_gpus
+        self.tokens_per_volume, self.sigreg_samples, self.w_top = tokens_per_volume, sigreg_samples, w_top
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
         self.levels = [int(c) for c in levels]
@@ -342,9 +346,11 @@ class LeJEPA(nn.Module):
         # equal foreground tokens per volume (with replacement: fixed shape for the cross-GPU gather); a
         # volume whose B views hold no foreground (boxes are centred on it, so only after jitter) falls back to all
         keep = self._sample(tvol, tfg, b, gen)
-        dist = torch.distributed.is_initialized()   # SIGReg sees every rank's samples (differentiable gather)
-        world = torch.distributed.get_world_size() if dist else 1
-        sig = lambda z: self.sigreg(gather_rows(z) if dist else z, gen) * (self.sigreg_gpus / world)
+
+        def sig(z):  # every rank's samples (differentiable gather), weighed as sigreg_samples whatever their count
+            z = gather_rows(z) if torch.distributed.is_initialized() else z
+            return self.sigreg(z, gen) * (self.sigreg_samples / z.shape[-2])
+
         sig_g, sig_t = sig(zg.permute(2, 0, 1, 3).reshape(2, -1, zg.shape[-1])), sig(ztok[keep][None])
         out = {}
         for cs, p, q, z, vb in zip(self.levels, cpred, ctgt, cz, cvol):
@@ -369,7 +375,9 @@ class LeJEPA(nn.Module):
             vol_share = 1 - (zt - means[tv]).var(0).sum() / zt.var(0).sum()
         inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels), out["inv_volume"], out["inv_session"]]
         sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels), out["sigreg_volume"], out["sigreg_session"]]
-        return {"loss": (1 - self.lam) * sum(inv) / len(inv) + self.lam * sum(sigs) / len(sigs),
+        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), self.w_top, self.w_top]
+        wmean = lambda xs: sum(a * x for a, x in zip(w, xs)) / sum(w)
+        return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs),
                 "inv_global": inv_g, "inv_token": inv_t, "sigreg_global": sig_g, "sigreg_token": sig_t, **out,
                 "vol_share": vol_share, "len_global": lens[0], "len_local": lens[1]}
 

@@ -55,8 +55,10 @@ class KernelEmbed(nn.Module):
         f = torch.logspace(math.log10(1 / (4 * patch_mm)), math.log10(max_cycles_per_mm), freqs)
         self.register_buffer("freqs", 2 * math.pi * f, persistent=False)
         self.phi = nn.Sequential(nn.Linear(2 * freqs, hidden), nn.GELU(), nn.Linear(hidden, 3 * rank))
-        # init: a constant patch of 1s gives tokens of std ~0.5 at every spacing
-        self.G = nn.Parameter(torch.randn(d, rank, rank, rank) * 1000 / rank ** 1.5)
+        # init: a constant patch of 1s gives tokens of std ~0.5 at every spacing. The 1000 is a constant in
+        # `weights`, not in G: AdamW steps are ~lr in absolute size, so G at std ~16 learned ~250x slower than the
+        # other matrices (renamed from G: an old checkpoint fails to load instead of embedding 1000x off)
+        self.G_unit = nn.Parameter(torch.randn(d, rank, rank, rank) / rank ** 1.5)
         self.bias = nn.Parameter(torch.zeros(d))
 
     def axis_integrals(self, spacing: torch.Tensor, k) -> list[torch.Tensor]:
@@ -73,8 +75,8 @@ class KernelEmbed(nn.Module):
     def weights(self, spacing: torch.Tensor, k) -> torch.Tensor:
         """spacing [3] mm, k [3] voxels per patch axis -> W [k0*k1*k2, d] (patchify's voxel order)."""
         px, py, pz = self.axis_integrals(spacing, k)
-        w = torch.einsum("dabc,xa,yb,zc->xyzd", self.G, px, py, pz)
-        return w.reshape(-1, self.G.shape[0]) / self.patch_mm ** 3
+        w = torch.einsum("dabc,xa,yb,zc->xyzd", self.G_unit, px, py, pz)
+        return w.reshape(-1, self.G_unit.shape[0]) * (1000 / self.patch_mm ** 3)
 
     def forward(self, patches: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """[..., P] native voxel values (fp32: the embedding sees them unrounded) -> [..., d]."""
