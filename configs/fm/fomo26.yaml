@@ -8,6 +8,5 @@ repo: ${SFC_FM_REPOS}/fomo26-fomo-lp
 commit: f915d5a
 checkpoint: ${SFC_FM_MODELS}/FOMO26-baseline/baselines/resenc_unet_b.ckpt
 args:
-  encoder: official     # official = embed_all's CLSREG encoder (MaxPool shortcuts); pretrain = pretraining encoder (AvgPool)
   reorient_ras: true    # reproduces the organisers' RAS delivery of the challenge data (only if the file is not RAS)
   target_size: 160      # embed_all default

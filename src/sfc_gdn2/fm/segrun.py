@@ -47,7 +47,7 @@ import torch
 import torch.nn.functional as F
 
 from ..bench.geom import gt_labels
-from .worker import build, prepared
+from .worker import build, fail, prepared
 
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
@@ -96,9 +96,7 @@ def prep(job: dict) -> None:
             print(f"[seg] {it['id']}: grid {tuple(xin.shape)} fg {(y[y < 255] > 0).float().mean():.4f} "
                   f"pre={t_pre:.1f}s lab={time.time() - t0:.1f}s", flush=True)
         except Exception:  # noqa: BLE001 -- logged per item
-            (cache / "_failed").mkdir(exist_ok=True)
-            (cache / "_failed" / f"{it['id']}.txt").write_text(err or traceback.format_exc())
-            print(f"[seg] FAILED {it['id']}: {(err or traceback.format_exc()).strip().splitlines()[-1]}", flush=True)
+            fail(cache, it["id"], err or traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------------------------- training

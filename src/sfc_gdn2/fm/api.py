@@ -41,36 +41,36 @@ def load_config(path: str | Path) -> dict:
 
 
 def image_id(image) -> str:
-    p = Path(image if isinstance(image, str) else min(image.values()))
-    return p.name.removesuffix(".gz").removesuffix(".nii")
+    return Path(image).name.removesuffix(".gz").removesuffix(".nii")
+
+
+def run_in_env(env: str, module: str, job: dict) -> None:
+    """`<env>/bin/python -m <module> <job.json>`, with this package on PYTHONPATH."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(job, f)
+    pythonpath = os.pathsep.join([str(SRC), *filter(None, [os.environ.get("PYTHONPATH")])])
+    try:
+        subprocess.run([str(Path(env) / "bin" / "python"), "-m", module, f.name], check=True,
+                       env=os.environ | {"PYTHONPATH": pythonpath, "PYTHONNOUSERSITE": "1"})
+    finally:
+        os.unlink(f.name)
 
 
 def extract(config, images: list, out, device: str = "cuda", overwrite: bool = False,
-            ids: list[str] | None = None, dense: list[bool] | None = None, workers: int = 0,
-            verify_shared: bool = False) -> list[Path]:
-    """images: paths, or {modality: path} dicts for multi-modal models. Returns the written files.
+            ids: list[str] | None = None, workers: int = 0) -> list[Path]:
+    """images: NIfTI paths. Returns the written files.
 
     `config` / `out` may be lists (same length): a group of models sharing the first one's preprocessing
-    (same env required); `dense` flags items whose `save.dense` features are kept. See worker.py."""
+    (same env required). See worker.py."""
     cfgs = [c if isinstance(c, dict) else load_config(c) for c in (config if isinstance(config, list) else [config])]
     outs = [Path(o) for o in (out if isinstance(out, list) else [out])]
     if len(outs) != len(cfgs) or len({c["env"] for c in cfgs}) != 1:
         raise ValueError("a model group needs one `out` per config and a single env")
-    cfg = cfgs[0]
     ids = ids or [image_id(im) for im in images]
     if len(set(ids)) != len(ids):
         raise ValueError("image ids are not unique; pass `ids`.")
-    dense = dense or [False] * len(ids)
-    items = [{"id": i, "image": im if isinstance(im, dict) else str(im), "dense": bool(d)}
-             for i, im, d in zip(ids, images, dense)]
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump({"cfgs": cfgs, "items": items, "outs": [str(o) for o in outs], "device": device,
-                   "overwrite": overwrite, "workers": workers, "verify_shared": verify_shared}, f)
-    python = Path(cfg["env"]) / "bin" / "python"
-    env = os.environ | {"PYTHONPATH": os.pathsep.join([str(SRC), *filter(None, [os.environ.get("PYTHONPATH")])]),
-                        "PYTHONNOUSERSITE": "1"}
-    try:
-        subprocess.run([str(python), "-m", "sfc_gdn2.fm.worker", f.name], env=env, check=True)
-    finally:
-        os.unlink(f.name)
+    items = [{"id": i, "image": str(im)} for i, im in zip(ids, images)]
+    run_in_env(cfgs[0]["env"], "sfc_gdn2.fm.worker",
+               {"cfgs": cfgs, "items": items, "outs": [str(o) for o in outs], "device": device,
+                "overwrite": overwrite, "workers": workers})
     return [o / f"{i}.pt" for o in outs for i in ids]

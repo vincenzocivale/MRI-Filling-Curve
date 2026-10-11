@@ -13,10 +13,8 @@ MODELS = {
     "brainiac": "brainiac",
     "brainsegfounder": "brainsegfounder",
     "medicalnet": "medicalnet",
-    "brainmvp": "brainmvp",
-    "mome": "mome", "mome_plus": "mome",
     "openmind": "nnssl", "nnfoundation": "nnssl",
-    "fomo26": "asparagus", "amaes_fomo260k": "asparagus",
+    "fomo26": "asparagus",
     "brainfm": "brainfm",
     "nnunet": "nnunet",
     "sfc_gdn2": "sfc",   # ours (LeJEPA GDN-2), run in our own env

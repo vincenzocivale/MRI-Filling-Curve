@@ -1,4 +1,5 @@
 """nnU-Net / TotalSegmentator-MRI wrapper vs the original pipelines. Run inside fm-nnunet (GPU):
+    source configs/fm/leonardo.env
     PYTHONPATH=src $SFC_FM_ENVS/fm-nnunet/bin/python tests/fm/nnunet_parity.py [--configs ...] [--samples ...]
 
 Per config x sample:
@@ -27,20 +28,20 @@ import nibabel as nib
 import numpy as np
 import torch
 
-MODELS = Path(os.environ.get("SFC_FM_MODELS", "/leonardo_work/IscrC_SFMRI/fcorrent/models"))
-TSMR = MODELS / "TotalSegmentatorMRI"
+TSMR = Path(os.environ["SFC_FM_MODELS"]) / "TotalSegmentatorMRI"
 os.environ["TOTALSEG_WEIGHTS_PATH"] = str(TSMR)  # TS's setup_nnunet points nnUNet_results here
 for var in ("nnUNet_results", "nnUNet_raw", "nnUNet_preprocessed"):
     os.environ[var] = str(TSMR)
 os.environ.setdefault("TOTALSEG_HOME_DIR", "/leonardo_scratch/large/userexternal/fcorrent/fm_check/.totalseg")
 
+from common import SAMPLES
+
 from sfc_gdn2.fm.api import load_config
 from sfc_gdn2.fm.nnunet import build
 
 ROOT = Path(__file__).resolve().parents[2]
-SAMPLES = Path("/leonardo_scratch/large/userexternal/fcorrent/fm_check/samples")
-# config id -> (TotalSegmentator task_name deciding step size, nnU-Net task id)
-TS_TASK = {870: "total_mr", 871: "total_mr", 872: "total_mr", 873: "total_mr", 857: "thigh_shoulder_muscles_mr"}
+# config id (= nnU-Net task id) -> TotalSegmentator task_name deciding the step size
+TS_TASK = {870: "total_mr"}
 
 
 def ts_reference(cfg: dict, task: int, sample: Path, out: Path) -> None:
@@ -138,7 +139,7 @@ def check(name: str, cfg: dict, task: int, sample: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--configs", nargs="+", type=int, default=[872, 873, 870, 871, 857])
+    ap.add_argument("--configs", nargs="+", type=int, default=list(TS_TASK))
     ap.add_argument("--samples", nargs="+", default=["ixi002_T1.nii.gz", "pdgm0004_T1.nii.gz"])
     args = ap.parse_args()
     for i in args.configs:

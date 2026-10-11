@@ -56,41 +56,22 @@ Outputs (`features`):
 """
 from __future__ import annotations
 
-import contextlib
+import functools
 import json
 from copy import deepcopy
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
 from einops import rearrange
 
-from .base import Image, Wrapper, add_to_path
+from .base import Image, Wrapper, add_to_path, plain_meta
 
 
-@contextlib.contextmanager
 def _torch_load_on_cpu():
     """pretrainedTrainer.py:204 loads without map_location; the OpenMind checkpoints store CUDA tensors."""
-    orig = torch.load
-
-    def load(*a, **kw):
-        kw.setdefault("map_location", "cpu")
-        return orig(*a, **kw)
-
-    torch.load = load
-    try:
-        yield
-    finally:
-        torch.load = orig
-
-
-def _plain(x):
-    """numpy scalars / arrays -> python types, so the result loads with torch.load(weights_only=True)."""
-    if isinstance(x, dict):
-        return {k: _plain(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return type(x)(_plain(v) for v in x)
-    return x.tolist() if isinstance(x, (np.generic, np.ndarray)) else x
+    return mock.patch.object(torch, "load", functools.partial(torch.load, map_location="cpu"))
 
 
 class NnsslWrapper(Wrapper):
@@ -160,11 +141,8 @@ class NnsslWrapper(Wrapper):
     # ------------------------------------------------------------------ segmentation (fm/segrun.py)
     def seg_input(self, prepared: dict):
         """nnssl's preprocessed volume: the grid nnU-Net fine-tunes and predicts on (before its sliding-window pad)."""
-        from ..bench.geom import _nnunet_crop_resample, _perm
-        props = prepared["props"]
-        geo = {k: props[k] for k in ("bbox_used_for_cropping", "shape_after_cropping_and_before_resampling")}
-        m = _nnunet_crop_resample(geo | {"preprocessed_shape": prepared["data"].shape[1:]},
-                                  _perm(self.plan.transpose_forward) @ _perm([2, 1, 0]))
+        from ..bench.geom import _nnunet_crop_resample
+        m = _nnunet_crop_resample(prepared["props"], prepared["data"].shape[1:], self.plan.transpose_forward)
         return torch.from_numpy(prepared["data"]), m
 
     def seg_net(self, n_out: int, pretrained: bool = True):
@@ -182,8 +160,7 @@ class NnsslWrapper(Wrapper):
         from nnssl.preprocessing.preprocessors.default_preprocessor import preprocess_case
         from nnssl.preprocessing.preprocessors.no_resampling_preprocessor import no_resample_preprocess_case
 
-        path = image if isinstance(image, str) else image["image"]
-        data, props = self.plan.image_reader_writer_class()().read_images([path])
+        data, props = self.plan.image_reader_writer_class()().read_images([image])
         if self.config_plan.spacing_style == "noresample":
             fn = no_resample_preprocess_case
         elif self.config_plan.spacing_style in ("onemmiso", "median"):
@@ -274,8 +251,7 @@ class NnsslWrapper(Wrapper):
                                     + ("" if self.name == "openmind" else " (applied by analogy: no official "
                                        "nnFoundation probe)"),
         }
-        return {"features": feats, "canonical": canonical, "meta": _plain(meta), "derived": derived}
+        return {"features": feats, "canonical": canonical, "meta": plain_meta(meta), "derived": derived}
 
 
-def build(cfg: dict, device: str) -> NnsslWrapper:
-    return NnsslWrapper(cfg, device)
+build = NnsslWrapper

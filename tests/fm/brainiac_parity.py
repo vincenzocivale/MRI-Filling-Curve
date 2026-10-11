@@ -1,4 +1,5 @@
 """BrainIAC wrapper vs the original pipeline. Run inside fm-brainiac:
+    source configs/fm/leonardo.env
     PYTHONPATH=src $SFC_FM_ENVS/fm-brainiac/bin/python tests/fm/brainiac_parity.py [--skip-e2e]
 
 1. shipped reference: wrapper (preprocessed=true) on the repo's processed sample vs the repo's own
@@ -15,7 +16,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 import tempfile
@@ -26,20 +26,21 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
+from common import SAMPLES
 from torch.utils.data import DataLoader
 
+from sfc_gdn2.fm.api import load_config
 from sfc_gdn2.fm.brainiac import build
 
-REPO = Path(os.environ.get("SFC_FM_REPOS", "/leonardo_work/IscrC_SFMRI/fcorrent/repos")) / "BrainIAC"
-CKPT = Path(os.environ.get("SFC_FM_MODELS", "/leonardo_work/IscrC_SFMRI/fcorrent/models")) / "BrainIAC/BrainIAC.ckpt"
-SRC = REPO / "src"
-SAMPLES = Path("/leonardo_scratch/large/userexternal/fcorrent/fm_check/samples")
+CFG = load_config(Path(__file__).resolve().parents[2] / "configs/fm/brainiac.yaml")
+CKPT = CFG["checkpoint"]
+SRC = Path(CFG["repo"]) / "src"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # the repo script picks cuda:0 when available
 FEATS = [f"Feature_{i}" for i in range(768)]
 
 
 def wrapper(**args):
-    return build({"model": "brainiac", "repo": str(REPO), "checkpoint": str(CKPT), "args": args}, DEVICE)
+    return build(CFG | {"args": args}, DEVICE)
 
 
 def cos(a, b) -> float:
@@ -68,7 +69,7 @@ def bitwise_vs_script(w, tmp: Path) -> None:
         (root / f"{k}.nii.gz").symlink_to(p)
     csv, out_csv = tmp / "in.csv", tmp / "out.csv"
     pd.DataFrame({"pat_id": list(imgs), "label": 0.0}).to_csv(csv, index=False)
-    subprocess.run([sys.executable, "get_brainiac_features.py", "--checkpoint", str(CKPT), "--input_csv", str(csv),
+    subprocess.run([sys.executable, "get_brainiac_features.py", "--checkpoint", CKPT, "--input_csv", str(csv),
                     "--output_csv", str(out_csv), "--root_dir", str(root)], cwd=SRC, check=True)
     cli = pd.read_csv(out_csv)[FEATS].values.astype(np.float32)  # float32 written with round-trip repr
     ds = BrainAgeDataset(str(csv), str(root), transform=get_validation_transform())

@@ -8,31 +8,25 @@ and the demo configs are passed as absolute paths (`utils/process_cfg.py:60`).
 Asserts bitwise equality of the preprocessed input, every feature level and every trained task output
 (cuDNN deterministic for both paths), and that the wrapper's corrected affine maps the crop correctly.
 
-usage: python tests/fm/brainfm_parity.py [--device cuda|cpu] [images...]
+usage: source configs/fm/leonardo.env; python tests/fm/brainfm_parity.py [--device cuda|cpu] [images...]
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
-import os
 import time
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 import torch
+from common import SAMPLES, check
 
 from sfc_gdn2.fm.api import load_config
 from sfc_gdn2.fm.brainfm import GEN_CFGS, TRAIN_CFGS, UNTRAINED_OUTPUTS, build
 
 ROOT = Path(__file__).resolve().parents[2]
-SAMPLES = Path("/leonardo_scratch/large/userexternal/fcorrent/fm_check/samples")
 DEFAULT = [SAMPLES / "pdgm0004_T1.nii.gz", SAMPLES / "pdgm0004_FLAIR.nii.gz", SAMPLES / "ixi002_T1.nii.gz"]
-
-
-def diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    assert a.shape == b.shape, (a.shape, b.shape)
-    return (a.float() - b.float()).abs().max().item()
 
 
 def main() -> None:
@@ -42,10 +36,7 @@ def main() -> None:
     args = ap.parse_args()
     torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
 
-    cfg = load_config(ROOT / "configs/fm/brainfm.yaml") if "SFC_FM_ENVS" in os.environ else None
-    cfg = cfg or {"model": "brainfm", "repo": "/leonardo_work/IscrC_SFMRI/fcorrent/repos/BrainFM",
-                  "checkpoint": "/leonardo_work/IscrC_SFMRI/fcorrent/models/BrainFM/assets/brainfm_pretrained.pth"}
-    cfg = cfg | {"args": {"levels": True, "task_outputs": True}}
+    cfg = load_config(ROOT / "configs/fm/brainfm.yaml") | {"args": {"levels": True, "task_outputs": True}}
     repo = Path(cfg["repo"])
     wrapper = build(cfg, args.device)   # puts the repo on sys.path, imports test_utils from the repo root
     tu = wrapper.tu
@@ -53,7 +44,6 @@ def main() -> None:
     tu.default_train_cfg_file, tu.default_val_file = str(repo / TRAIN_CFGS[0]), str(repo / TRAIN_CFGS[1])
     gen_cfg, model_cfg = str(repo / GEN_CFGS[1]), str(repo / TRAIN_CFGS[2])
 
-    worst = 0.0
     for path in args.images:
         print(f"== {path}", flush=True)
         t0 = time.time()
@@ -72,14 +62,13 @@ def main() -> None:
         print(f"   original {t1 - t0:.1f}s (incl. model build + ckpt load), wrapper {t2 - t1:.1f}s; "
               f"input {tuple(im.shape)} bbox {meta['bbox']} of {meta['aligned_shape']}")
 
-        d = {"input": diff(prepared["input"].cpu(), im)}
-        d |= {f"feat_{i}": diff(f["feat_last" if i == 5 else f"feat_{i}"].cpu(), r[0]) for i, r in enumerate(ref["feat"])}
-        tasks = [k for k in ref if k != "feat" and k not in UNTRAINED_OUTPUTS]
-        d |= {f"task_{k}": diff(f[f"task_{k}"].cpu(), ref[k][0]) for k in tasks}
+        check("input", prepared["input"].cpu(), im)
+        for i, r in enumerate(ref["feat"]):
+            check(f"feat_{i}", f["feat_last" if i == 5 else f"feat_{i}"].cpu(), r[0])
+        for k in ref:
+            if k != "feat" and k not in UNTRAINED_OUTPUTS:
+                check(f"task_{k}", f[f"task_{k}"].cpu(), ref[k][0])
         assert not {f"task_{k}" for k in UNTRAINED_OUTPUTS} & set(f), "untrained SR outputs leaked"
-        for k, v in d.items():
-            print(f"   max|diff| {k:24s} {v:.3e}")
-        worst = max(worst, *d.values())
 
         # corrected affine: voxel (0,0,0) of the cropped input == voxel bbox[0] of the aligned grid
         lo = np.asarray(meta["bbox"][0], dtype=np.float64)
@@ -94,8 +83,6 @@ def main() -> None:
         if args.device == "cuda":
             torch.cuda.empty_cache()
 
-    print(f"WORST max|diff| = {worst:.3e}")
-    assert worst == 0.0, "wrapper differs from the original pipeline"
     print("PARITY OK (bitwise)")
 
 

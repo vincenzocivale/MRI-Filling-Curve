@@ -1,6 +1,8 @@
 # External foundation-model configs
 
-One file per model (checkpoint): `sfc fm configs/fm/<name>.yaml --images a.nii.gz ... --out <dir>`.
+One file per model (checkpoint) of the benchmark (`benchmark.txt`; ours: `sfc_gdn2*.yaml`):
+`sfc fm configs/fm/<name>.yaml --images a.nii.gz ... --out <dir>`. Other checkpoints a wrapper supports are
+described in its module docstring (src/sfc_gdn2/fm/); their configs were removed (git history).
 
 ```yaml
 model: brainiac                    # key of sfc_gdn2.fm.MODELS

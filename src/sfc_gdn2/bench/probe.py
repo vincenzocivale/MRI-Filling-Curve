@@ -155,11 +155,9 @@ class Dex(Kind):
 
     def metrics(self, pred, y, rows):
         mae = (pred - y).abs().mean().item()
-        out = {"neg_mae": -mae, "mae": mae, "pearson_r": torch.corrcoef(torch.stack([pred, y]))[0, 1].item()}
-        if self.cfg.get("per_dataset", True):
-            err = (pred - y).abs().cpu().numpy()
-            out["mae_per_dataset"] = {d: float(err[m].mean()) for d, m in rows.groupby("dataset").indices.items()}
-        return out
+        err = (pred - y).abs().cpu().numpy()
+        return {"neg_mae": -mae, "mae": mae, "pearson_r": torch.corrcoef(torch.stack([pred, y]))[0, 1].item(),
+                "mae_per_dataset": {d: float(err[m].mean()) for d, m in rows.groupby("dataset").indices.items()}}
 
 
 class Cox(Kind):
@@ -233,17 +231,22 @@ def fit(x: torch.Tensor, y: torch.Tensor, kind: Kind, l2: float, hidden: int, se
     return head.eval().requires_grad_(False)
 
 
-def bootstrap(kind: Kind, pred, y, rows: pd.DataFrame, n: int = 1000, seed: int = 0) -> list[float]:
-    """95% CI of kind.key over resamples of test subjects (fixed seed -> paired across models)."""
+def subject_ci(stat, subjects, n: int = 1000, seed: int = 0) -> list[float]:
+    """95% CI of `stat(row positions)` over resamples of the subjects (`subjects`: one per row; fixed seed -> the
+    same resamples for every model, paired). Also the segdec CI (bench/segdec.py)."""
     rng = np.random.default_rng(seed)
-    groups = rows.groupby("subject").indices
-    subjects = sorted(groups)
-    vals = []
-    for _ in range(n):
-        idx = np.concatenate([groups[s] for s in rng.choice(subjects, len(subjects))])
-        t = torch.as_tensor(idx, device=pred.device)
-        vals.append(kind.metrics(pred[t], y[t], rows.iloc[idx])[kind.key])  # nan when degenerate
+    groups = pd.Series(range(len(subjects))).groupby(np.asarray(subjects)).indices
+    keys = sorted(groups)
+    vals = [stat(np.concatenate([groups[s] for s in rng.choice(keys, len(keys))])) for _ in range(n)]
     return [float(np.nanpercentile(vals, 2.5)), float(np.nanpercentile(vals, 97.5))]
+
+
+def bootstrap(kind: Kind, pred, y, rows: pd.DataFrame) -> list[float]:
+    """95% CI of kind.key over resamples of test subjects."""
+    def stat(idx):
+        t = torch.as_tensor(idx, device=pred.device)
+        return kind.metrics(pred[t], y[t], rows.iloc[idx])[kind.key]  # nan when degenerate
+    return subject_ci(stat, rows["subject"].to_numpy())
 
 
 # ------------------------------------------------------------------------------------------- runner

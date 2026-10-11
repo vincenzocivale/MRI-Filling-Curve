@@ -4,9 +4,9 @@ Checkpoints (Lightning, keys `model.encoder.*` / `model.decoder.*`): AMAES pretr
 4^3 units, random 160^3 crops of RAS / native-spacing / not skull-stripped FOMO300K scans) of
 `asparagus/modules/networks/resenc_unet.py:143` `resenc_unet_b(use_skip_connections=False)`
 (`configs/projects/datapaper/pretrain/resenc_6m_amaes.yaml`). `fomo26` = FOMO26BrainAI/fomo26-baseline
-`resenc_unet_b.ckpt` (identical tensors to FOMO-MRI/AMAES_resenc_b_fomo300k); `amaes_fomo260k` = the
-FOMO260K run. The `_5ch` file is the 1-channel stem repeated x5 and divided by 5 (`base_module.py:182`
-applied offline): no config, and any stem/channel mismatch is rejected here (gardening_tools
+`resenc_unet_b.ckpt` (identical tensors to FOMO-MRI/AMAES_resenc_b_fomo300k). The `_5ch` file is the
+1-channel stem repeated x5 and divided by 5 (`base_module.py:182` applied offline): no config, and any
+stem/channel mismatch is rejected here (gardening_tools
 `BaseNet.load_state_dict`, `BaseNet.py:22-31`, would silently drop it and keep a random stem).
 
 Everything is the repo's own code: fomo26/fomo-lp `pipeline/embed_all.py` (`cfg["repo"]`, verified at
@@ -27,9 +27,6 @@ absent at 72f333b which the HF model cards link) and gardening_tools 0.3.5.
 - inference / canonical embedding: `embed_all.embed_scan` (:104-120): fp32, single crop, `_encode` ->
   deepest stage (320 ch, stride 32) -> global average pool -> `embedding` [320]. All six encoder stages of
   the same forward (captured from `_encode`, no second pass) are exposed as `stage0..stage5`.
-- `args.encoder: pretrain` (opt-in): the pretraining network's own encoder (AvgPool shortcuts), strict load
-  of `model.encoder.*`; its repo output is `SelfSupervisedModule.predict_step` (`self_supervised.py:183-186`)
-  = `encoder(x)[-1]` (`deepest`, canonical); the GAP `embedding` is then ours (`derived`).
 """
 from __future__ import annotations
 
@@ -39,6 +36,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import torch
+from nibabel.affines import from_matvec
 
 from .base import Image, Wrapper, add_to_path, git_commit
 
@@ -48,8 +46,7 @@ STRIDES = (1, 2, 4, 8, 16, 32)
 
 
 class Asparagus(Wrapper):
-    """args: encoder (official | pretrain, default official), reorient_ras (bool, default true),
-    target_size (int, default 160 = embed_all's default)."""
+    """args: reorient_ras (bool, default true), target_size (int, default 160 = embed_all's default)."""
 
     name = "asparagus"
 
@@ -59,9 +56,6 @@ class Asparagus(Wrapper):
         import embed_all
 
         self.ea = embed_all
-        self.encoder = self.args.get("encoder", "official")
-        if self.encoder not in ("official", "pretrain"):
-            raise ValueError(f"asparagus: encoder must be 'official' or 'pretrain', got {self.encoder!r}")
         self.reorient_ras = bool(self.args.get("reorient_ras", True))
         self.size = int(self.args.get("target_size", SIZE))
         self.dev = torch.device(device)
@@ -72,32 +66,21 @@ class Asparagus(Wrapper):
         if enc[STEM].shape[1] != 1:
             raise ValueError(f"asparagus: checkpoint stem has {enc[STEM].shape[1]} input channels; the "
                              f"embedding pipeline is single-modality (1). The _5ch file is not supported.")
-        if self.encoder == "official":
-            self.model = embed_all.load_backbone(Path(cfg["checkpoint"]), device=self.dev)
-            self._skips: list[torch.Tensor] = []
-            encode = self.model._encode
+        self.model = embed_all.load_backbone(Path(cfg["checkpoint"]), device=self.dev)
+        self._skips: list[torch.Tensor] = []
+        encode = self.model._encode
 
-            def capture(x: torch.Tensor) -> list[torch.Tensor]:  # records the stages of embed_scan's forward
-                self._skips = encode(x)
-                return self._skips
+        def capture(x: torch.Tensor) -> list[torch.Tensor]:  # records the stages of embed_scan's forward
+            self._skips = encode(x)
+            return self._skips
 
-            self.model._encode = capture
-        else:
-            from asparagus.modules.networks.resenc_unet import resenc_unet_b
-
-            self.model = resenc_unet_b(dimensions="3D", input_channels=1, output_channels=1,
-                                       use_skip_connections=False)
-            torch.nn.Module.load_state_dict(self.model.encoder, {k[len("encoder."):]: v for k, v in enc.items()},
-                                            strict=True)
-            self.model.eval().to(self.dev)
+        self.model._encode = capture
         got = self.model.state_dict()  # every encoder tensor must be the checkpoint's (no silent drop)
         bad = [k for k, v in enc.items() if k not in got or not torch.equal(got[k].cpu(), v)]
         if bad:
             raise RuntimeError(f"asparagus: {len(bad)} encoder tensors not loaded from the checkpoint, e.g. {bad[:3]}")
 
     def preprocess(self, image: Image) -> dict:
-        if not isinstance(image, str):
-            raise TypeError("asparagus: single-modality, pass a NIfTI path")
         img = nib.load(image)
         from gardening_tools.functional.nibabel_utils import get_nib_orientation, reorient_nib_image
 
@@ -118,9 +101,8 @@ class Asparagus(Wrapper):
         pad_lb = np.maximum(self.size - shape, 0) // 2
         start = (np.maximum(shape, self.size) - self.size) // 2
         offset = start - pad_lb  # input voxel i <-> (RAS) array voxel i + offset
-        shift = np.eye(4)
-        shift[:3, 3] = offset
-        meta |= {"affine": torch.from_numpy(img.affine @ shift),  # voxel -> world of the 160^3 input grid
+        # affine: voxel -> world of the 160^3 input grid
+        meta |= {"affine": torch.from_numpy(img.affine @ from_matvec(np.eye(3), offset)),
                  "array_shape": tuple(int(s) for s in shape), "input_offset": tuple(int(o) for o in offset),
                  "spacing": tuple(float(z) for z in img.header.get_zooms()[:3]), "input_shape": tuple(x.shape[1:]),
                  "stage_strides": STRIDES}
@@ -167,19 +149,9 @@ class Asparagus(Wrapper):
 
     @torch.no_grad()
     def features(self, prepared: dict) -> dict:
-        x, meta = prepared["x"], prepared["meta"]
-        if self.encoder == "official":
-            emb = self.ea.embed_scan(self.model, x, device=self.dev)
-            skips, canonical, derived = self._skips, "embedding", []
-        else:
-            skips = self.model.encoder(x.unsqueeze(0).to(self.dev))
-            emb = torch.nn.functional.adaptive_avg_pool3d(skips[-1], (1, 1, 1)).flatten(1).squeeze(0)
-            canonical, derived = "deepest", ["embedding"]
-        feats = {"embedding": emb, **{f"stage{i}": s[0] for i, s in enumerate(skips)}}
-        if self.encoder == "pretrain":
-            feats["deepest"] = skips[-1][0]
-        return {"features": feats, "canonical": canonical, "derived": derived,
-                "meta": meta | {"encoder": self.encoder}}
+        emb = self.ea.embed_scan(self.model, prepared["x"], device=self.dev)
+        feats = {"embedding": emb, **{f"stage{i}": s[0] for i, s in enumerate(self._skips)}}
+        return {"features": feats, "canonical": "embedding", "derived": [], "meta": prepared["meta"]}
 
     def provenance(self) -> dict:
         from importlib.metadata import version
@@ -190,5 +162,4 @@ class Asparagus(Wrapper):
                                        "gardening_tools": version("gardening_tools"), "torch": torch.__version__}
 
 
-def build(cfg: dict, device: str) -> Asparagus:
-    return Asparagus(cfg, device)
+build = Asparagus

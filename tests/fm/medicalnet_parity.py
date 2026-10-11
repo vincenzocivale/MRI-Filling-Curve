@@ -1,6 +1,7 @@
-"""MedicalNet parity: the repo's own test-phase pipeline vs the `medicalnet` wrapper, every released checkpoint.
+"""MedicalNet parity: the repo's own test-phase pipeline vs the `medicalnet` wrapper, every configs/fm/medicalnet_*.
 
-Run inside the env:  PYTHONPATH=src <fm-medicalnet>/bin/python tests/fm/medicalnet_parity.py [image ...]
+Run inside the env:  source configs/fm/leonardo.env
+                     PYTHONPATH=src $SFC_FM_ENVS/fm-medicalnet/bin/python tests/fm/medicalnet_parity.py [image ...]
 Original side (Tencent/MedicalNet, untouched): `BrainS18Dataset` phase "test" through a `DataLoader(batch_size=1)`
 (test.py:88-89), the net from `model.generate_model` (phase "test", no_cuda) wrapped in `nn.DataParallel` exactly
 as model.py:72-85 does, the pretrain copy of model.py:112-115 on that wrapped net, and `model(volume)` (test.py:57)
@@ -9,7 +10,6 @@ of brains18.py:146 is drawn from numpy's global RNG: both sides seed it with the
 """
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 from argparse import Namespace
@@ -17,19 +17,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
+from common import SAMPLES, check
 from torch import nn
 from torch.utils.data import DataLoader
 
-from sfc_gdn2.fm.api import expand
+from sfc_gdn2.fm.api import load_config
 from sfc_gdn2.fm.medicalnet import build
 
 ROOT = Path(__file__).resolve().parents[2]
-SAMPLES = ["/leonardo_scratch/large/userexternal/fcorrent/fm_check/samples/ixi002_T1.nii.gz"]
 CONFIGS = sorted((ROOT / "configs/fm").glob("medicalnet_*.yaml"))
 
 
 def original(cfg: dict, image: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Needs the repo on sys.path (the wrapper's build puts it there)."""
     from datasets.brains18 import BrainS18Dataset
     from model import generate_model
     a = cfg["args"]
@@ -60,26 +60,15 @@ def original(cfg: dict, image: str) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def main(images: list[str]) -> None:
-    worst = 0.0
     for path in CONFIGS:
-        cfg = expand(yaml.safe_load(path.read_text()))
+        cfg = load_config(path)
         wrapper = build(cfg, "cpu")
         for image in images:
             x_ref, f_ref = original(cfg, image)
-            prepared = wrapper.preprocess(image)
-            out = wrapper(image)
-            dx = (prepared["image"] - x_ref).abs().max().item()
-            df = (out["features"]["layer4"] - f_ref).abs().max().item()
-            worst = max(worst, dx, df)
-            print(f"{path.stem:32s} {Path(image).name}: input {tuple(x_ref.shape)} max|dx|={dx:.3g}  "
-                  f"layer4 {tuple(f_ref.shape)} max|df|={df:.3g}", flush=True)
-            assert torch.equal(prepared["image"], x_ref) and torch.equal(out["features"]["layer4"], f_ref)
-    print(f"OK: bitwise equal (max abs diff {worst})")
+            check(f"{path.stem} {Path(image).name} input", wrapper.preprocess(image)["image"], x_ref)
+            check(f"{path.stem} {Path(image).name} layer4", wrapper(image)["features"]["layer4"], f_ref)
+    print("PARITY OK (bitwise)")
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("SFC_FM_ENVS", "/leonardo_work/IscrC_SFMRI/fcorrent/envs")
-    os.environ.setdefault("SFC_FM_REPOS", "/leonardo_work/IscrC_SFMRI/fcorrent/repos")
-    os.environ.setdefault("SFC_FM_MODELS", "/leonardo_work/IscrC_SFMRI/fcorrent/models")
-    sys.path.insert(0, os.path.expandvars("${SFC_FM_REPOS}/MedicalNet"))
-    main(sys.argv[1:] or SAMPLES)
+    main(sys.argv[1:] or [str(SAMPLES / "ixi002_T1.nii.gz")])

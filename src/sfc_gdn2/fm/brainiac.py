@@ -26,23 +26,19 @@ import logging
 import shutil
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import nibabel as nib
 import numpy as np
 import torch
 from torch.utils.data import default_collate
 
-from .base import Image, Wrapper, add_to_path
+from .base import Image, Wrapper, add_to_path, plain
 
 log = logging.getLogger(__name__)
 
 GRID, PATCH, SIZE = 6, 16, 96
 HIDDEN = (3, 6, 9)  # 1-based transformer blocks whose outputs UNETR uses
-
-
-def plain(t: torch.Tensor) -> torch.Tensor:
-    """MetaTensor -> torch.Tensor (the .pt files must load without monai)."""
-    return t.as_tensor() if hasattr(t, "as_tensor") else t
 
 
 class BrainIAC(Wrapper):
@@ -68,8 +64,6 @@ class BrainIAC(Wrapper):
         """Step 1 of the repo's mri_preprocess_3d_simple.main (:155-180) on a one-file input dir (it globs
         `*.nii.gz` and takes the ID as the name up to the first dot, :49): `registration` = N4 + rigid registration
         (SimpleITK, CPU). The worker runs this ahead in CPU processes; `preprocess_gpu` does the rest."""
-        if not isinstance(image, str):
-            raise TypeError("brainiac is single-modality: pass a NIfTI path")
         if self.preprocessed:
             return {"source": image, "work": None}
         import mri_preprocess_3d_simple as mp
@@ -90,9 +84,9 @@ class BrainIAC(Wrapper):
         4x4, for mapping segmentations back; the repo discards it after resampling (:129-138). Nothing else changes."""
         import SimpleITK as sitk
 
-        box, orig = [], sitk.ImageRegistrationMethod
+        box = []
 
-        class Capturing(orig):
+        class Capturing(sitk.ImageRegistrationMethod):
             def Execute(self, *a):
                 t = super().Execute(*a)
                 p0 = np.array(t.TransformPoint((0.0, 0.0, 0.0)))
@@ -102,33 +96,23 @@ class BrainIAC(Wrapper):
                 box.append(m)
                 return t
 
-        sitk.ImageRegistrationMethod = Capturing
-        try:
+        with mock.patch.object(sitk, "ImageRegistrationMethod", Capturing):
             yield box
-        finally:
-            sitk.ImageRegistrationMethod = orig
 
-    @contextlib.contextmanager
     def _n4(self):
         """`args.n4_shrink` = s (OURS, off by default): the N4 bias field is fitted on the image shrunk by s per axis
         and applied at full resolution, instead of the repo's full-resolution N4 (mri_preprocess_3d_simple.py:74)."""
         s = self.args.get("n4_shrink")
         if not s:
-            yield
-            return
+            return contextlib.nullcontext()
         import SimpleITK as sitk
-        orig = sitk.N4BiasFieldCorrection
 
         def n4(img, *_, **__):
             f = sitk.N4BiasFieldCorrectionImageFilter()
             f.Execute(sitk.Shrink(img, [int(s)] * img.GetDimension()))
             # `/` is real division (float64): cast back to the input type, as the repo's N4 returns (registration needs it)
             return sitk.Cast(img / sitk.Exp(f.GetLogBiasFieldAsImage(img)), img.GetPixelID())
-        sitk.N4BiasFieldCorrection = n4
-        try:
-            yield
-        finally:
-            sitk.N4BiasFieldCorrection = orig
+        return mock.patch.object(sitk, "N4BiasFieldCorrection", n4)
 
     def preprocess_gpu(self, staged: dict) -> dict:
         """Step 2 of main (:182-190): HD-BET (fast, no TTA) on device "0" if CUDA else "cpu", as main picks it;
@@ -227,5 +211,4 @@ class BrainIAC(Wrapper):
         return {"features": feats, "canonical": "embedding", "meta": meta}
 
 
-def build(cfg: dict, device: str) -> BrainIAC:
-    return BrainIAC(cfg, device)
+build = BrainIAC

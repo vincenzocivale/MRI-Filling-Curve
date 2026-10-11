@@ -32,14 +32,13 @@ import itertools
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .base import Wrapper, add_to_path
+from .base import Wrapper, add_to_path, plain_meta
 
 TS_TRIPLE_SPLIT_VOXELS = 512 * 512 * 900  # TS/totalsegmentator/nnunet.py:569
 
@@ -69,21 +68,6 @@ class _Replay(nn.Module):
         for d, s in enumerate(self.stride):
             m = m.repeat_interleave(s, dim=2 + d)
         return m
-
-
-def _plain(x: Any) -> Any:
-    """numpy / tuples / slices -> python lists, so the result loads with torch.load(weights_only=True)."""
-    if isinstance(x, dict):
-        return {k: _plain(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return [_plain(v) for v in x]
-    if isinstance(x, slice):
-        return [_plain(x.start), _plain(x.stop)]
-    if isinstance(x, np.ndarray):
-        return x.tolist()
-    if isinstance(x, np.generic):
-        return x.item()
-    return x
 
 
 class NNUNet(Wrapper):
@@ -157,11 +141,12 @@ class NNUNet(Wrapper):
     # ------------------------------------------------------------------ segmentation (fm/segrun.py)
     def seg_input(self, prepared: dict):
         """nnU-Net's preprocessed volume (after TotalSegmentator's canonical + resampling steps)."""
-        from ..bench.geom import source_to_input
-        meta = {"totalseg": prepared["totalseg"], "nnunet_properties": prepared["properties"],
-                "transpose_forward": self.predictor.plans_manager.transpose_forward,
-                "preprocessed_shape": list(prepared["data"].shape[1:])}
-        return prepared["data"], source_to_input("nnunet", meta)
+        from ..bench.geom import _nnunet_crop_resample
+        g = prepared["totalseg"]
+        to_rsp = np.linalg.inv(g["resampled_affine"]) @ g["original_affine"] if g else np.eye(4)
+        m = _nnunet_crop_resample(prepared["properties"], list(prepared["data"].shape[1:]),
+                                  self.predictor.plans_manager.transpose_forward)
+        return prepared["data"], m @ to_rsp
 
     def seg_net(self, n_out: int, pretrained: bool = True):
         """The checkpoint's nnU-Net architecture with n_out outputs: encoder from the trained network, decoder from
@@ -233,9 +218,8 @@ class NNUNet(Wrapper):
             "autocast": "cuda fp16" if p.device.type == "cuda" else None,
         }
         canonical = f"stage{bottleneck}" if bottleneck in self.stages else f"stage{self.stages[-1]}"
-        return {"features": feats, "canonical": canonical, "meta": _plain(meta),
+        return {"features": feats, "canonical": canonical, "meta": plain_meta(meta),
                 "derived": [f"fg_mean_stage{k}" for k in self.stages]}
 
 
-def build(cfg: dict, device: str) -> NNUNet:
-    return NNUNet(cfg, device)
+build = NNUNet

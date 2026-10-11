@@ -1,20 +1,18 @@
 """Runs inside a model's conda env: `python -m sfc_gdn2.fm.worker <job.json>`.
 
-job = {"cfgs": [{...resolved model config...}, ...], "outs": [dir, ...],
-       "items": [{"id": str, "image": path | {modality: path}, "dense": bool}],
-       "device": "cuda" | "cpu", "overwrite": bool, "workers": int, "verify_shared": bool}
-(`cfg` / `out` instead of `cfgs` / `outs`: one model.) The models of a job share ONE preprocessing, the first
-model's `preprocess` (only group models whose repos preprocess identically; `verify_shared` re-runs every
-model's own preprocessing and logs any difference). With `workers` > 0 the preprocessing runs ahead in that
-many CPU-only processes (CUDA hidden, 1 thread each), each with its own copy of the first wrapper built on cpu,
-while this process runs the networks (and `preprocess_gpu`, for wrappers that split their preprocessing into
-`preprocess_cpu` + `preprocess_gpu`). Writes `<out>/<id>.pt` (the wrapper's result dict, tensors on CPU);
+job = {"cfgs": [{...resolved model config...}, ...], "outs": [dir, ...], "items": [{"id": str, "image": path}],
+       "device": "cuda" | "cpu", "overwrite": bool, "workers": int}
+The models of a job share ONE preprocessing, the first model's `preprocess` (only group models whose repos
+preprocess identically). With `workers` > 0 the preprocessing runs ahead in that many CPU-only processes (CUDA
+hidden, 1 thread each), each with its own copy of the first wrapper built on cpu, while this process runs the
+networks (and `preprocess_gpu`, for wrappers that split their preprocessing into `preprocess_cpu` +
+`preprocess_gpu`). Writes `<out>/<id>.pt` (the wrapper's result dict, tensors on CPU);
 a failing item is logged to `<out>/_failed/<id>.txt` and skipped. Only stdlib + torch are imported here, so it
 runs in any model env without our own dependencies.
 
-Optional `cfg["save"]` trims what is stored, never what is computed: `features` (names kept for every item;
-default all), `dense` (more names kept for items with `dense`), `pool` ([{from, factor, to}]: average pooling,
-ceil mode, added to `derived`), `drop_canonical` (do not force-keep the canonical tensor), `dtype`.
+Optional `cfg["save"]` trims what is stored, never what is computed: `features` (names kept; default all),
+`pool` ([{from, factor, to}]: average pooling, ceil mode, added to `derived`), `drop_canonical` (do not
+force-keep the canonical tensor), `dtype`.
 """
 from __future__ import annotations
 
@@ -54,12 +52,10 @@ def to_cpu(x):
     return x
 
 
-def trim(res: dict, save: dict | None, dense: bool = False) -> dict:
+def trim(res: dict, save: dict | None) -> dict:
     if not save:
         return res
     keep = save.get("features")
-    if keep is not None:
-        keep = set(keep) | (set(save.get("dense") or ()) if dense else set())
     feats, derived = dict(res["features"]), list(res.get("derived", []))
     for op in save.get("pool") or ():
         if keep is None or op["to"] in keep:
@@ -72,22 +68,7 @@ def trim(res: dict, save: dict | None, dense: bool = False) -> dict:
         dtype = getattr(torch, save["dtype"])
         feats = {k: v.to(dtype) if isinstance(v, torch.Tensor) and v.is_floating_point() else v
                  for k, v in feats.items()}
-    return res | {"features": feats, "derived": derived, "saved": dict(save, dense=dense)}
-
-
-def differences(a, b, path="") -> list[str]:
-    """Paths where two preprocessing outputs differ (exact equality for arrays / tensors)."""
-    if isinstance(a, dict) and isinstance(b, dict):
-        return [d for k in a.keys() | b.keys() for d in differences(a.get(k), b.get(k), f"{path}.{k}")]
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) and len(a) == len(b):
-        return [d for i, (x, y) in enumerate(zip(a, b)) for d in differences(x, y, f"{path}[{i}]")]
-    if hasattr(a, "shape") and hasattr(b, "shape"):
-        same = tuple(a.shape) == tuple(b.shape) and bool((torch.as_tensor(a) == torch.as_tensor(b)).all())
-        return [] if same else [path]
-    try:
-        return [] if bool(a == b) else [path]
-    except Exception:  # noqa: BLE001 -- objects without a usable ==
-        return [] if type(a) is type(b) else [path]
+    return res | {"features": feats, "derived": derived, "saved": save}
 
 
 _PREP = None
@@ -153,8 +134,8 @@ def fail(out: Path, item_id: str, err: str) -> None:
 
 def main(job_path: str) -> None:
     job = json.loads(Path(job_path).read_text())
-    cfgs = job.get("cfgs") or [job["cfg"]]
-    outs = [Path(o) for o in (job.get("outs") or [job["out"]])]
+    cfgs = job["cfgs"]
+    outs = [Path(o) for o in job["outs"]]
     for o in outs:
         o.mkdir(parents=True, exist_ok=True)
     wrappers = [build(c, job["device"]) for c in cfgs]
@@ -182,15 +163,11 @@ def main(job_path: str) -> None:
             if dst.exists() and not job.get("overwrite"):
                 continue
             try:
-                if job.get("verify_shared") and w is not lead:
-                    diff = differences(x, w.preprocess(it["image"]))
-                    print(f"[fm] verify_shared {cfg['model']} {it['id']}: "
-                          f"{'identical' if not diff else 'DIFFERENT at ' + ', '.join(diff)}", flush=True)
                 t0 = time.time()
                 res = w.finish(x if i == len(wrappers) - 1 else copy.deepcopy(x))
                 t_feat = time.time() - t0
-                res = to_cpu(trim(res, cfg.get("save"), bool(it.get("dense"))))
-                res |= {"id": it["id"], "image": it["image"], "dense": bool(it.get("dense"))}
+                res = to_cpu(trim(res, cfg.get("save")))
+                res |= {"id": it["id"], "image": it["image"]}
                 tmp = dst.with_suffix(".tmp")
                 torch.save(res, tmp)
                 os.replace(tmp, dst)

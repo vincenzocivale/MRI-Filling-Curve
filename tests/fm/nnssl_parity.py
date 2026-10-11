@@ -22,12 +22,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from common import SAMPLES
 from einops import rearrange
 
 from sfc_gdn2.fm.api import load_config
 from sfc_gdn2.fm.nnssl import _torch_load_on_cpu, build
 
-SAMPLES = Path("/leonardo_scratch/large/userexternal/fcorrent/fm_check/samples")
 IMAGES = [SAMPLES / "ixi002_T1.nii.gz", SAMPLES / "pdgm0004_T1.nii.gz"]
 
 

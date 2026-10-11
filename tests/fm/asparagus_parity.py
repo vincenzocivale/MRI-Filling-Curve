@@ -4,11 +4,10 @@
     $SFC_FM_ENVS/fm-asparagus/bin/python tests/fm/asparagus_parity.py [samples...]
 
 Reference = fomo-lp `pipeline/embed_all.py:embed_all` untouched (CSV -> <ptid>.npz) plus its
-load_scan/preprocess for the model input. Cases, for both checkpoints:
+load_scan/preprocess for the model input. Cases (fomo26):
 - reorient_ras=false on the raw files: the pure repo path;
 - reorient_ras=true: the reference gets RAS files written independently with nibabel
   `as_closest_canonical` (the organisers' delivery), the wrapper the raw files.
-- encoder=pretrain vs asparagus `SelfSupervisedModule.predict_step` (self_supervised.py:183-186).
 - the 5ch checkpoint must be rejected.
 Everything is fp32 on CPU in one process: equality is asserted bitwise.
 """
@@ -23,29 +22,18 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import torch
+from common import SAMPLES, check
 
-from sfc_gdn2.fm.api import expand
+from sfc_gdn2.fm.api import load_config
 from sfc_gdn2.fm.asparagus import build
 
 ROOT = Path(__file__).resolve().parents[2]
-SAMPLES = Path("/leonardo_scratch/large/userexternal/fcorrent/fm_check/samples")
-CONFIGS = ["fomo26", "amaes_fomo260k"]
 
 
-def cfg_for(name: str, **args) -> dict:
-    import yaml
-
-    cfg = expand(yaml.safe_load((ROOT / f"configs/fm/{name}.yaml").read_text()))
+def cfg_for(**args) -> dict:
+    cfg = load_config(ROOT / "configs/fm/fomo26.yaml")
     cfg["args"] = {**cfg["args"], **args}
     return cfg
-
-
-def check(tag: str, a: torch.Tensor, b: torch.Tensor) -> None:
-    a, b = torch.as_tensor(a).float(), torch.as_tensor(b).float()
-    assert a.shape == b.shape, (tag, a.shape, b.shape)
-    d = (a - b).abs().max().item()
-    print(f"  {tag:<48} shape={tuple(a.shape)} max|diff|={d:.3e}", flush=True)
-    assert torch.equal(a, b), f"{tag}: not bitwise equal"
 
 
 def reference(ea, ckpt: str, files: list[Path], work: Path) -> dict[str, np.ndarray]:
@@ -70,39 +58,23 @@ def main(samples: list[Path]) -> None:
             nib.save(nib.Nifti1Image(np.asarray(img.get_fdata(), dtype=np.float32), img.affine), dst)
             ras.append(dst)
             print(f"{p.name}: {nib.load(p).shape} {''.join(nib.aff2axcodes(nib.load(p).affine))}", flush=True)
-        for name in CONFIGS:
-            for reorient, ref_files in ((False, samples), (True, ras)):
-                w = build(cfg_for(name, reorient_ras=reorient), "cpu")
-                ea = w.ea
-                work = tmp / f"{name}_{reorient}"
-                work.mkdir()
-                ref = reference(ea, w.cfg["checkpoint"], ref_files, work)
-                print(f"[{name}] reorient_ras={reorient}", flush=True)
-                for p, rp in zip(samples, ref_files):
-                    prep = w.preprocess(str(p))
-                    check(f"{p.name} input", prep["x"], ea.preprocess(ea.load_scan(rp)))
-                    out = w.features(prep)
-                    check(f"{p.name} embedding vs embed_all", out["features"]["embedding"], ref[rp.name.split(".")[0]])
-                    gap = out["features"]["stage5"].mean((1, 2, 3))
-                    print(f"  stage5 GAP vs embedding max|diff|={(gap - out['features']['embedding']).abs().max():.1e}"
-                          f"  meta reoriented={prep['meta']['reoriented_to_ras']} offset={prep['meta']['input_offset']}")
-                del w
-            # opt-in pretraining encoder vs the repo's SelfSupervisedModule.predict_step
-            from asparagus.modules.lightning_modules.self_supervised import SelfSupervisedModule
-            from asparagus.modules.networks.resenc_unet import resenc_unet_b
-
-            w = build(cfg_for(name, encoder="pretrain"), "cpu")
-            sd = torch.load(w.cfg["checkpoint"], map_location="cpu", weights_only=False)["state_dict"]
-            net = resenc_unet_b(dimensions="3D", input_channels=1, output_channels=1, use_skip_connections=False)
-            ssl = SelfSupervisedModule(model=net, weights=sd).eval()
-            print(f"[{name}] encoder=pretrain", flush=True)
-            for p in samples:
+        for reorient, ref_files in ((False, samples), (True, ras)):
+            w = build(cfg_for(reorient_ras=reorient), "cpu")
+            ea = w.ea
+            work = tmp / f"fomo26_{reorient}"
+            work.mkdir()
+            ref = reference(ea, w.cfg["checkpoint"], ref_files, work)
+            print(f"[fomo26] reorient_ras={reorient}", flush=True)
+            for p, rp in zip(samples, ref_files):
                 prep = w.preprocess(str(p))
-                with torch.no_grad():
-                    ref_deep = ssl.predict_step({"image": prep["x"].unsqueeze(0)}, 0)[0]
-                check(f"{p.name} deepest vs predict_step", w.features(prep)["features"]["deepest"], ref_deep)
-            del w, ssl
-    five = cfg_for("fomo26")
+                check(f"{p.name} input", prep["x"], ea.preprocess(ea.load_scan(rp)))
+                out = w.features(prep)
+                check(f"{p.name} embedding vs embed_all", out["features"]["embedding"], ref[rp.name.split(".")[0]])
+                gap = out["features"]["stage5"].mean((1, 2, 3))
+                print(f"  stage5 GAP vs embedding max|diff|={(gap - out['features']['embedding']).abs().max():.1e}"
+                      f"  meta reoriented={prep['meta']['reoriented_to_ras']} offset={prep['meta']['input_offset']}")
+            del w
+    five = cfg_for()
     five["checkpoint"] = five["checkpoint"].replace("resenc_unet_b.ckpt", "resenc_unet_b_5ch.ckpt")
     try:
         build(five, "cpu")

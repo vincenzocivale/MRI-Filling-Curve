@@ -89,8 +89,6 @@ class BrainFM(Wrapper):
             raise RuntimeError(f"brainfm: checkpoint not fully loaded: missing {missing[:4]}, differing {differ[:4]}")
 
     def preprocess(self, image: Image) -> dict:
-        if not isinstance(image, str):
-            raise TypeError("brainfm is single-modality: pass a NIfTI path")
         final, _, _, _, aff, _, _ = self.tu.prepare_image(image, win_size=None, zero_crop_first=False, spacing=None,
                                                           add_bf=False, is_CT=self.is_ct, device=self.device)
         vol = final[0, 0]
@@ -122,8 +120,9 @@ class BrainFM(Wrapper):
 
     def seg_input(self, prepared: dict):
         """The 1 mm zero-cropped volume the network sees, in the SOURCE axis order (bench/geom.py brainfm_input_affine)."""
-        from ..bench.geom import source_to_input
-        return prepared["input"][0].float().cpu(), source_to_input("brainfm", prepared["meta"])
+        meta = prepared["meta"]
+        m = np.linalg.inv(meta["affine"].numpy()) @ meta["source_affine"].numpy()  # source voxel -> input voxel
+        return prepared["input"][0].float().cpu(), m
 
     def seg_net(self, n_out: int, pretrained: bool = True):
         """The repo's task head on the frozen backbone: `TaskHead` with task_f_maps [64] (cfgs/trainer/default_train.yaml:26)
@@ -179,5 +178,4 @@ class _FeatLastHead(torch.nn.Module):
         return self.head(self.backbone.get_feature(x)[-1])  # joiner.py:180 -> head.py:40
 
 
-def build(cfg: dict, device: str) -> BrainFM:
-    return BrainFM(cfg, device)
+build = BrainFM

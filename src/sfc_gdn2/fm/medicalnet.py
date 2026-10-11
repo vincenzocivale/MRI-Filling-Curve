@@ -47,14 +47,11 @@ class MedicalNet(Wrapper):
     def __init__(self, cfg: dict, device: str):
         super().__init__(cfg, device)
         add_to_path(cfg["repo"])
-        from models import resnet
         self.depth = int(self.args["depth"])
         self.input_size = tuple(int(s) for s in self.args.get("input_size", (56, 448, 448)))
         self.seed = self.args.get("seed", 1)
         torch.manual_seed(1)  # conv_seg init only (setting.py:110 manual_seed); conv_seg never reaches the features
-        self.model = getattr(resnet, f"resnet{self.depth}")(
-            sample_input_D=self.input_size[0], sample_input_H=self.input_size[1], sample_input_W=self.input_size[2],
-            shortcut_type=SHORTCUT[self.depth], no_cuda=device == "cpu", num_seg_classes=2)
+        self.model = self._resnet(no_cuda=device == "cpu", n_classes=2)
         sd = torch.load(cfg["checkpoint"], map_location="cpu", weights_only=True)["state_dict"]
         res = self.model.load_state_dict({k.removeprefix("module."): v for k, v in sd.items()}, strict=False)
         missing = [k for k in res.missing_keys if not k.startswith("conv_seg.")]
@@ -63,9 +60,14 @@ class MedicalNet(Wrapper):
                                f"missing {missing[:4]}, unexpected {res.unexpected_keys[:4]}")
         self.model.eval().to(device)
 
+    def _resnet(self, no_cuda: bool, n_classes: int):
+        """`models/resnet.py` resnet{depth} as `model.py` generate_model builds it."""
+        from models import resnet
+        return getattr(resnet, f"resnet{self.depth}")(
+            sample_input_D=self.input_size[0], sample_input_H=self.input_size[1], sample_input_W=self.input_size[2],
+            shortcut_type=SHORTCUT[self.depth], no_cuda=no_cuda, num_seg_classes=n_classes)
+
     def preprocess(self, image: Image) -> dict:
-        if not isinstance(image, str):
-            raise TypeError("medicalnet is single-modality: pass a NIfTI path")
         from datasets.brains18 import BrainS18Dataset
         sets = Namespace(input_D=self.input_size[0], input_H=self.input_size[1], input_W=self.input_size[2],
                          phase="test")
@@ -82,20 +84,15 @@ class MedicalNet(Wrapper):
 
     # ------------------------------------------------------------------ segmentation (fm/segrun.py)
     def seg_input(self, prepared: dict):
-        from ..bench.geom import source_to_input
+        from ..bench.geom import _scale
         x = prepared["image"]
-        return x, source_to_input("medicalnet", {"source_shape": prepared["source_shape"],
-                                                 "input_shape": tuple(x.shape[1:])})
+        return x, _scale(prepared["source_shape"], x.shape[1:], align_corners=True)
 
     def seg_net(self, n_out: int, pretrained: bool = True):
         """The repo's segmentation network: resnet + `conv_seg` (resnet.py:145-170, transposed conv to stride 4) with
         n_out classes, backbone from the checkpoint (model.py:88-115), conv_seg from scratch; its output is resized to
         the input grid (trilinear, as test.py:60-67 zooms the prediction with order 1). Whole-volume input."""
-        from models import resnet
-
-        net = getattr(resnet, f"resnet{self.depth}")(
-            sample_input_D=self.input_size[0], sample_input_H=self.input_size[1], sample_input_W=self.input_size[2],
-            shortcut_type=SHORTCUT[self.depth], no_cuda=False, num_seg_classes=n_out)
+        net = self._resnet(no_cuda=False, n_classes=n_out)
         if pretrained:
             net.load_state_dict({k: v for k, v in self.model.state_dict().items() if not k.startswith("conv_seg.")},
                                 strict=False)
@@ -133,5 +130,4 @@ class _ToInput(torch.nn.Module):
         return torch.nn.functional.interpolate(self.net(x), size=x.shape[2:], mode="trilinear", align_corners=False)
 
 
-def build(cfg: dict, device: str) -> MedicalNet:
-    return MedicalNet(cfg, device)
+build = MedicalNet

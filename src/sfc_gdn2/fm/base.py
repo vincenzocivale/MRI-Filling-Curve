@@ -13,17 +13,38 @@ A wrapper runs INSIDE the model's conda env (see `worker.py`) and imports the OR
   the feature grid (`meta`). Anything derived by us (e.g. a pooling the repo does not define) is listed in
   `derived` so it is never mistaken for the repo's output.
 
-An image is a path (single-modality models) or a {modality: path} dict (multi-modal models; the
-accepted modality names are the wrapper's `modalities`).
+An image is the path of a NIfTI file.
 """
 from __future__ import annotations
 
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Union
+from typing import Any
 
-Image = Union[str, dict[str, str]]  # noqa: UP007 -- runtime alias, some model envs run python 3.9
+import numpy as np
+
+Image = str  # a NIfTI path
+
+
+def plain(t):
+    """MetaTensor -> torch.Tensor (the .pt files must load without monai)."""
+    return t.as_tensor() if hasattr(t, "as_tensor") else t
+
+
+def plain_meta(x: Any) -> Any:
+    """numpy / tuples / slices -> python lists, so the result loads with torch.load(weights_only=True)."""
+    if isinstance(x, dict):
+        return {k: plain_meta(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [plain_meta(v) for v in x]
+    if isinstance(x, slice):
+        return [plain_meta(x.start), plain_meta(x.stop)]
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
 
 
 def add_to_path(*dirs: str | Path) -> None:
@@ -42,13 +63,12 @@ def git_commit(repo: str | Path) -> str | None:
 
 
 class Wrapper:
-    """Subclasses: set `name`, `modalities`, implement `preprocess` and `features`.
+    """Subclasses: set `name`, implement `preprocess` and `features`.
 
     cfg = {model, env, repo, checkpoint, args: {...}}; device = "cuda" | "cpu".
     """
 
     name = "fm"
-    modalities: tuple[str, ...] = ("image",)   # single-modality wrappers take a bare path
 
     def __init__(self, cfg: dict, device: str):
         self.cfg, self.args, self.device = cfg, dict(cfg.get("args") or {}), device
@@ -65,10 +85,6 @@ class Wrapper:
                 "checkpoint": self.cfg.get("checkpoint"), "python": sys.version.split()[0]}
 
     def __call__(self, image: Image) -> dict:
-        if isinstance(image, dict):
-            unknown = set(image) - set(self.modalities)
-            if unknown:
-                raise ValueError(f"{self.name}: unknown modalities {sorted(unknown)}; accepted {self.modalities}.")
         return self.finish(self.preprocess(image))
 
     def finish(self, prepared: Any) -> dict:

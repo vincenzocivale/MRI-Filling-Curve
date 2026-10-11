@@ -7,22 +7,19 @@ model. Two stages, as SLURM jobs:
   cached under <segdec.cache>/<group lead>/ for the union of the tasks' volumes;
 - train (per model x task x init): `init` = pretrained (the protocol) or random (same network, encoder randomly
   initialised and frozen: what the decoder gets from the architecture alone). Writes
-  <segdec.out>/<task>/s<seed>/<model>__<init>.json with a 95% CI over test-subject resamples (`_ci`).
+  <segdec.out>/<task>/s<seed>/<model>__<init>.json with a 95% CI over test-subject resamples (probe.subject_ci).
 """
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from ..fm.api import SRC, load_config
+from ..fm.api import load_config, run_in_env
 from ..io import override
-from .probe import task_rows
+from .probe import subject_ci, task_rows
 
 MAX_TRAIN, MAX_VAL = 400, 100  # volumes per task held in RAM
 
@@ -44,15 +41,7 @@ def task_items(tasks: dict, vols: pd.DataFrame, splits: pd.DataFrame, seed: int,
 
 
 def run_job(cfg: dict, job: dict) -> None:
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump({"cfg": cfg, **job}, f)
-    env = os.environ | {"PYTHONPATH": os.pathsep.join([str(SRC), *filter(None, [os.environ.get("PYTHONPATH")])]),
-                        "PYTHONNOUSERSITE": "1"}
-    try:
-        subprocess.run([str(Path(cfg["env"]) / "bin" / "python"), "-m", "sfc_gdn2.fm.segrun", f.name], env=env,
-                       check=True)
-    finally:
-        os.unlink(f.name)
+    run_in_env(cfg["env"], "sfc_gdn2.fm.segrun", {"cfg": cfg, **job})
 
 
 def prep(bench: dict, group: str, items: dict[str, list[dict]], device: str = "cuda", shard: str | None = None,
@@ -91,8 +80,9 @@ def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init
         print(f"[segdec] {task} s{seed} {model} {init}: best val dice {res['val_dice']:.3f}", flush=True)
         return res
     subj = {it["id"]: it["subject"] for it in items}
-    res |= {"task": task, "seed": seed, "test_ci95": _ci(np.asarray(res["per_volume"], dtype=float),
-                                                                  np.array([subj[i] for i in res["test_ids"]]))}
+    d = np.asarray(res["per_volume"], dtype=float)
+    res |= {"task": task, "seed": seed,
+            "test_ci95": subject_ci(lambda idx: np.nanmean(d[idx]), [subj[i] for i in res["test_ids"]])}
     out.write_text(json.dumps(res, indent=1))
     print(f"[segdec] {task} s{seed} {model} {init}: dice {res['test_dice']:.3f} {res['test_ci95']}", flush=True)
     return res
@@ -107,11 +97,3 @@ def select(rows: pd.DataFrame, cfg: dict, rng: np.random.Generator) -> dict[str,
     if cfg.get("test_query"):
         sel["test"] = rows.loc[sel["test"]].query(cfg["test_query"]).index.to_numpy()
     return sel
-
-
-def _ci(d: np.ndarray, subj: np.ndarray, n: int = 1000) -> list[float]:
-    rng = np.random.default_rng(0)
-    groups = pd.Series(range(len(subj))).groupby(subj).indices
-    keys = sorted(groups)
-    vals = [np.nanmean(d[np.concatenate([groups[s] for s in rng.choice(keys, len(keys))])]) for _ in range(n)]
-    return [float(np.nanpercentile(vals, 2.5)), float(np.nanpercentile(vals, 97.5))]

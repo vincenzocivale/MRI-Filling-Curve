@@ -1,6 +1,7 @@
 # Models in the FM benchmark (decided 2026-10-06). One config per line; `sfc fm <config> ...` for each.
-# Wrappers/configs not listed here (BrainMVP, MoME/MoME+, BrainSegFounder BraTS/ATLAS-ft, other OpenMind
-# methods, AMAES-fomo260k, other MedicalNet depths, TotalSeg 857/872/873) stay verified but unused.
+# Only these configs (+ the per-curve sfc_gdn2_*) exist: the others (BrainMVP, MoME/MoME+, BrainSegFounder
+# BraTS/ATLAS-ft, other OpenMind methods, AMAES-fomo260k, other MedicalNet depths, TotalSeg 857/871/872/873)
+# were removed 2026-10-11 (git history). TotalSeg 871 was dropped 2026-10-09: same net and data as 870 (muscles).
 configs/fm/brainiac.yaml                      # required
 configs/fm/openmind_resencl_mae.yaml
 configs/fm/openmind_primusm_mae.yaml
@@ -14,4 +15,3 @@ configs/fm/bsf_atlas_pretrain.yaml            # barely trained, kept on purpose
 configs/fm/medicalnet_resnet50_23dataset.yaml # legacy baseline
 configs/fm/nnunet_totalseg_mr_870.yaml        # supervised on TotalSeg MRI: upper bound on the TotalSeg test only
 configs/fm/sfc_gdn2.yaml                      # ours (curve average); + sfc_gdn2_{raster,morton,hilbert}: one row per curve
-# configs/fm/nnunet_totalseg_mr_871.yaml       # dropped 2026-10-09: same net and data as 870 (muscles instead of organs)

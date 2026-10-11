@@ -45,9 +45,8 @@ fm:
     bsf_atlas_pretrain: *bsf
     medicalnet_resnet50_23dataset: {features: [layer4_gap, layer4_pool144], drop_canonical: true,
                                     pool: [{from: layer4, factor: [1, 4, 4], to: layer4_pool144}]}
-    nnunet_totalseg_mr_870: &nnunet {features: [fg_mean_stage0, fg_mean_stage1, fg_mean_stage2, fg_mean_stage3,
-                                                fg_mean_stage4, stage4, stage3]}
-    nnunet_totalseg_mr_871: *nnunet
+    nnunet_totalseg_mr_870: {features: [fg_mean_stage0, fg_mean_stage1, fg_mean_stage2, fg_mean_stage3,
+                                        fg_mean_stage4, stage4, stage3]}
     sfc_gdn2: &sfc {features: [mean, map]}   # map: bi tokens on the patch grid (~16 mm)
     sfc_gdn2_raster: *sfc
     sfc_gdn2_morton: *sfc
