@@ -398,22 +398,42 @@ def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.T
             "subjects": len(subjects), "chosen": [{k: c[k] for k in ("head", "feature", "l2")} for c in (a, b)]}
 
 
+TUNE_FEATURES = {"mean"}  # sfc_gdn2's map mean is 0.98 cosine-similar to its mean (p1_lr/00): half the fits
+
+
+def _tune_one(m: str, d: Path, tname: str, cfg: dict, rows: pd.DataFrame, device: str) -> dict:
+    torch.set_num_threads(2)
+    ids, feats = load_globals(d)
+    feats = {k: f for k, f in feats.items() if k in TUNE_FEATURES} or feats
+    r = tune_task(tname, cfg, rows, feats, {i: k for k, i in enumerate(ids)}, device)
+    print(f"[tune] {m} {tname}: skill {r['skill']:.3f} ({r['subjects']} subjects)", flush=True)
+    return {"model": m, **{k: r[k] for k in ("task", "skill", "subjects")}, "chosen": r["chosen"]}
+
+
 def tune(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, splits: pd.DataFrame, out_dir: Path,
          device: str = "cuda") -> pd.DataFrame:
     """tune_task for every model x non-seg task on the tune_subjects -> <out>/tune.csv (+ the mean skill per model).
-    No test subject of any seed is read."""
-    keep, out = tune_subjects(splits), []
+    No test subject of any seed is read. The (model, task) pairs run in one process per visible GPU (the L-BFGS fits are
+    launch-bound: processes sharing a GPU slow each other down); tune.csv is rewritten as each pair ends."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from multiprocessing import get_context
+    keep, jobs, out = tune_subjects(splits), [], []
     for m, d in models.items():
-        ids, feats = load_globals(d)
+        ids, _ = load_globals(d)  # builds the cache once, before the workers read it
         v = vols[vols["id"].isin(set(ids)) & vols["subject"].isin(keep)]
-        for tname, cfg in tasks.items():
-            if cfg["type"] == "seg":
-                continue
-            r = tune_task(tname, cfg, task_rows(v, splits, cfg, 0), feats, {i: k for k, i in enumerate(ids)}, device)
-            out.append({"model": m, **{k: r[k] for k in ("task", "skill", "subjects")}, "chosen": r["chosen"]})
-            print(f"[tune] {m} {tname}: skill {r['skill']:.3f} ({r['subjects']} subjects)", flush=True)
-    df = pd.DataFrame(out)
+        jobs += [(m, d, t, cfg, task_rows(v, splits, cfg, 0)) for t, cfg in tasks.items() if cfg["type"] != "seg"]
+    gpus = torch.cuda.device_count() if device == "cuda" else 0
     out_dir.mkdir(parents=True, exist_ok=True)
+    with ProcessPoolExecutor(min(max(gpus, 1), len(jobs)), mp_context=get_context("spawn")) as ex:
+        futs = [ex.submit(_tune_one, *j, f"cuda:{k % gpus}" if gpus else device) for k, j in enumerate(jobs)]
+        for f in as_completed(futs):
+            try:
+                out.append(f.result())
+            except Exception as e:  # noqa: BLE001 - one degenerate task must not lose the others
+                print(f"[tune] failed: {e!r}", flush=True)
+                continue
+            pd.DataFrame(out).to_csv(out_dir / "tune.csv", index=False)
+    df = pd.DataFrame(out, columns=["model", "task", "skill", "subjects", "chosen"]).sort_values(["model", "task"])
     df.to_csv(out_dir / "tune.csv", index=False)
     print(df.groupby("model")["skill"].mean().rename("mean skill").to_string(), flush=True)
     return df
