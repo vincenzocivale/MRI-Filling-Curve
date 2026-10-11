@@ -81,8 +81,10 @@ submits it; any `sfc` command or script goes after `--`:
 cp slurm/local.yaml.example slurm/local.yaml      # once: mail, conda base / env path
 python slurm/submit.py slurm/presets/dbg.yaml -- sfc fm configs/fm/brainiac.yaml --images a.nii.gz --out o
 python slurm/submit.py slurm/presets/cpu.yaml -- sfc pretrain-pool configs/pretrain_lejepa.yaml --workers 8
-python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
+python slurm/submit.py slurm/presets/4gpu.yaml --chain 5 -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
 ```
+`--chain N`: N jobs one after the other; each resumes the run's `ckpt.pt` (full state, every `train.ckpt_every`
+steps), so a run can outlast the 24 h limit.
 
 Presets: `dbg` (1 GPU, debug QOS, 30 min), `1gpu`, `4gpu` and `8gpu` (torchrun DDP, 1 and 2 nodes),
 `cpu` (`lrd_all_serial`). Under torchrun the command is `-m <module>` or a script, never `python`.

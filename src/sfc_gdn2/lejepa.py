@@ -34,6 +34,8 @@ bounds the tokens per step whatever the field of view.
   entirely masked in A is pulled to the same cell in B (`cell<c>` head); SIGReg on `tokens_per_volume` of
   B's cells per volume.
 loss = (1 - lam) * mean(invariances) + lam * mean(SIGRegs), one of each per scale.
+SIGReg sees every rank's samples; its statistic scales with their count, so it is rescaled by
+sigreg_gpus / world size: the objective (lam tuned on 4 GPUs) does not change with the number of GPUs.
 """
 from __future__ import annotations
 
@@ -106,7 +108,7 @@ class LeJEPA(nn.Module):
                  thick_mm: tuple = (4.0, 8.0), mask_ratio: tuple = (0.2, 0.5), gamma: float = 0.3, scale: float = 0.1,
                  shift: float = 0.05, noise: float = 0.02, fg_threshold: float = 0.05, proj_hidden: int = 1024,
                  proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
-                 sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,)):
+                 sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_gpus: int = 4):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -114,7 +116,7 @@ class LeJEPA(nn.Module):
         self.embed_chunk_voxels, self.max_packed_tokens = embed_chunk_voxels, max_packed_tokens
         self.checkpoint_tokens = checkpoint_tokens
         self.thick_prob, self.thick_mm = thick_prob, tuple(float(t) for t in thick_mm)
-        self.tokens_per_volume = tokens_per_volume
+        self.tokens_per_volume, self.sigreg_gpus = tokens_per_volume, sigreg_gpus
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
         self.levels = [int(c) for c in levels]
@@ -333,7 +335,8 @@ class LeJEPA(nn.Module):
         # volume whose B views hold no foreground (boxes are centred on it, so only after jitter) falls back to all
         keep = self._sample(tvol, tfg, b, gen)
         dist = torch.distributed.is_initialized()   # SIGReg sees every rank's samples (differentiable gather)
-        sig = lambda z: self.sigreg(gather_rows(z) if dist else z, gen)
+        world = torch.distributed.get_world_size() if dist else 1
+        sig = lambda z: self.sigreg(gather_rows(z) if dist else z, gen) * (self.sigreg_gpus / world)
         sig_g, sig_t = sig(zg.permute(2, 0, 1, 3).reshape(2, -1, zg.shape[-1])), sig(ztok[keep][None])
         out = {}
         for cs, p, q, z, vb in zip(self.levels, cpred, ctgt, cz, cvol):

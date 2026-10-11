@@ -14,6 +14,11 @@ script path there, never `python`:
     python slurm/submit.py slurm/presets/4gpu.yaml -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
     python slurm/submit.py slurm/presets/cpu.yaml --dry-run -- python tests/fm/brainfm_parity.py
 
+Runs longer than the 24 h limit: `--chain N` submits N copies, each after the previous ends (afterany);
+`sfc pretrain` resumes its run directory's ckpt.pt, so the copies continue one run:
+
+    python slurm/submit.py slurm/presets/4gpu.yaml --chain 5 -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
+
 Config = slurm/defaults.yaml <- slurm/local.yaml (per user, gitignored) <- preset <- --set key=value.
 """
 from __future__ import annotations
@@ -125,6 +130,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--job-name", help="override the job name")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="override any config field")
     ap.add_argument("--after-job", metavar="JOB_ID", help="start after JOB_ID ends (--dependency=afterany)")
+    ap.add_argument("--chain", type=int, default=1, metavar="N", help="submit N copies, each after the previous")
     ap.add_argument("--dry-run", action="store_true", help="print the batch script, do not submit")
     ap.add_argument("--script-out", type=Path, help="also write the batch script here")
     args = ap.parse_args(argv[:sep])
@@ -154,12 +160,15 @@ def main(argv: list[str] | None = None) -> int:
     Path(logs_dir).mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
         f.write(script)
-    cmd = ["sbatch", *([f"--dependency=afterany:{args.after_job}"] if args.after_job else []), f.name]
+    after, jobs = args.after_job, []
     try:
-        res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        for _ in range(args.chain):
+            cmd = ["sbatch", "--parsable", *([f"--dependency=afterany:{after}"] if after else []), f.name]
+            after = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip().split(";")[0]
+            jobs.append(after)
     finally:
         Path(f.name).unlink()
-    print(res.stdout.strip(), f"(logs: {logs_dir})")
+    print(f"Submitted batch job {' -> '.join(jobs)} (logs: {logs_dir})")
     return 0
 
 

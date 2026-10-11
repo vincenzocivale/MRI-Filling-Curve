@@ -35,8 +35,9 @@ The first GPU run spends minutes compiling Triton kernels (`TRITON_CACHE_DIR` on
 - `model.py`: `KernelEmbed` (continuous kernel in mm, separable learned basis, integrated per voxel: one [P,d] weight per scan),
   `Encoder` (mask token, causal GDN-2 stack, no coordinate embedding; `packed` runs variable-length sequences via cu_seqlens).
 - `lejepa.py`: `SIGReg`, `Projector`, `LeJEPA` (`boxes` → `jittered` → `serialize` → `read` (fwd + reversed pass, cube masks) → glob/tok/`cells` heads).
-- `pretrain.py`: `Pretrainer` (bf16, fused AdamW, decay on matrices only, warmup+cosine, grad clip,
-  non-finite steps skipped, `encoder_step*.pt` incl. step 0).
+- `pretrain.py`: `Pretrainer` (bf16, fused AdamW, decay on matrices only, warmup + WSD or cosine, grad clip,
+  non-finite steps skipped, `encoder_step*.pt` incl. step 0; `ckpt.pt` every `ckpt_every` steps, resumed
+  automatically: same config = same run directory).
 - `data/`: `catalog` (every volume + labels), `pool` (pretraining manifest), `VolumeStore` (native, cache optional), loader (volumes as a list;
   `to_device` makes values + per-scan [N,P] patches; `grid`, `k`, `spacing` [B,3]).
 - `fm/`: external foundation models, image -> the model's own features. `api.extract` (`sfc fm`) runs `worker.py` under the model's conda env (`envs/fm/`, path in `configs/fm/*.yaml`); each wrapper (`base.Wrapper`) imports the ORIGINAL repo code for preprocessing, network, inference and outputs. Parity scripts in `tests/fm/`.
