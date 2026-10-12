@@ -29,17 +29,18 @@ def _fla_host_fixes() -> None:
       call it in turn with different arguments: recomputed several times per block, each time with a host sync and
       one Python `arange` per sequence (~1.6k syncs and ~150k aranges per step). Here: kept per (cu_seqlens, chunk
       size) while that tensor lives, built by a few kernels and one sync. Same values.
-    - the short conv's and the gated norm's Triton autotune keys hold NB = cdiv(T, 1024): a new benchmark of 16
-      configs for every new packed length. Keyed without NB: tuned once per width (configs change speed only)."""
+    - the short conv's, gated norm's and l2norm's kernels take NB = cdiv(T, ...), a constexpr their bodies never read, in
+      the autotune key too: a compile and a 16-config benchmark for every new packed length. Pinned to 1 by the
+      heuristics in front of each autotuner: compiled and tuned once per width."""
     if _FLA_FIXED:
         return
     import sys
     import weakref
 
-    from fla.modules import fused_norm_gate
+    from fla.modules import fused_norm_gate, l2norm
     from fla.modules.conv.triton import kernels
     from fla.ops.utils import index
-    from triton.runtime.autotuner import Autotuner
+    from triton.runtime.autotuner import Autotuner, Heuristics
 
     old, cache = index.prepare_chunk_indices, {}
 
@@ -59,12 +60,13 @@ def _fla_host_fixes() -> None:
     for m in list(sys.modules.values()):
         if getattr(m, "prepare_chunk_indices", None) is old:
             m.prepare_chunk_indices = prepare_chunk_indices
-    for mod in (kernels, fused_norm_gate):
-        for k in vars(mod).values():
-            while k is not None and not isinstance(k, Autotuner):
-                k = getattr(k, "fn", None)
-            if k is not None and "NB" in k.keys:
-                k.keys = [x for x in k.keys if x != "NB"]
+    for mod in (kernels, fused_norm_gate, l2norm):
+        for name, h in list(vars(mod).items()):
+            if isinstance(h, Autotuner) and "NB" in h.keys:            # l2norm's: no heuristics in front, add one
+                h = Heuristics(h, h.arg_names, {})
+                setattr(mod, name, h)
+            if isinstance(h, Heuristics) and isinstance(h.fn, Autotuner) and "NB" in h.fn.keys:
+                h.values["NB"] = lambda _: 1
     _FLA_FIXED.append(True)
 
 
@@ -79,8 +81,16 @@ class GDN2Block(nn.Module):
         self.ffn_norm = nn.LayerNorm(d)
         self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.mix(self.norm(x), cu_seqlens=cu_seqlens)[0]
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, rev: torch.Tensor | None = None,
+                both: bool = False) -> torch.Tensor:
+        """rev (index reversing each packed sequence): the mixer reads backwards; both: the mean of both ways."""
+        y = self.norm(x)
+        if torch.is_autocast_enabled(y.device.type):    # cast once, not once per projection (~6 per block)
+            y = y.to(torch.get_autocast_dtype(y.device.type))
+        m = self.mix(y, cu_seqlens=cu_seqlens)[0] if rev is None or both else 0
+        if rev is not None:                             # index_select: its backward is an index_add, no sort
+            m = (m + self.mix(y.index_select(1, rev), cu_seqlens=cu_seqlens)[0].index_select(1, rev)) / (2 if both else 1)
+        x = x + m
         return x + self.ffn(self.ffn_norm(x))
 
 
@@ -123,8 +133,9 @@ class KernelEmbed(nn.Module):
 
     def weights(self, spacing: torch.Tensor, k) -> torch.Tensor:
         """spacing [3] mm, k [3] voxels per patch axis -> W [k0*k1*k2, d] (patchify's voxel order)."""
-        px, py, pz = self.axis_integrals(spacing, k)
-        w = torch.einsum("dabc,xa,yb,zc->xyzd", self.G_unit, px, py, pz)
+        with torch.autocast(spacing.device.type, enabled=False):  # bf16 picked an sm75 bmm, ~15% of the step
+            px, py, pz = self.axis_integrals(spacing, k)
+            w = torch.einsum("dabc,xa,yb,zc->xyzd", self.G_unit, px, py, pz)
         return w.reshape(-1, self.G_unit.shape[0]) * (1000 / self.patch_mm ** 3)
 
     def forward(self, patches: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -160,12 +171,19 @@ class Encoder(nn.Module):
     order is the only spatial signal, and it differs between views, so an embedding cannot be made
     view-invariant through absolute position. Any grid size: sequences are packed, not padded.
     `view_pos`: adds `ViewPos` (coordinates relative to the view's own box: no absolute position).
+    `bidir`: "late" (default) the stack reads each sequence forwards and, separately, backwards, bi = fwd ++ bwd;
+    "alternate" every odd block reads backwards (Vision-LSTM, Alkin et al. 2024): every token sees the whole sequence
+    from block 2 on, at half the late encoder's cost; "block" every block reads both ways with the same mixer, outputs
+    averaged (Vision Mamba / Hydra pattern), the late encoder's mixer cost and half its MLP. One stream: bi = h ++ h
+    (same interface for the heads, probes and decoder).
     """
 
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
-                 grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, **embed):
+                 grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, bidir: str = "late",
+                 **embed):
         super().__init__()
-        self.dim, self.grad_checkpoint = d_model, grad_checkpoint
+        assert bidir in ("late", "alternate", "block"), bidir
+        self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
         self.patch_embed = KernelEmbed(d_model, patch_mm, **embed)
         self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
         self.pos = ViewPos(d_model) if view_pos else None
@@ -178,19 +196,21 @@ class Encoder(nn.Module):
         m = cfg["model"]
         return cls(m["d_model"], m["depth"], m["head_dim"], m["num_heads"], m.get("use_short_conv", True),
                    m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
-                   **m.get("embed", {}))
+                   m.get("bidir", "late"), **m.get("embed", {}))
 
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         """[...,N,d] tokens, masked ones replaced by the learned mask token."""
         return x if mask is None else torch.where(mask[..., None], self.mask_token.to(x.dtype), x)
 
-    def run(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, ckpt: bool | None = None) -> torch.Tensor:
+    def run(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, ckpt: bool | None = None,
+            rev: torch.Tensor | None = None) -> torch.Tensor:
         """[B,S,d] curve-ordered tokens -> [B,S,d] hidden states (pre final norm). With `cu_seqlens`
-        (int32 [n+1] offsets), x is [1,T,d]: n sequences packed back to back, no padding."""
-        for block in self.blocks:
-            ckpt = self.grad_checkpoint if ckpt is None else ckpt
-            x = (checkpoint(block, x, cu_seqlens, use_reentrant=False) if ckpt and self.training
-                 else block(x, cu_seqlens))
+        (int32 [n+1] offsets), x is [1,T,d]: n sequences packed back to back, no padding. rev: see `bidir`."""
+        ckpt = self.grad_checkpoint if ckpt is None else ckpt
+        for i, block in enumerate(self.blocks):
+            r = rev if self.bidir == "block" or i % 2 else None
+            x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", use_reentrant=False) if ckpt and self.training
+                 else block(x, cu_seqlens, r, self.bidir == "block"))
         return x
 
     def packed(self, x: torch.Tensor, valid: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
@@ -203,8 +223,16 @@ class Encoder(nn.Module):
 
     def flat(self, x: torch.Tensor, cu_seqlens: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
         """[T,d] curve-ordered tokens of n sequences back to back (int32 offsets cu_seqlens [n+1]) -> [T,d] normed
-        hidden states. Any lengths: FLA's length-keyed autotuning is off (`_fla_host_fixes`)."""
-        return self.norm(self.run(x[None], cu_seqlens, ckpt)[0])
+        hidden states. A dummy sequence pads T <= 64: GDN-2 switches to its recurrent kernel there in eval."""
+        total = len(x)
+        if pad := max(65 - total, 0):
+            x, cu_seqlens = nn.functional.pad(x, (0, 0, 0, pad)), torch.cat([cu_seqlens, cu_seqlens[-1:] + pad])
+        rev = None
+        if self.bidir != "late":                           # index reversing each sequence in place
+            k, cu = torch.arange(len(x), device=x.device), cu_seqlens.long()
+            s = torch.searchsorted(cu[1:], k, right=True)
+            rev = cu[s] + cu[s + 1] - 1 - k
+        return self.norm(self.run(x[None], cu_seqlens, ckpt, rev)[0, :total])
 
 
 # scans on the device (`dataset.to_device`) -> {"bi": [B,N,F] (patch level, N = the batch's largest grid),
@@ -251,10 +279,13 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
                                  for c, d, m in zip(local, dims, inside)])  # per volume: no batch-dependent curve
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s = t.gather(1, order[..., None].expand(-1, -1, encoder.dim))
-                h = encoder.packed(torch.cat([s, s.gather(1, rev[..., None].expand_as(s))]), valid.repeat(2, 1)).float()
-            fwd, bwd = h[: len(grid)], h[len(grid):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))
+                if encoder.bidir == "late":
+                    h = encoder.packed(torch.cat([s, s.gather(1, rev[..., None].expand_as(s))]), valid.repeat(2, 1)).float()
+                    fb = torch.cat([h[: len(grid)], h[len(grid):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))], -1)
+                else:                                                          # one stream: bi = h ++ h
+                    fb = encoder.packed(s, valid).float().repeat(1, 1, 2)
             back = order.argsort(1)[..., None]                                 # curve position -> raster
-            bi = bi + torch.cat([fwd, bwd], -1).gather(1, back.expand(-1, -1, 2 * h.shape[-1])) / len(curves)
+            bi = bi + fb.gather(1, back.expand(-1, -1, fb.shape[-1])) / len(curves)
         if level == "patch":
             return {"bi": bi}
         w = (fg | (inside & ~fg.any(1, keepdim=True))).float()

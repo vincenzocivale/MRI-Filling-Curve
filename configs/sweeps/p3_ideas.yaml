@@ -1,0 +1,28 @@
+# Phase 3, idea arms (notes/LOG.md 12/10): one change each on the baseline (G2 architecture, D1 lr), paired with run 0
+# (same seed = same batches), 760 steps, skill + dense signal. Runs 0-1 are the baseline on the packed code and its
+# noise (also p3_objective's reference). 2σ against the 2-seed mean ≈ 0.06 skill, 0.044 Dice.
+# - rec: masked tokens predict their patch's sub-patch layout (4^3 cells of native voxels, normalised per patch):
+#   PatchDecode decodes each token alone, so that layout must be in the token, and no other term asks for it.
+#   Adopt if Dice >= base + 0.044 and skill >= base - 0.03. rec_visible: B's foreground tokens too.
+# - bidir alternate: odd blocks read backwards (one stream, whole-view context from block 2; half the encoder cost).
+#   Non-inferiority: skill >= base - 0.03 and Dice >= base - 0.022 -> the phase-4 encoder.
+# - muon: the encoder blocks' matrices (Moonlight scaling: same lr). Paired SSL loss over steps 710-760.
+# - recipe: the three together (interactions; s/step and memory of what phase 4 would scale).
+name: p3_ideas
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {}                                                  # base
+  - {seed: 18}                                          # base, second seed (noise)
+  - {objective.rec_weight: 0.2}                         # rec
+  - {model.bidir: alternate}                            # alternate
+  - {train.optimizer: muon}                             # muon
+  - {objective.rec_weight: 0.2, objective.rec_visible: 0.2}   # rec + visible
+  - {model.bidir: alternate, train.optimizer: muon, objective.rec_weight: 0.2}   # recipe
+  - {objective.rec_weight: 0.5}                         # rec dose
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:30:00"}

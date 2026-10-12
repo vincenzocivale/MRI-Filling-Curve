@@ -1,14 +1,16 @@
-# Phase 3 (notes/PIANO_TARATURA.md, D6): the objective's task/data choices, 12 random draws, 760 steps (d=512/8, 2 GPUs, ~3 h), skill
-# (mean over tasks); the SSL loss does not compare across objectives. train.lr from p1_lr; before launching, the
-# architecture fixed at gate G2 (view_curves, view_pos, patch_mm) in `fixed`. Then: the 3 best with a second seed +
-# the dense signal, and the winner with objective.top_levels: [] (A/B of the volume/session levels).
+# Phase 3 (notes/PIANO_TARATURA.md, D6): the objective's task/data choices, 12 random draws, 760 steps (d=512/8, 2 GPUs, ~2.5 h
+# with the packed code), skill (mean over tasks) + the dense signal (free: on the job's second GPU beside the probe);
+# the SSL loss does not compare across objectives. train.lr from p1_lr; architecture of gate G2 (three curves, no view
+# position, 16 mm: the config's defaults). Baseline and noise on this code: p3_ideas runs 0-1. Then: the 3 best with a
+# second seed, and the winner with objective.top_levels: [] (A/B of the volume/session levels).
 name: p3_objective
 n: 12
 seed: 0
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
 fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
-        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8}
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
 space:
   objective.mask_ratio: {choice: [[0.1, 0.3], [0.2, 0.5], [0.4, 0.7]]}
   objective.mask_cells: {choice: [[1], [1, 2], [1, 2, 4], [1, 4]]}   # 1 always there: cubes must fit small views
@@ -17,6 +19,8 @@ space:
   objective.lam: {log: [0.02, 0.1]}
   objective.w_top: {log: [0.25, 4.0]}
   data.mix_alpha: {choice: [1.0, 0.7, 0.5]}
-  aug: {log: [1.0, 3.0], scales: {objective.gamma: 0.3, objective.scale: 0.1, objective.shift: 0.05, objective.noise: 0.02}}
+  aug: {log: [0.3, 3.0], scales: {objective.gamma: 0.3, objective.scale: 0.1, objective.shift: 0.05, objective.noise: 0.02}}
+  # (aug from 0.3: today's 1.0 sat at the edge of [1, 3], which explored stronger augmentation only)
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
-slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "04:30:00"}
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:30:00"}

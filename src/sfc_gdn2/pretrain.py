@@ -42,13 +42,61 @@ def lr_factor(step: int, t: dict) -> float:
     return warm * (1.0 if left >= 1 else 1 - math.sqrt(max(0.0, 1 - left)))
 
 
-def param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+def param_groups(model: nn.Module, weight_decay: float, muon: bool = False) -> list[dict]:
     """Decay matrices only. Biases, norms, the mask token and GDN-2's decay-gate parameters
-    (A_log, dt_bias: flagged `_no_weight_decay` upstream) are left undecayed."""
-    decay, keep = [], []
-    for p in model.parameters():
-        (keep if p.ndim < 2 or getattr(p, "_no_weight_decay", False) else decay).append(p)
-    return [{"params": decay, "weight_decay": weight_decay}, {"params": keep, "weight_decay": 0.0}]
+    (A_log, dt_bias: flagged `_no_weight_decay` upstream) are left undecayed. muon: the encoder blocks' weight
+    matrices in a group of their own (`MuonAdamW`)."""
+    groups = {"muon": [], "decay": [], "keep": []}
+    for name, p in model.named_parameters():
+        g = "keep" if p.ndim < 2 or getattr(p, "_no_weight_decay", False) else "decay"
+        groups["muon" if muon and g == "decay" and p.ndim == 2 and ".blocks." in f".{name}" else g].append(p)
+    return [{"params": groups["muon"], "weight_decay": weight_decay, "muon": True},
+            {"params": groups["decay"], "weight_decay": weight_decay}, {"params": groups["keep"], "weight_decay": 0.0}]
+
+
+def _orthogonalize(g: torch.Tensor, steps: int) -> torch.Tensor:
+    """~U V^T of g's SVD by the quintic Newton-Schulz iteration of Muon (Jordan et al. 2024), in bf16."""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    x = g.bfloat16()
+    if tall := x.shape[0] > x.shape[1]:
+        x = x.T
+    x = x / (x.norm() + 1e-7)
+    for _ in range(steps):
+        s = x @ x.T
+        x = a * x + (b * s + c * s @ s) @ x
+    return x.T if tall else x
+
+
+class MuonAdamW(torch.optim.Optimizer):
+    """Muon on the groups flagged `muon`, AdamW on the rest. Muon: Nesterov momentum orthogonalised by Newton-Schulz,
+    scaled by 0.2 sqrt(max(fan_out, fan_in)) so its RMS matches AdamW's (Moonlight, Liu et al. 2025, arXiv
+    2502.16982): AdamW's lr, schedule and decoupled weight decay carry over. Same rank-identical update under DDP."""
+
+    def __init__(self, groups: list[dict], lr: float, betas=(0.9, 0.999), eps: float = 1e-8, momentum: float = 0.95,
+                 ns_steps: int = 5):
+        super().__init__(groups, {"lr": lr, "betas": betas, "eps": eps, "momentum": momentum, "ns_steps": ns_steps,
+                                  "muon": False, "weight_decay": 0.0})
+
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            lr, wd = g["lr"], g["weight_decay"]
+            for p in g["params"]:
+                if p.grad is None:
+                    continue
+                st = self.state[p]
+                if g["muon"]:
+                    m = st.setdefault("m", torch.zeros_like(p))
+                    m.mul_(g["momentum"]).add_(p.grad)
+                    u = _orthogonalize(p.grad.add(m, alpha=g["momentum"]), g["ns_steps"])
+                    p.mul_(1 - lr * wd).add_(u.to(p.dtype), alpha=-lr * 0.2 * max(p.shape) ** 0.5)
+                    continue
+                b1, b2 = g["betas"]
+                st["t"] = t = st.get("t", 0) + 1
+                m, v = st.setdefault("m", torch.zeros_like(p)), st.setdefault("v", torch.zeros_like(p))
+                m.lerp_(p.grad, 1 - b1)
+                v.mul_(b2).addcmul_(p.grad, p.grad, value=1 - b2)
+                p.mul_(1 - lr * wd).addcdiv_(m, (v / (1 - b2 ** t)).sqrt_().add_(g["eps"]), value=-lr / (1 - b1 ** t))
 
 
 class Pretrainer:
@@ -83,7 +131,10 @@ class Pretrainer:
         self.net = LeJEPA.from_config(cfg).to(self.device)
         self.session = torch.tensor(ses)
         self.model = DistributedDataParallel(self.net, device_ids=[self.device.index]) if world > 1 else self.net
-        self.opt = torch.optim.AdamW(param_groups(self.net, t["weight_decay"]), lr=t["lr"], fused=True)
+        muon = t.get("optimizer", "adamw") == "muon"
+        groups = param_groups(self.net, t["weight_decay"], muon)
+        self.opt = MuonAdamW(groups, lr=t["lr"]) if muon else torch.optim.AdamW(
+            [{k: v for k, v in g.items() if k != "muon"} for g in groups], lr=t["lr"], fused=True)
         self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lambda s: lr_factor(s, t))
         self.gen = torch.Generator(self.device).manual_seed(self.seed + 123 + self.rank)
         self.log = print if self.rank == 0 else (lambda *a, **k: None)

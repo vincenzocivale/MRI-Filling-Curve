@@ -89,17 +89,13 @@ class SIGReg(nn.Module):
     def forward(self, z: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         """z: [..., M, D] -> scalar (mean over leading dims and slices). Scaled by M like a test
         statistic (LeJEPA's); LeJEPA.forward rescales it to a fixed M."""
-        tf32, torch.backends.cuda.matmul.allow_tf32 = torch.backends.cuda.matmul.allow_tf32, False
-        try:
-            with torch.autocast(z.device.type, enabled=False):  # cos/sin of bf16 (or tf32) projections is too coarse
-                z = z.float()
-                a = torch.randn(z.shape[-1], self.slices, device=z.device, generator=generator)
-                a = a / a.norm(dim=0)
-                xt = (z @ a).unsqueeze(-1) * self.t                      # [..., M, S, T]
-                err = (xt.cos().mean(-3) - self.phi).square() + xt.sin().mean(-3).square()
-                return ((err @ self.w) * z.shape[-2]).mean()
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = tf32
+        with torch.autocast(z.device.type, enabled=False):  # cos/sin of bf16 (or tf32) projections is too coarse
+            z = z.float()
+            a = torch.randn(z.shape[-1], self.slices, device=z.device, generator=generator)
+            a = a / a.norm(dim=0)
+            xt = (z.double() @ a.double()).float().unsqueeze(-1) * self.t   # [..., M, S, T]; fp64: no tf32 either way
+            err = (xt.cos().mean(-3) - self.phi).square() + xt.sin().mean(-3).square()
+            return ((err @ self.w) * z.shape[-2]).mean()
 
 
 class Projector(nn.Sequential):
@@ -124,7 +120,8 @@ class LeJEPA(nn.Module):
                  shift: float = 0.05, noise: float = 0.02, fg_threshold: float = 0.05, proj_hidden: int = 1024,
                  proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
-                 w_top: float = 1.0, top_levels: tuple = ("volume", "session")):
+                 w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
+                 rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -141,6 +138,9 @@ class LeJEPA(nn.Module):
         self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.cell = nn.ModuleList(Projector(2 * encoder.dim, proj_hidden, proj_dim) for _ in self.levels)
         self.top = nn.ModuleDict({n: Projector(2 * encoder.dim, proj_hidden, proj_dim) for n in top_levels})
+        self.rec_weight, self.rec_cells, self.rec_eps, self.rec_visible = rec_weight, rec_cells, rec_eps, rec_visible
+        self.rec = nn.Sequential(nn.Linear(2 * encoder.dim, proj_hidden), nn.GELU(),
+                                 nn.Linear(proj_hidden, rec_cells ** 3)) if rec_weight or rec_visible else None
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
         perms, flips = symmetries()
         self.register_buffer("perms", perms, persistent=False)
@@ -290,8 +290,9 @@ class LeJEPA(nn.Module):
             t = t + self.encoder.pos(vpos).to(t.dtype)
         off = n.cumsum(0) - n
         rev = 2 * off[tv] + n[tv] - 1 - torch.arange(tot, device=dev)                      # an involution
-        seqs, lens2 = torch.cat([t, t[rev]]), lens + lens   # forwards, then backwards
-        cu = nn.functional.pad(torch.cat([n, n]).cumsum(0), (1, 0))
+        late = self.encoder.bidir == "late"                # else one stream, both ways inside the blocks
+        seqs, lens2 = (torch.cat([t, t.index_select(0, rev)]), lens + lens) if late else (t, lens)   # fwd, then bwd
+        cu = nn.functional.pad((torch.cat([n, n]) if late else n).cumsum(0), (1, 0))
         groups, cur, size = [], [], 0
         for r, ln in enumerate(lens2):     # packed calls of <= max_packed_tokens: GDN-2's backward peak follows the call
             if cur and size + ln > self.max_packed_tokens:
@@ -300,15 +301,13 @@ class LeJEPA(nn.Module):
             cur.append(r)
             size += ln
         groups.append(cur)
-        ckpt = self.encoder.grad_checkpoint and 2 * tot > self.checkpoint_tokens   # recompute only for big scans
-        h, pos = [], 0
-        for g in groups:
-            r0, r1 = g[0], g[-1] + 1
-            end = pos + sum(lens2[r0:r1])
-            h.append(self.encoder.flat(seqs[pos:end], (cu[r0:r1 + 1] - cu[r0]).int(), ckpt))
-            pos = end
-        h = torch.cat(h)
-        return tv, idx, pxyz, fgv, mask, torch.cat([h[:tot], h[tot:][rev]], -1), n, off, lens
+        ckpt = self.encoder.grad_checkpoint and len(seqs) > self.checkpoint_tokens   # recompute only for big scans
+        parts = seqs.split([sum(lens2[g[0]:g[-1] + 1]) for g in groups])   # split: one cat in backward (slices:
+        h = torch.cat([self.encoder.flat(x, (cu[g[0]:g[-1] + 2] - cu[g[0]]).int(), ckpt)    # a zero-filled [2T,d]
+                       for x, g in zip(parts, groups)])                                   # gradient per call)
+        fwd, bwd = h.split(tot) if late else (h, h)
+        bi = torch.cat([fwd, bwd.index_select(0, rev) if late else bwd], -1)   # index_select: backward index_add
+        return tv, idx, pxyz, fgv, mask, bi, n, off, lens
 
     def forward(self, vols: dict, generator: torch.Generator) -> dict[str, torch.Tensor]:
         """vols (`dataset.to_device`): patches = per scan [N_b, P_b] native voxel values, spacing [B,3] mm,
@@ -323,6 +322,14 @@ class LeJEPA(nn.Module):
             if (key := (*sp, *k)) not in memo:
                 memo[key] = self.encoder.patch_embed.weights(torch.tensor(sp, device=grid.device), k)
         ws = [memo[(*sp, *k)] for sp, k in zip(vols["spacing_list"], vols["k_list"])]
+        if self.rec is not None:  # sub-patch targets: each patch's native voxels in rec_cells^3 cells, normalised per patch
+            with torch.no_grad(), torch.autocast(grid.device.type, enabled=False):
+                rt = torch.cat([nn.functional.adaptive_avg_pool3d(x.view(-1, 1, *k), self.rec_cells).flatten(1)
+                                for x, k in zip(vols["patches"], vols["k_list"])])
+                rt = (rt - rt.mean(1, keepdim=True)) / (rt.var(1, keepdim=True, unbiased=False) + self.rec_eps).sqrt()
+            roff = torch.tensor([len(x) for x in vols["patches"]], device=grid.device)
+            roff = roff.cumsum(0) - roff                                                   # first row of each scan
+        rec, recv = [], []
         corner, edge = self.jittered(*self.boxes(fg, xyz, grid, gen), grid, gen)           # [B,G,2,3]
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
         zg, pred, tgt, ztok, tvol, tfg, lens, tops = [], [], [], [], [], [], [], []
@@ -354,13 +361,18 @@ class LeJEPA(nn.Module):
             # (deterministic: batch-statistics BatchNorm)
             head = (lambda x: checkpoint(self.tok, x, use_reentrant=False)) if len(bi) > self.checkpoint_tokens \
                 else self.tok
-            z_b = head(bi[ib]).float()                                                     # B's tokens
-            pred.append(head(bi[ia][pair]).float())
+            z_b = head(bi.index_select(0, ib)).float()                                     # B's tokens
+            pred.append(head(bi.index_select(0, ia[pair])).float())
             tgt.append(z_b[j_b[pair]])
             ztok.append(z_b)
             tvol.append(v[tv[ib]])
             tfg.append(fgv[ib])
             lens.append(e.prod(-1).float().mean())
+            # masked tokens (A's foreground) -> their patch's sub-patch layout (MAE-style); rec_visible: B's foreground
+            for w, r, acc in ((self.rec_weight, mask, rec), (self.rec_visible, fgv & (tv % 2 == 1), recv)):
+                if w:
+                    r = r.nonzero()[:, 0]
+                    acc.append((self.rec(bi.index_select(0, r)).float() - rt[roff[v[tv[r]]] + idx[r]]).square().mean(1))
         zg = torch.cat(zg, 1)                                                              # [B,G,2,D]
         inv_g = (zg - zg.mean(2, keepdim=True)).square().mean()
         # symmetric, as LeJEPA: both tokens pulled to their mean, no stop-grad (with a stop-grad target and
@@ -403,7 +415,11 @@ class LeJEPA(nn.Module):
         sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels), *(out[f"sigreg_{n}"] for n in self.top)]
         w = [self.w_top, 1.0, *(1.0 for _ in self.levels), *(self.w_top for _ in self.top)]
         wmean = lambda xs: sum(a * x for a, x in zip(w, xs)) / sum(w)
-        return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs),
+        for k, r in (("rec", rec), ("rec_visible", recv)):
+            if r:
+                out[k] = (r := torch.cat(r)).sum() / max(len(r), 1)
+        return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs) + self.rec_weight * out.get("rec", 0)
+                + self.rec_visible * out.get("rec_visible", 0),
                 "inv_global": inv_g, "inv_token": inv_t, "sigreg_global": sig_g, "sigreg_token": sig_t, **out,
                 "vol_share": vol_share, "len_global": lens[0], "len_local": lens[1]}
 

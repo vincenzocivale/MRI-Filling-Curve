@@ -32,6 +32,8 @@ model:
   num_heads: 4
   use_short_conv: true
   view_pos: false             # model.ViewPos: coordinates inside each view's own box (ablation A3, PIANO_TARATURA)
+  bidir: late                 # late: the stack reads each view forwards and backwards, bi = fwd ++ bwd; alternate: odd
+                              # blocks read backwards (one stream, half the cost); block: both ways in every block
   grad_checkpoint: true         # GDN-2 blocks recomputed in backward when a step's views exceed objective.checkpoint_tokens
   embed:                      # continuous-kernel patch embedding (model.KernelEmbed), any spacing
     rank: 16                  # learned 1D basis functions per axis (kernel = G . phi_x phi_y phi_z)
@@ -68,12 +70,17 @@ objective:
                               # for every term whatever batch, tokens_per_volume, groups or GPUs; 768 = what lam was tuned on
   w_top: 1.0                  # weight of the view, volume and session terms (token and cells: 1), in both means
   top_levels: [volume, session]   # the levels above the view ([] for the A/B check)
+  rec_weight: 0.0             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
+  rec_visible: 0.0            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens
+  max_packed_tokens: 65536    # tokens per encoder call (GDN-2's backward peak follows it; 262144: -12% s/step at d=512)
 
 train:
   steps: 15000
   batch_size: 36               # per GPU, at most (data.patches_per_batch packs whole scans); 4 GPUs: 144 volumes per step,
                                # the samples of the volume level's SIGReg (~72 sessions for the session level)
   lr: 0.0005
+  optimizer: adamw            # or muon: the encoder blocks' matrices (Moonlight scaling, AdamW's lr carries over)
+  tf32: true                  # fp32 matmuls on tensor cores (the patch embedding); SIGReg stays exact
   weight_decay: 0.05          # matrices only (see pretrain.param_groups)
   grad_clip: 1.0              # rare single-token gradient spikes (50-1500x median) otherwise; skip non-finite steps
   warmup_steps: 1000
