@@ -1,0 +1,16 @@
+# Gate G3 (12/10): the config's new defaults = p3_objective #5 (best skill and Dice of the random search) + rec and
+# rec_visible 0.2 + bidir alternate + Muon (each the best or non-inferior in p3_ideas; none beyond 2σ, adopted on
+# the user's call). Two seeds at the screens' size: do the gains add up (the alternate+muon+rec recipe did not beat
+# its parts)? Compare with p3_ideas 0-1 (skill 0.417, Dice 0.313).
+name: p3_g3
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {}
+  - {seed: 18}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}

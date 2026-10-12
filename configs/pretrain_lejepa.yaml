@@ -23,7 +23,7 @@ data:
                               # 2-GPU dbg, 40 steps: 6x the v8 batch peaks at 10.7 GB (views over checkpoint_tokens are
                               # recomputed), ~31k patches/s per GPU vs ~9k at 16384
   mix_by: [dataset, modality] # strata of the mixing (pool: MR-RATE T1w 26% ... FOMO300K ADC 159 scans)
-  mix_alpha: 1.0              # stratum share ~ n^alpha: 1 = as in the pool (MR-RATE 72%); 0.5-0.7 to try in the ablations
+  mix_alpha: 0.5              # stratum share ~ n^alpha: 1 = as in the pool (MR-RATE 72%) (G3, p3 12/10)
 
 model:
   d_model: 256
@@ -32,7 +32,7 @@ model:
   num_heads: 4
   use_short_conv: true
   view_pos: false             # model.ViewPos: coordinates inside each view's own box (ablation A3, PIANO_TARATURA)
-  bidir: late                 # late: the stack reads each view forwards and backwards, bi = fwd ++ bwd; alternate: odd
+  bidir: alternate            # (G3, p3 12/10) late: the stack reads each view forwards and backwards, bi = fwd ++ bwd; alternate: odd
                               # blocks read backwards (one stream, half the cost); block: both ways in every block
   grad_checkpoint: true         # GDN-2 blocks recomputed in backward when a step's views exceed objective.checkpoint_tokens
   embed:                      # continuous-kernel patch embedding (model.KernelEmbed), any spacing
@@ -43,7 +43,7 @@ objective:
   view_curves: [raster, morton, hilbert]  # each view: one of these curves, in a random cube symmetry; probes average all three
   groups_global: 2            # per volume: boxes spanning global_frac of the foreground bounding box
   groups_local: 6             # per volume: boxes with edges log-uniform in local_edge patches
-  global_frac: [0.3, 1.0]     # volume fraction of the foreground bounding box
+  global_frac: [0.5, 1.0]     # (G3, p3 12/10) volume fraction of the foreground bounding box
   local_edge: [3, 8]          # patches per edge (27-512 tokens)
   jitter: 0.25                # view box = group box rescaled/shifted by up to this fraction of its edge
   max_view_tokens: 4096       # views are padded to the longest in the batch, so one big scan set the memory of all
@@ -51,27 +51,27 @@ objective:
   thick_prob: 0.3             # per view: native slices averaged into slabs along a random axis ...
   thick_mm: [4, 8]            # ... ~4 or 8 mm thick (skipped where the scan's slices already are): thick-slice acquisitions
   mask_ratio: [0.2, 0.5]      # fraction of view A's cubes whose foreground patches get the mask token
-  mask_cells: [1, 2, 4]       # per view A: cube edge (patches) of its mask, <= half the view's shortest edge
+  mask_cells: [1]             # (G3, p3 12/10) per view A: cube edge (patches) of its mask, <= half the view's shortest edge
   levels: [2, 4]              # cube levels above the patch (32, 64 mm): mean token of fully masked A cubes -> B's (v8 smoke: 128 mm cubes got 0-4 pairs per step: masks that big fit only whole-body views)
-  gamma: 0.3                  # intensity: x^exp(U(-g,g)) * U(1-scale,1+scale) + U(-shift,shift) + N(0, U(0,noise))
-  scale: 0.1
-  shift: 0.05
-  noise: 0.02
+  gamma: 0.19                 # (G3, p3 12/10) intensity: x^exp(U(-g,g)) * U(1-scale,1+scale) + U(-shift,shift) + N(0, U(0,noise))
+  scale: 0.063
+  shift: 0.032
+  noise: 0.013
   fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
   proj_hidden: 1024
   proj_dim: 64                # every head (view mean, patch, each cube level); LeJEPA Tab. 1d: small is better
   tokens_per_volume: 32       # B foreground tokens (and cells) per volume fed to their SIGReg: the estimate's sample
                               # count only (4 GPUs x 36 vols x 32 = 4608), not its weight (sigreg_samples); <32 also
                               # biases vol_share up (within-volume variance from too few tokens: floor 0.2 at 5)
-  lam: 0.05                   # loss = (1-lam)*invariance + lam*SIGReg
+  lam: 0.076                  # (G3, p3 12/10) loss = (1-lam)*invariance + lam*SIGReg
   sigreg_slices: 256
   sigreg_knots: 17
   sigreg_samples: 768         # every SIGReg rescaled to this many samples (it grows with its sample count): same weight
                               # for every term whatever batch, tokens_per_volume, groups or GPUs; 768 = what lam was tuned on
-  w_top: 1.0                  # weight of the view, volume and session terms (token and cells: 1), in both means
+  w_top: 0.63                 # (G3, p3 12/10) weight of the view, volume and session terms (token and cells: 1), in both means
   top_levels: [volume, session]   # the levels above the view ([] for the A/B check)
-  rec_weight: 0.0             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
-  rec_visible: 0.0            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens
+  rec_weight: 0.2             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
+  rec_visible: 0.2            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens
   max_packed_tokens: 65536    # tokens per encoder call (GDN-2's backward peak follows it; 262144: -12% s/step at d=512)
 
 train:
@@ -79,7 +79,7 @@ train:
   batch_size: 36               # per GPU, at most (data.patches_per_batch packs whole scans); 4 GPUs: 144 volumes per step,
                                # the samples of the volume level's SIGReg (~72 sessions for the session level)
   lr: 0.0005
-  optimizer: adamw            # or muon: the encoder blocks' matrices (Moonlight scaling, AdamW's lr carries over)
+  optimizer: muon             # (G3, p3 12/10); adamw, or muon: the encoder blocks' matrices (Moonlight scaling, AdamW's lr carries over)
   tf32: true                  # fp32 matmuls on tensor cores (the patch embedding); SIGReg stays exact
   weight_decay: 0.05          # matrices only (see pretrain.param_groups)
   grad_clip: 1.0              # rare single-token gradient spikes (50-1500x median) otherwise; skip non-finite steps
