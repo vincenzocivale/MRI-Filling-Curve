@@ -16,7 +16,56 @@ def _gdn2():
     except Exception as e:
         raise RuntimeError("Official NVlabs/GatedDeltaNet-2 (and its FLA/Triton deps) is required; "
                            "see README 'Install'.") from e
+    _fla_host_fixes()
     return GatedDeltaNet2
+
+
+_FLA_FIXED = []
+
+
+def _fla_host_fixes() -> None:
+    """Host-side costs of FLA 0.4.2 on packed sequences of every length (profile of 11/10, notes/LOG.md):
+    - `prepare_chunk_indices` remembers only its last call (`tensor_cache`), and the short conv and the GDN-2 kernels
+      call it in turn with different arguments: recomputed several times per block, each time with a host sync and
+      one Python `arange` per sequence (~1.6k syncs and ~150k aranges per step). Here: kept per (cu_seqlens, chunk
+      size) while that tensor lives, built by a few kernels and one sync. Same values.
+    - the short conv's and the gated norm's Triton autotune keys hold NB = cdiv(T, 1024): a new benchmark of 16
+      configs for every new packed length. Keyed without NB: tuned once per width (configs change speed only)."""
+    if _FLA_FIXED:
+        return
+    import sys
+    import weakref
+
+    from fla.modules import fused_norm_gate
+    from fla.modules.conv.triton import kernels
+    from fla.ops.utils import index
+    from triton.runtime.autotuner import Autotuner
+
+    old, cache = index.prepare_chunk_indices, {}
+
+    def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int, cu_seqlens_cpu=None) -> torch.Tensor:
+        key = (id(cu_seqlens), chunk_size)
+        if (hit := cache.get(key)) is not None and hit[0]() is cu_seqlens:
+            return hit[1]
+        n = (cu_seqlens[1:] - cu_seqlens[:-1] + chunk_size - 1) // chunk_size    # chunks per sequence (all >= 1)
+        tot, dev = int(n.sum()), n.device
+        seq = torch.repeat_interleave(torch.arange(len(n), device=dev), n, output_size=tot)
+        out = torch.stack([seq, torch.arange(tot, device=dev) - (n.cumsum(0) - n)[seq]], 1).to(cu_seqlens)
+        if len(cache) > 4096:
+            cache.clear()
+        cache[key] = (weakref.ref(cu_seqlens), out)
+        return out
+
+    for m in list(sys.modules.values()):
+        if getattr(m, "prepare_chunk_indices", None) is old:
+            m.prepare_chunk_indices = prepare_chunk_indices
+    for mod in (kernels, fused_norm_gate):
+        for k in vars(mod).values():
+            while k is not None and not isinstance(k, Autotuner):
+                k = getattr(k, "fn", None)
+            if k is not None and "NB" in k.keys:
+                k.keys = [x for x in k.keys if x != "NB"]
+    _FLA_FIXED.append(True)
 
 
 class GDN2Block(nn.Module):
@@ -147,14 +196,15 @@ class Encoder(nn.Module):
     def packed(self, x: torch.Tensor, valid: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
         """[V,L,d] curve-ordered tokens, [V,L] valid (a prefix of each row) -> [V,L,d] normed hidden
         states, zero at padding. Only valid tokens are run, packed into one sequence (views differ ~10x
-        in length: padding was ~3x the work). FLA's short conv re-tunes (~20 s) for every new
-        ceil(T/1024): a dummy last sequence rounds T up to 8 lengths per octave (<= 12.5% extra)."""
-        flat, total = x[valid], int(valid.sum())
-        pad = -total % (1 << max(total.bit_length() - 3, 10))
-        cu = nn.functional.pad(valid.sum(1).cumsum(0), (1, 0))
-        cu = torch.cat([cu, cu[-1:] + pad] if pad else [cu]).int()
-        out = self.norm(self.run(nn.functional.pad(flat, (0, 0, 0, pad))[None], cu, ckpt)[0, :total])
+        in length: padding was ~3x the work)."""
+        cu = nn.functional.pad(valid.sum(1).cumsum(0), (1, 0)).int()
+        out = self.flat(x[valid], cu, ckpt)
         return out.new_zeros(*valid.shape, out.shape[-1]).index_put((valid,), out)
+
+    def flat(self, x: torch.Tensor, cu_seqlens: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
+        """[T,d] curve-ordered tokens of n sequences back to back (int32 offsets cu_seqlens [n+1]) -> [T,d] normed
+        hidden states. Any lengths: FLA's length-keyed autotuning is off (`_fla_host_fixes`)."""
+        return self.norm(self.run(x[None], cu_seqlens, ckpt)[0])
 
 
 # scans on the device (`dataset.to_device`) -> {"bi": [B,N,F] (patch level, N = the batch's largest grid),

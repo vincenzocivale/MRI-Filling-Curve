@@ -71,6 +71,10 @@ class Pretrainer:
         world = self.world
         self.device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
         torch.cuda.set_device(self.device)
+        # fp32 matmuls on tensor cores (TF32, 10-bit mantissa): mostly the patch embedding of native voxels and its
+        # gradient, ~30% of the step on the SIMT cores. Its rounding (~5e-4 relative) is ~40x below the training
+        # noise augmentation (objective.noise); SIGReg keeps full fp32; extraction (benchmark) stays fp32.
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = bool(t.get("tf32", True))
         rows = pretrain_rows(cfg)
         if self.rank == 0:
             rows[["dataset", "subject", "sample_id"]].to_csv(run / "split.csv", index=False)
@@ -125,7 +129,13 @@ class Pretrainer:
             self.log(f"[lejepa] already at step {self.step} of {t['steps']}", flush=True)
             return
         self.model.train()
+        prof, first = os.environ.get("SFC_PROFILE"), self.step + 1  # a dir: steps first+5..first+7 profiled, then stop
         for step in range(self.step + 1, t["steps"] + 1):
+            if prof and step == first + 5 and save:
+                torch.cuda.memory._record_memory_history(max_entries=500_000)
+                p = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                       torch.profiler.ProfilerActivity.CUDA], record_shapes=True)
+                p.__enter__()
             t_w = time.time()
             batch = next(batches)   # the previous step already synced (isfinite(gnorm)): this wait is a GPU stall
             wait += time.time() - t_w
@@ -151,6 +161,17 @@ class Pretrainer:
                              "peak_vram_mb": torch.cuda.max_memory_allocated(self.device) / 2 ** 20})
                 wait, patches, t_log = 0.0, 0, time.time()
                 self.log("[lejepa] " + " ".join(f"{k}={v:.4g}" for k, v in hist[-1].items()), flush=True)
+            if prof and step == first + 7:
+                if save:
+                    torch.cuda.synchronize()
+                    p.__exit__(None, None, None)
+                    Path(prof).mkdir(parents=True, exist_ok=True)
+                    p.export_chrome_trace(f"{prof}/trace.json")
+                    ka = p.key_averages()
+                    (Path(prof) / "ops.txt").write_text(ka.table(sort_by="cuda_time_total", row_limit=80) + "\n"
+                                                       + ka.table(sort_by="self_cpu_time_total", row_limit=40))
+                    torch.cuda.memory._dump_snapshot(f"{prof}/memory.pickle")
+                return
             if save and (step % t["save_every"] == 0 or step == t["steps"]):
                 torch.save(self.net.encoder.state_dict(), self.run / f"encoder_step{step:06d}.pt")
             if save and (step % t.get("ckpt_every", 500) == 0 or step == t["steps"]):

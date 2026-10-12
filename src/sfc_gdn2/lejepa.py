@@ -89,13 +89,17 @@ class SIGReg(nn.Module):
     def forward(self, z: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         """z: [..., M, D] -> scalar (mean over leading dims and slices). Scaled by M like a test
         statistic (LeJEPA's); LeJEPA.forward rescales it to a fixed M."""
-        with torch.autocast(z.device.type, enabled=False):  # cos/sin of bf16 projections is too coarse
-            z = z.float()
-            a = torch.randn(z.shape[-1], self.slices, device=z.device, generator=generator)
-            a = a / a.norm(dim=0)
-            xt = (z @ a).unsqueeze(-1) * self.t                      # [..., M, S, T]
-            err = (xt.cos().mean(-3) - self.phi).square() + xt.sin().mean(-3).square()
-            return ((err @ self.w) * z.shape[-2]).mean()
+        tf32, torch.backends.cuda.matmul.allow_tf32 = torch.backends.cuda.matmul.allow_tf32, False
+        try:
+            with torch.autocast(z.device.type, enabled=False):  # cos/sin of bf16 (or tf32) projections is too coarse
+                z = z.float()
+                a = torch.randn(z.shape[-1], self.slices, device=z.device, generator=generator)
+                a = a / a.norm(dim=0)
+                xt = (z @ a).unsqueeze(-1) * self.t                      # [..., M, S, T]
+                err = (xt.cos().mean(-3) - self.phi).square() + xt.sin().mean(-3).square()
+                return ((err @ self.w) * z.shape[-2]).mean()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
 
 
 class Projector(nn.Sequential):
@@ -180,117 +184,131 @@ class LeJEPA(nn.Module):
         c = corner[:, :, None] + (self._u(shape, -self.jitter, self.jitter, gen) * edge[:, :, None]).round().long()
         return c.clamp(min=0).minimum(g - e), e
 
-    def serialize(self, xyz, corner, edge, gen):
-        """Coords [V,N,3], boxes [V,3] -> patch indices [V,L] in the order of a random curve of
-        `view_curves` under a random cube symmetry, traced within the box; valid [V,L]; their coordinates in the box
-        after the symmetry [V,L,3] (the view position)."""
-        inside = ((xyz >= corner[:, None]) & (xyz < (corner + edge)[:, None])).all(-1)     # [V,N]
-        dev, dims = corner.device, edge[:, None]
-        sym = torch.randint(len(self.perms), (len(corner),), device=dev, generator=gen)[:, None]
-        local, dims = transform((xyz - corner[:, None]).clamp_min(0).minimum(dims - 1), dims,
-                                self.perms[sym], self.flips[sym])
-        curve = torch.randint(len(self.curves), (len(corner), 1), device=dev, generator=gen)
-        key = torch.zeros_like(inside, dtype=torch.long)
+    def serialize(self, grid, corner, edge, n, tot, gen):
+        """Boxes (corner, edge) [V,3] in patch grids [V,3], n [V] patches per box (tot in all, host) -> every view's
+        patches in the order of a random curve of `view_curves` under a random cube symmetry, traced within the box,
+        packed view after view (no padding): view [T], patch index in its scan's raster [T], coordinates [T,3] in the
+        scan and in the box after the symmetry (the view position)."""
+        dev, nv = corner.device, len(corner)
+        sym = torch.randint(len(self.perms), (nv,), device=dev, generator=gen)
+        curve = torch.randint(len(self.curves), (nv,), device=dev, generator=gen)
+        tv = torch.repeat_interleave(torch.arange(nv, device=dev), n, output_size=tot)
+        j, e = torch.arange(tot, device=dev) - (n.cumsum(0) - n)[tv], edge[tv]
+        box = torch.stack([j // (e[:, 1] * e[:, 2]), j // e[:, 2] % e[:, 1], j % e[:, 2]], -1)   # raster of the box
+        pxyz, g = corner[tv] + box, grid[tv]
+        local, dims = transform(box, e, self.perms[sym[tv]], self.flips[sym[tv]])
+        key = torch.zeros_like(j)
         for i, name in enumerate(self.curves):
-            key = torch.where(curve == i, keys(name, local, dims, self.seed, gen), key)
-        order = key.masked_fill(~inside, 1 << 62).argsort(1)
-        n = inside.sum(1)
-        order = order[:, : int(n.max())]
-        return (order, torch.arange(order.shape[1], device=order.device) < n[:, None],
-                local.gather(1, order[..., None].expand(-1, -1, 3)))
+            key = torch.where(curve[tv] == i, keys(name, local, dims, self.seed, gen), key)
+        order = key.argsort()                                   # keys are distinct within a box
+        order = order[tv[order].argsort(stable=True)]           # views kept in place, each along its curve
+        pxyz = pxyz[order]
+        return tv, (pxyz[:, 0] * g[:, 1] + pxyz[:, 1]) * g[:, 2] + pxyz[:, 2], pxyz, local[order]
 
     @staticmethod
     def cell_ids(p: torch.Tensor, grid: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """Patch coords p [V,L,3] in grids [V,3] -> id [V,L] of the aligned cube of c [V] patches per edge holding
+        """Patch coords p [...,3] in grids [...,3] -> id [...] of the aligned cube of c [...] patches per edge holding
         each patch (ids < the grid's patch count)."""
-        gc = (grid + c[:, None] - 1) // c[:, None]
-        q = p.clamp_min(0) // c[:, None, None]
-        return (q[..., 0] * gc[:, 1, None] + q[..., 1]) * gc[:, 2, None] + q[..., 2]
+        gc = (grid + c[..., None] - 1) // c[..., None]
+        q = p.clamp_min(0) // c[..., None]
+        return (q[..., 0] * gc[..., 1] + q[..., 1]) * gc[..., 2] + q[..., 2]
 
-    def thick(self, v: torch.Tensor, k, spacing, on, axis, mm) -> torch.Tensor:
-        """Patches [R,P] of one scan (k voxels at `spacing` mm); per row with `on`: native slices along `axis`
-        averaged in consecutive groups of round(mm / spacing) (a thick-slice acquisition at ~mm; nothing when
-        the scan's slices are already that thick)."""
-        for a in range(3):
-            for t in self.thick_mm:
-                if (f := round(t / spacing[a])) < 2:
-                    continue
-                g = torch.arange(k[a], device=v.device) // f
-                m = (g[:, None] == g[None, :]).float()
-                x = v.unflatten(-1, tuple(k)).movedim(1 + a, -1)
-                with torch.autocast(v.device.type, enabled=False):              # voxel values stay fp32
-                    y = (x @ (m / m.sum(0))).movedim(-1, 1 + a).flatten(-3)
-                v = torch.where((on & (axis == a) & (mm == t))[:, None], y, v)   # no host sync (every row computed)
-        return v
+    @staticmethod
+    def thick(v: torch.Tensor, k, a: int, f: int) -> torch.Tensor:
+        """Patches [R,P] of one scan (k voxels per axis): native slices along axis a averaged in consecutive groups of
+        f (a thick-slice acquisition)."""
+        g = torch.arange(k[a], device=v.device) // f
+        m = (g[:, None] == g[None, :]).float()
+        x = v.unflatten(-1, tuple(k)).movedim(1 + a, -1)
+        with torch.autocast(v.device.type, enabled=False):              # voxel values stay fp32
+            return (x @ (m / m.sum(0))).movedim(-1, 1 + a).flatten(-3)
 
-    def _embed(self, x, pid, vid, w, aug, k, spacing, seed):
+    def _embed(self, x, pid, vid, w, aug, k, slabs, seed):
         """Patches `pid` of one scan's [N,P] voxel values, each augmented with the parameters of its view `vid`
-        (aug: per-view tensors; noise drawn from `seed`, so a recomputation in backward is identical) -> [R,d]."""
-        gamma, scale, shift, noise, on, axis, mm = (a[vid] for a in aug)
+        (aug: per-view tensors; noise drawn from `seed`, so a recomputation in backward is identical); `slabs`:
+        (first row, end, axis, f) of the rows whose view simulates thick slices (`thick`) -> [R,d]."""
+        gamma, scale, shift, noise = (a[vid] for a in aug)
         v = x[pid]
         v = v.sign() * v.abs() ** gamma[:, None] * scale[:, None] + shift[:, None]
         g = torch.Generator(v.device).manual_seed(seed)
         v = v + torch.randn(v.shape, device=v.device, generator=g) * noise[:, None]
-        if self.thick_prob:
-            v = self.thick(v, k, spacing, on, axis, mm)
+        for s, e, a, f in slabs:                           # only those rows (before: every row, every axis and slab)
+            v[s:e] = self.thick(v[s:e], k, a, f)
         return self.encoder.patch_embed(v, w)
 
-    def read(self, vols, ws, fg, xyz, vol, corner, edge, masked, gen):
-        """Views [V] -> patch indices, valid, foreground, mask [V,L], bi tokens [V,L,2d]. Masking applies only to foreground patches of views with `masked`; the
-        backward pass reads each view's valid tokens in reverse (padding stays at the end, zero in the outputs).
-        Tokens are embedded per scan (its own voxels per patch and kernel weights `ws`)."""
-        idx, valid, vpos = self.serialize(xyz[vol], corner, edge, gen)
-        fgv = valid & fg[vol[:, None], idx]
-        n, nv, dev = valid.sum(1), len(idx), idx.device
+    def read(self, vols, ws, fg, n_patch, vol, corner, edge, masked, gen):
+        """Views [V] (scan `vol`, box) -> their tokens packed view after view, each along its curve (no padding):
+        view [T], patch index in its scan [T], patch coords [T,3], foreground [T], mask [T], bi tokens [T,2d]; tokens
+        per view [V] and per-view offsets [V] (device) and the tokens per view (host). Masking applies only to
+        foreground patches of views with `masked`; the backward pass reads each view in reverse. Tokens are embedded
+        per scan (its own voxels per patch and kernel weights `ws`). Host syncs: a handful per call."""
+        nv, dev = len(corner), corner.device
+        n = edge.prod(-1)
+        vol_h, lens = torch.stack([vol, n]).tolist()
+        tot = sum(lens)
+        tv, idx, pxyz, vpos = self.serialize(vols["grid"][vol], corner, edge, n, tot, gen)
+        fgv = fg[vol[tv], idx]
         u = lambda lo, hi: self._u((nv, 1, 1), lo, hi, gen)
         gamma, scale, shift, noise = u(-self.gamma, self.gamma).exp(), u(1 - self.scale, 1 + self.scale), \
             u(-self.shift, self.shift), u(0, self.noise)
         on = torch.rand(nv, device=dev, generator=gen) < self.thick_prob
         axis = torch.randint(3, (nv,), device=dev, generator=gen)
-        mm = torch.tensor(self.thick_mm, device=dev)[torch.randint(len(self.thick_mm), (nv,), device=dev, generator=gen)]
+        mm = torch.randint(len(self.thick_mm), (nv,), device=dev, generator=gen)
         # masked in aligned cubes of one of mask_cells per view (<= half its shortest edge): big cubes are the
         # coarse levels' prediction targets
         cells = self.mask_cells[None]
         ok_c = cells <= (edge.amin(-1, keepdim=True) // 2).clamp_min(1)
         c = cells[0][torch.rand(ok_c.shape, device=dev, generator=gen).masked_fill(~ok_c, -1).argmax(1)]
-        cid = self.cell_ids(xyz[vol[:, None], idx], vols["grid"][vol], c)
-        draw = torch.rand(nv, xyz.shape[1], device=dev, generator=gen).gather(1, cid)
-        mask = masked[:, None] & fgv & (draw < u(*self.mask_ratio)[..., 0])
-        aug = (gamma.view(-1), scale.view(-1), shift.view(-1), noise.view(-1), on, axis, mm)
-        seed = int(torch.randint(1 << 62, (1,), device=dev, generator=gen))
-        t = torch.zeros(*idx.shape, self.encoder.dim, device=dev)
-        rows_v, pos = valid.nonzero(as_tuple=True)                                          # every token of every view
-        vol_r = vol[rows_v]
-        for b in vol.unique().tolist():                    # one scan at a time: its voxels per patch and kernel weights
-            r = (vol_r == b).nonzero()[:, 0]
-            x, k, sp = vols["patches"][b], vols["k_list"][b], vols["spacing_list"][b]
+        cid = self.cell_ids(pxyz, vols["grid"][vol[tv]], c[tv])
+        draw = torch.rand(nv, n_patch, device=dev, generator=gen)[tv, cid]
+        mask = masked[tv] & fgv & (draw < u(*self.mask_ratio).view(-1)[tv])
+        aug = (gamma.view(-1), scale.view(-1), shift.view(-1), noise.view(-1))
+        host = torch.cat([on.long(), axis, mm, torch.randint(1 << 62, (1,), device=dev, generator=gen)]).tolist()
+        on_h, axis_h, mm_h, seed = host[:nv], host[nv:2 * nv], host[2 * nv:3 * nv], host[-1]   # one host sync
+        offs = [0]
+        for ln in lens:
+            offs.append(offs[-1] + ln)
+        spans, slabs = {}, {}                               # per scan: its token range (its views are contiguous)
+        for i, b in enumerate(vol_h):
+            s = spans.setdefault(b, [offs[i], offs[i]])
+            assert s[1] == offs[i], "views of a scan must be contiguous"
+            s[1] = offs[i + 1]
+            sp = vols["spacing_list"][b]
+            if on_h[i] and (f := round(self.thick_mm[mm_h[i]] / sp[axis_h[i]])) >= 2:   # else already that thick
+                slabs.setdefault(b, []).append((offs[i], offs[i + 1], axis_h[i], f))
+        parts = []
+        for b, (s0, s1) in spans.items():                  # one scan at a time: its voxels per patch and kernel weights
+            x, k = vols["patches"][b], vols["k_list"][b]
             chunk = max(1, self.embed_chunk_voxels // x.shape[1])
-            for c in range(0, len(r), chunk):              # recomputed in backward: memory ~ tokens, not voxels
-                rc = r[c:c + chunk]
-                t[rows_v[rc], pos[rc]] = checkpoint(self._embed, x, idx[rows_v[rc], pos[rc]], rows_v[rc], ws[b], aug, k,
-                                                    sp, seed + b * 1_000_003 + c, use_reentrant=False).to(t.dtype)
-        t = self.encoder.apply_mask(t, mask)
+            for c in range(0, s1 - s0, chunk):             # recomputed in backward: memory ~ tokens, not voxels
+                lo, hi = s0 + c, min(s0 + c + chunk, s1)
+                sl = [(max(a, lo) - lo, min(z, hi) - lo, ax, f) for a, z, ax, f in slabs.get(b, []) if a < hi and z > lo]
+                parts.append(checkpoint(self._embed, x, idx[lo:hi], tv[lo:hi], ws[b], aug, k, sl,
+                                        seed + b * 1_000_003 + c, use_reentrant=False))
+        t = self.encoder.apply_mask(torch.cat(parts), mask)
         if self.encoder.pos is not None:   # masked patches too: the mask token learns where it is
             t = t + self.encoder.pos(vpos).to(t.dtype)
-        j = torch.arange(idx.shape[1], device=dev)
-        rev = torch.where(j < n[:, None], (n[:, None] - 1 - j).clamp_min(0), j)            # an involution
-        seqs, ok = torch.cat([t, t.gather(1, rev[..., None].expand_as(t))]), torch.cat([valid, valid])
-        lens, groups, cur, tot = ok.sum(1).tolist(), [], [], 0
-        for r, ln in enumerate(lens):      # packed calls of <= max_packed_tokens: GDN-2's backward peak follows the call
-            if cur and tot + ln > self.max_packed_tokens:
+        off = n.cumsum(0) - n
+        rev = 2 * off[tv] + n[tv] - 1 - torch.arange(tot, device=dev)                      # an involution
+        seqs, lens2 = torch.cat([t, t[rev]]), lens + lens   # forwards, then backwards
+        cu = nn.functional.pad(torch.cat([n, n]).cumsum(0), (1, 0))
+        groups, cur, size = [], [], 0
+        for r, ln in enumerate(lens2):     # packed calls of <= max_packed_tokens: GDN-2's backward peak follows the call
+            if cur and size + ln > self.max_packed_tokens:
                 groups.append(cur)
-                cur, tot = [], 0
+                cur, size = [], 0
             cur.append(r)
-            tot += ln
+            size += ln
         groups.append(cur)
-        ckpt = self.encoder.grad_checkpoint and sum(lens) > self.checkpoint_tokens   # recompute only for big scans
-        outs = [(g, self.encoder.packed(seqs[g, : max(lens[r] for r in g)], ok[g, : max(lens[r] for r in g)], ckpt))
-                for g in map(torch.tensor, groups)]
-        h = seqs.new_zeros(*seqs.shape[:2], outs[0][1].shape[-1], dtype=outs[0][1].dtype)
-        for g, o in outs:
-            h[g, : o.shape[1]] = o
-        fwd, bwd = h[: len(t)], h[len(t):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))
-        return idx, valid, fgv, mask, torch.cat([fwd, bwd], -1)
+        ckpt = self.encoder.grad_checkpoint and 2 * tot > self.checkpoint_tokens   # recompute only for big scans
+        h, pos = [], 0
+        for g in groups:
+            r0, r1 = g[0], g[-1] + 1
+            end = pos + sum(lens2[r0:r1])
+            h.append(self.encoder.flat(seqs[pos:end], (cu[r0:r1 + 1] - cu[r0]).int(), ckpt))
+            pos = end
+        h = torch.cat(h)
+        return tv, idx, pxyz, fgv, mask, torch.cat([h[:tot], h[tot:][rev]], -1), n, off, lens
 
     def forward(self, vols: dict, generator: torch.Generator) -> dict[str, torch.Tensor]:
         """vols (`dataset.to_device`): patches = per scan [N_b, P_b] native voxel values, spacing [B,3] mm,
@@ -311,37 +329,37 @@ class LeJEPA(nn.Module):
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
             c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
-            masked = torch.arange(len(c), device=c.device) % 2 == 0
-            idx, valid, fgv, mask, bi = self.read(vols, ws, fg, xyz, v, c, e, masked, gen)
-            w = fgv | (valid & ~fgv.any(1, keepdim=True))                              # foreground (all if none)
-            top = torch.bmm(w[:, None].to(bi.dtype), bi)[:, 0].float() / w.sum(1, keepdim=True)
+            nv, dev = len(c), c.device
+            masked = torch.arange(nv, device=dev) % 2 == 0
+            tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(vols, ws, fg, n_patch, v, c, e, masked, gen)
+            has = torch.zeros(nv, device=dev).index_add_(0, tv, fgv.float()) > 0
+            w = (fgv | ~has[tv]).float()                                                   # foreground (all if none)
+            top = torch.zeros(nv, bi.shape[-1], device=dev).index_add_(0, tv, bi.float() * w[:, None]) \
+                / torch.zeros(nv, device=dev).index_add_(0, tv, w)[:, None]
             zg.append(self.glob(top).float().view(b, -1, 2, self.glob[-1].out_features))
             tops.append(top.view(b, -1, top.shape[-1]))
-            a, bb = masked.nonzero()[:, 0], (~masked).nonzero()[:, 0]
-            pxyz, gv = xyz[v[:, None], idx], grid[v]
             for i, (cs, head) in enumerate(zip(self.levels, self.cell)):
-                p, q, zb, vb = self.cells(bi, valid & fgv, mask, pxyz, gv, cs, n_patch, head)
+                p, q, zb, vb = self.cells(bi, tv, fgv, mask, pxyz, grid[v[tv]], cs, n_patch, head)
                 cpred[i].append(p)
                 ctgt[i].append(q)
                 cz[i].append(zb)
                 cvol[i].append(v[1::2][vb])
-            safe = torch.where(valid, idx, n_patch)                                        # padding -> dump column
-            pos_b = torch.full((len(bb), n_patch + 1), -1, device=c.device)
-            pos_b.scatter_(1, safe[bb], torch.arange(idx.shape[1], device=c.device).expand(len(bb), -1))
-            pos_b[:, -1] = -1
-            j_b = pos_b.gather(1, safe[a])                                                 # A's patch -> its position in B
-            pair = mask[a] & (j_b >= 0)                                                    # mask is foreground only
+            ia = _ranges(off[0::2], n[0::2], sum(n_h[0::2]))                               # A's tokens, B's tokens
+            ib = _ranges(off[1::2], n[1::2], sum(n_h[1::2]))
+            row_b = torch.full((nv // 2, n_patch), -1, device=dev)                         # (pair, patch) -> row in B
+            row_b[tv[ib] // 2, idx[ib]] = torch.arange(len(ib), device=dev)
+            j_b = row_b[tv[ia] // 2, idx[ia]]                                              # A's patch -> its row in B
+            pair = mask[ia] & (j_b >= 0)                                                   # mask is foreground only
             # token head recomputed in backward for big scans: whole-volume views give ~10^5 tokens x 1024 hidden
             # (deterministic: batch-statistics BatchNorm)
-            head = (lambda x: checkpoint(self.tok, x, use_reentrant=False)) if len(bi) * bi.shape[1] > self.checkpoint_tokens \
+            head = (lambda x: checkpoint(self.tok, x, use_reentrant=False)) if len(bi) > self.checkpoint_tokens \
                 else self.tok
-            z_b = head(bi[bb][valid[bb]]).float()                                          # B's valid tokens, flat
-            flat = valid[bb].flatten().long().cumsum(0).view_as(valid[bb]) - 1             # (row, pos) -> flat index
-            pred.append(head(bi[a][pair]).float())
-            tgt.append(z_b[flat.gather(1, j_b.clamp_min(0))[pair]])
+            z_b = head(bi[ib]).float()                                                     # B's tokens
+            pred.append(head(bi[ia][pair]).float())
+            tgt.append(z_b[j_b[pair]])
             ztok.append(z_b)
-            tvol.append(v[bb][:, None].expand_as(valid[bb])[valid[bb]])
-            tfg.append(fgv[bb][valid[bb]])
+            tvol.append(v[tv[ib]])
+            tfg.append(fgv[ib])
             lens.append(e.prod(-1).float().mean())
         zg = torch.cat(zg, 1)                                                              # [B,G,2,D]
         inv_g = (zg - zg.mean(2, keepdim=True)).square().mean()
@@ -390,30 +408,41 @@ class LeJEPA(nn.Module):
                 "vol_share": vol_share, "len_global": lens[0], "len_local": lens[1]}
 
     def _sample(self, vol: torch.Tensor, fg: torch.Tensor, b: int, gen) -> torch.Tensor:
-        """`tokens_per_volume` row indices per volume (foreground first; with replacement: a fixed shape for
-        the cross-GPU gather); a volume with no foreground row falls back to all its rows, with none to any."""
-        keep = []
-        for v in range(b):
-            i = ((vol == v) & fg).nonzero()[:, 0]
-            i = i if len(i) else (vol == v).nonzero()[:, 0]
-            i = i if len(i) else torch.arange(len(vol), device=vol.device)
-            keep.append(i[torch.randint(len(i), (self.tokens_per_volume,), device=i.device, generator=gen)])
-        return torch.cat(keep)
+        """`tokens_per_volume` row indices per volume, drawn among its foreground rows (with replacement: a fixed
+        shape for the cross-GPU gather); a volume with no foreground row falls back to all its rows, with none to any.
+        Vectorised (before: a loop over volumes, two host syncs each)."""
+        cnt = torch.zeros(b, dtype=torch.long, device=vol.device).index_add_(0, vol, torch.ones_like(vol))
+        nfg = torch.zeros_like(cnt).index_add_(0, vol, fg.long())
+        order = (vol * 2 + (~fg).long()).argsort(stable=True)          # by volume, its foreground rows first
+        pool = torch.where(nfg > 0, nfg, cnt)[:, None]
+        r = torch.rand(b, self.tokens_per_volume, device=vol.device, generator=gen)
+        j = torch.where(pool > 0, (cnt.cumsum(0) - cnt)[:, None] + (r * pool).long().clamp_max(pool - 1),
+                        (r * len(vol)).long().clamp_max(len(vol) - 1))
+        return order[j.flatten()]
 
-    def cells(self, bi, sel, mask, pxyz, grid, c, n_patch, head):
-        """Views A (even rows) and B (odd), bi tokens [V,L,2d], `sel` = their foreground [V,L] -> per cube of c
-        patches per edge: projected mean token of A at cubes whose foreground is entirely masked in A, of B at the
-        same cubes, of B at every cube it holds, and the pair index of the latter."""
-        cid = self.cell_ids(pxyz, grid, torch.full((len(bi),), c, device=bi.device))
-        pair = torch.arange(len(bi), device=bi.device)[:, None].expand_as(cid) // 2 * n_patch + cid
-        sa, sb = sel[0::2], sel[1::2]
-        u, inv = torch.unique(torch.cat([pair[0::2][sa], pair[1::2][sb]]), return_inverse=True)
-        ia, ib = inv[: int(sa.sum())], inv[int(sa.sum()):]
+    def cells(self, bi, tv, sel, mask, pxyz, grid, c, n_patch, head):
+        """Packed tokens of views A (even) and B (odd): bi [T,2d], their view tv [T], foreground `sel` [T], mask
+        [T], patch coords [T,3] in grids [T,3] -> per cube of c patches per edge: projected mean token of A at cubes
+        whose foreground is entirely masked in A, of B at the same cubes, of B at every cube it holds, and the pair
+        index of the latter."""
+        cid = self.cell_ids(pxyz, grid, torch.full_like(tv, c))
+        pair, isa = tv // 2 * n_patch + cid, tv % 2 == 0
+        sa, sb = sel & isa, sel & ~isa
+        pa, pb = pair[sa], pair[sb]
+        u, inv = torch.unique(torch.cat([pa, pb]), return_inverse=True)
+        ia, ib = inv[: len(pa)], inv[len(pa):]
         n_a, n_b = torch.bincount(ia, minlength=len(u)), torch.bincount(ib, minlength=len(u))
         mean = lambda x, i, n: x.new_zeros(len(u), x.shape[-1]).index_add_(0, i, x) / n.clamp_min(1)[:, None]
-        m_a, m_b = mean(bi[0::2][sa].float(), ia, n_a), mean(bi[1::2][sb].float(), ib, n_b)
-        full = (torch.bincount(ia, weights=mask[0::2][sa].float(), minlength=len(u)) == n_a) & (n_a > 0)
+        m_a, m_b = mean(bi[sa].float(), ia, n_a), mean(bi[sb].float(), ib, n_b)
+        full = (torch.bincount(ia, weights=mask[sa].float(), minlength=len(u)) == n_a) & (n_a > 0)
         ok, has_b = full & (n_b > 0), n_b > 0
-        z = head(torch.cat([m_a[ok], m_b[has_b]])).float()
-        z_a, z_b = z[: int(ok.sum())], z[int(ok.sum()):]
+        m_a = m_a[ok]
+        z = head(torch.cat([m_a, m_b[has_b]])).float()
+        z_a, z_b = z[: len(m_a)], z[len(m_a):]
         return z_a, z_b[(has_b.cumsum(0) - 1)[ok]], z_b, u[has_b] // n_patch
+
+
+def _ranges(start: torch.Tensor, n: torch.Tensor, total: int) -> torch.Tensor:
+    """Indices of the ranges [start_i, start_i + n_i) back to back; total = sum(n), known on the host (no sync)."""
+    r = torch.repeat_interleave(torch.arange(len(n), device=n.device), n, output_size=total)
+    return start[r] + torch.arange(total, device=n.device) - (n.cumsum(0) - n)[r]
