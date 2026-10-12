@@ -126,10 +126,10 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
               for s, p in zip(P, patch)]
     g = gaussian(patch, x.device)
-    try:  # fp16 accumulator on the device, else on the CPU (nnU-Net's predictor does both)
-        out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device)
-    except torch.cuda.OutOfMemoryError:
-        out = torch.zeros(n_out, *P, dtype=torch.half)
+    # fp16 accumulator on the device if it takes <= 1/4 of the free memory, else on the CPU (nnU-Net's predictor does
+    # both; "fits at all" left the tiles' forward no room: nnF CNN OOM on whole-body TotalSeg grids)
+    fits = x.is_cuda and n_out * math.prod(P) * 2 <= torch.cuda.mem_get_info(x.device)[0] / 4
+    out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device if fits else "cpu")
     wsum = torch.zeros(P, device=x.device)
     for a, b, c in product(*starts):
         sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
