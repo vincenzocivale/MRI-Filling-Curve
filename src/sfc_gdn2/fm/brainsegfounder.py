@@ -49,7 +49,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .base import Image, Wrapper, add_to_path, plain
+from .base import Image, Wrapper, add_to_path, fg_means, plain
 
 STRIDES = (2, 4, 8, 16, 32)
 PIPELINES = {"ukb", "atlas"}
@@ -192,6 +192,10 @@ class BrainSegFounder(Wrapper):
                          "sw_batch_size": self.sw_batch_size, "blend": "constant"}
         feats = {k: v[0].float() for k, v in out.items()}
         feats["stage4_gap"] = feats["stage4"].mean((1, 2, 3))
+        a_min, a_max = float(self.args.get("a_min", -1000.0)), float(self.args.get("a_max", 1000.0))
+        zero = 0.0 if self.pipeline == "atlas" else min(max(-a_min / (a_max - a_min), 0.0), 1.0)  # where raw 0 lands
+        fg = fg_means({k: feats[k] for k in ("stage2", "stage3", "stage4")}, inputs[0, 0] > zero)  # raw > 0, padding out
+        feats |= fg
         meta = {"pipeline": self.pipeline, "input_path": prepared["path"], "inference": inference,
                 "input_shape": tuple(inputs.shape[2:]), "strides": {f"stage{i}": s for i, s in enumerate(STRIDES)},
                 "grid": "feature voxel (i,j,k) of stage s covers input voxels [i*stride, (i+1)*stride) per axis; "
@@ -210,7 +214,7 @@ class BrainSegFounder(Wrapper):
                          "crop_end": tuple(int(c) for c in prepared["crop_end"]),
                          "crop": "CropForegroundd(k_divisible=roi): box in the (reoriented) source array; "
                                  "may extend outside it (zero padded)"}
-        return {"features": feats, "canonical": "stage4", "meta": meta, "derived": ["stage4_gap"]}
+        return {"features": feats, "canonical": "stage4", "meta": meta, "derived": ["stage4_gap", *fg]}
 
 
 build = BrainSegFounder

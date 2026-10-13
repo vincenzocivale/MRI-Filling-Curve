@@ -27,6 +27,7 @@ absent at 72f333b which the HF model cards link) and gardening_tools 0.3.5.
 - inference / canonical embedding: `embed_all.embed_scan` (:104-120): fp32, single crop, `_encode` ->
   deepest stage (320 ch, stride 32) -> global average pool -> `embedding` [320]. All six encoder stages of
   the same forward (captured from `_encode`, no second pass) are exposed as `stage0..stage5`.
+Derived (ours): `fg_stage{3,4,5}` (base.fg_means), foreground = input voxels above the input's minimum.
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ import numpy as np
 import torch
 from nibabel.affines import from_matvec
 
-from .base import Image, Wrapper, add_to_path, git_commit
+from .base import Image, Wrapper, add_to_path, fg_means, git_commit
 
 SIZE = 160
 STEM = "encoder.stem.conv1.conv.weight"
@@ -151,7 +152,9 @@ class Asparagus(Wrapper):
     def features(self, prepared: dict) -> dict:
         emb = self.ea.embed_scan(self.model, prepared["x"], device=self.dev)
         feats = {"embedding": emb, **{f"stage{i}": s[0] for i, s in enumerate(self._skips)}}
-        return {"features": feats, "canonical": "embedding", "derived": [], "meta": prepared["meta"]}
+        x = torch.as_tensor(prepared["x"][0])
+        fg = fg_means({k: feats[k] for k in ("stage3", "stage4", "stage5")}, x > x.min())  # zero background, padding out
+        return {"features": feats | fg, "canonical": "embedding", "derived": list(fg), "meta": prepared["meta"]}
 
     def provenance(self) -> dict:
         from importlib.metadata import version

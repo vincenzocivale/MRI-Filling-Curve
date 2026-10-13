@@ -41,7 +41,7 @@ import numpy as np
 import torch
 
 from ..bench.geom import brainfm_input_affine
-from .base import Image, Wrapper, add_to_path
+from .base import Image, Wrapper, add_to_path, fg_means
 
 GEN_CFGS = ("cfgs/generator/default.yaml", "cfgs/generator/test/demo_test.yaml")
 TRAIN_CFGS = ("cfgs/trainer/default_train.yaml", "cfgs/trainer/default_val.yaml", "cfgs/trainer/test/demo_test.yaml")
@@ -161,12 +161,14 @@ class BrainFM(Wrapper):
                       if k != "feat" and k not in UNTRAINED_OUTPUTS and isinstance(v, torch.Tensor)}
         fg = (x[0, 0] > 0).to(feats["feat_last"].dtype)
         feats["feat_last_fgmean"] = (feats["feat_last"] * fg).sum((1, 2, 3)) / fg.sum()
+        lv = fg_means({k: feats[k] for k in ("feat_0", "feat_1", "feat_2") if k in feats}, x[0, 0] > 0)  # stride 32/16/8
+        feats |= lv
         meta = prepared["meta"] | {
             "levels": {f"feat_{i}": tuple(f.shape[1:]) for i, f in enumerate(feat)},
             "level_note": "feat_i (i<5) is at stride 2**(5-i) of the input grid via floor MaxPool3d(2); "
                           "feat_last == feat_5 is on the input grid (meta['affine'])",
         }
-        return {"features": feats, "canonical": "feat_last", "meta": meta, "derived": ["feat_last_fgmean"]}
+        return {"features": feats, "canonical": "feat_last", "meta": meta, "derived": ["feat_last_fgmean", *lv]}
 
 
 class _FeatLastHead(torch.nn.Module):

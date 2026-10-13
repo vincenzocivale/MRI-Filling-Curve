@@ -47,6 +47,20 @@ def plain_meta(x: Any) -> Any:
     return x
 
 
+def fg_means(maps: dict, mask) -> dict:
+    """`fg_<name>`: each [C, ...] map's mean over the foreground, the input-grid `mask` averaged onto the map's grid
+    (cells > 0.5; the whole map when none pass). The benchmark's menu B (notes/LOG.md 13/10): one reading for all."""
+    import torch
+    import torch.nn.functional as F
+
+    out = {}
+    for k, v in maps.items():
+        w = (F.adaptive_avg_pool3d(torch.as_tensor(mask).float()[None, None].to(v.device), v.shape[1:])[0, 0] > 0.5).float()
+        w = w if w.sum() > 0 else torch.ones_like(w)
+        out[f"fg_{k}"] = (v.float() * w).flatten(1).sum(1) / w.sum()
+    return out
+
+
 def add_to_path(*dirs: str | Path) -> None:
     """Make an original repo importable (front of sys.path, once)."""
     for d in reversed([str(Path(d)) for d in dirs]):

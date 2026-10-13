@@ -32,7 +32,7 @@ import nibabel as nib
 import numpy as np
 import torch
 
-from .base import Image, Wrapper, add_to_path
+from .base import Image, Wrapper, add_to_path, fg_means
 
 SHORTCUT = {10: "B", 18: "A", 34: "A", 50: "B", 101: "B", 152: "B", 200: "B"}
 STRIDE = 8
@@ -79,7 +79,10 @@ class MedicalNet(Wrapper):
                 np.random.seed(int(self.seed))
             x = dataset[0]  # np.float32 [1, D, H, W]
         img = nib.load(image)
-        return {"image": torch.from_numpy(x), "path": image, "source_shape": tuple(int(s) for s in img.shape[:3]),
+        from scipy import ndimage  # the nonzero voxels through the same resize (the noise fills them in `x`)
+        raw = np.asanyarray(img.dataobj).reshape(img.shape[:3])
+        nz = ndimage.zoom((raw > 0).astype(np.uint8), [i / s for i, s in zip(self.input_size, raw.shape)], order=0)
+        return {"image": torch.from_numpy(x), "nonzero": torch.from_numpy(nz > 0), "path": image, "source_shape": tuple(int(s) for s in img.shape[:3]),
                 "source_affine": torch.as_tensor(img.affine, dtype=torch.float64)}
 
     # ------------------------------------------------------------------ segmentation (fm/segrun.py)
@@ -117,8 +120,9 @@ class MedicalNet(Wrapper):
                 "stride": STRIDE, "grid": tuple(layer4.shape[1:]),
                 "background_noise_seed": self.seed,
                 "shortcut": SHORTCUT[self.depth]}
-        return {"features": {"layer4": layer4, "layer4_gap": layer4.mean((1, 2, 3))}, "canonical": "layer4",
-                "meta": meta, "derived": ["layer4_gap"]}
+        fg = fg_means({"layer4": layer4}, prepared["nonzero"])
+        return {"features": {"layer4": layer4, "layer4_gap": layer4.mean((1, 2, 3))} | fg, "canonical": "layer4",
+                "meta": meta, "derived": ["layer4_gap", *fg]}
 
 
 class _ToInput(torch.nn.Module):
