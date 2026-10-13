@@ -5,7 +5,7 @@ root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
 fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
         data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 768, model.depth: 12, model.num_heads: 12,
-        objective.max_packed_tokens: 262144}
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
 runs:
   - {}
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
