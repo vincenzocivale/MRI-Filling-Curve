@@ -50,6 +50,8 @@ objective:
                               # (m5: OOM at 144 scans/GPU); brains are ~2.3k patches, the cap shrinks ~0.3% of views
   thick_prob: 0.3             # per view: native slices averaged into slabs along a random axis ...
   thick_mm: [4, 8]            # ... ~4 or 8 mm thick (skipped where the scan's slices already are): thick-slice acquisitions
+  coarse_max: 1               # > 1: in coarse_prob of the views each axis averaged in blocks of 1..coarse_max native
+  coarse_prob: 0.3            # voxels (a coarser acquisition: 0.69 -> 1.4 mm, 1 -> 4 mm, 3 -> 6 mm slices); 1 = off
   mask_ratio: [0.2, 0.5]      # fraction of view A's cubes whose foreground patches get the mask token
   mask_cells: [1]             # (G3, p3 12/10) per view A: cube edge (patches) of its mask, <= half the view's shortest edge
   levels: [2, 4]              # cube levels above the patch (32, 64 mm): mean token of fully masked A cubes -> B's (v8 smoke: 128 mm cubes got 0-4 pairs per step: masks that big fit only whole-body views)

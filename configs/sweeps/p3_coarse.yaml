@@ -1,0 +1,16 @@
+# Random block averaging per axis (objective.coarse_max 4, coarse_prob 0.3) on the G3 config, rank 16, 2 seeds: every
+# coarsened view looks like a coarser acquisition of the same anatomy (integer blocks of native voxels, nothing
+# interpolated), so A <-> B teach that 0.69 and 1.4 mm (or 3 and 6 mm slices) are the same thing. Compare with p3_g3
+# (skill 0.473, Dice 0.352). Rank 32 (p3_rank32): skill 0.473, Dice 0.340: no gain.
+name: p3_coarse
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {objective.coarse_max: 4}
+  - {objective.coarse_max: 4, seed: 18}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}

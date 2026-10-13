@@ -121,7 +121,8 @@ class LeJEPA(nn.Module):
                  proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
                  w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
-                 rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0):
+                 rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
+                 coarse_prob: float = 0.3):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -129,6 +130,7 @@ class LeJEPA(nn.Module):
         self.embed_chunk_voxels, self.max_packed_tokens = embed_chunk_voxels, max_packed_tokens
         self.checkpoint_tokens = checkpoint_tokens
         self.thick_prob, self.thick_mm = thick_prob, tuple(float(t) for t in thick_mm)
+        self.coarse_max, self.coarse_prob = int(coarse_max), coarse_prob
         self.tokens_per_volume, self.sigreg_samples, self.w_top = tokens_per_volume, sigreg_samples, w_top
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
@@ -263,8 +265,14 @@ class LeJEPA(nn.Module):
         draw = torch.rand(nv, n_patch, device=dev, generator=gen)[tv, cid]
         mask = masked[tv] & fgv & (draw < u(*self.mask_ratio).view(-1)[tv])
         aug = (gamma.view(-1), scale.view(-1), shift.view(-1), noise.view(-1))
-        host = torch.cat([on.long(), axis, mm, torch.randint(1 << 62, (1,), device=dev, generator=gen)]).tolist()
+        coarse = []      # coarse_max > 1: in coarse_prob of the views, each axis averaged in blocks of 1..coarse_max
+        if self.coarse_max > 1:  # native voxels (a coarser acquisition, nothing interpolated); off: no draw at all
+            c_on = torch.rand(nv, device=dev, generator=gen) < self.coarse_prob
+            f3 = torch.randint(1, self.coarse_max + 1, (nv, 3), device=dev, generator=gen)
+            coarse = [torch.where(c_on[:, None], f3, 1).flatten()]
+        host = torch.cat([on.long(), axis, mm, *coarse, torch.randint(1 << 62, (1,), device=dev, generator=gen)]).tolist()
         on_h, axis_h, mm_h, seed = host[:nv], host[nv:2 * nv], host[2 * nv:3 * nv], host[-1]   # one host sync
+        co_h = host[3 * nv:6 * nv] if coarse else None
         offs = [0]
         for ln in lens:
             offs.append(offs[-1] + ln)
@@ -276,6 +284,9 @@ class LeJEPA(nn.Module):
             sp = vols["spacing_list"][b]
             if on_h[i] and (f := round(self.thick_mm[mm_h[i]] / sp[axis_h[i]])) >= 2:   # else already that thick
                 slabs.setdefault(b, []).append((offs[i], offs[i + 1], axis_h[i], f))
+            for a in range(3) if co_h else ():
+                if (f := co_h[3 * i + a]) >= 2:
+                    slabs.setdefault(b, []).append((offs[i], offs[i + 1], a, f))
         parts = []
         for b, (s0, s1) in spans.items():                  # one scan at a time: its voxels per patch and kernel weights
             x, k = vols["patches"][b], vols["k_list"][b]
