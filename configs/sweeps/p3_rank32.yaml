@@ -1,0 +1,15 @@
+# Kernel embedding with 32 basis curves per axis instead of 16 (filters with ~0.5 mm detail instead of ~1 mm; 52 % of
+# the pool is below 0.75 mm in plane, MR-RATE median 0.69 mm), on the G3 config, 2 seeds. Compare with p3_g3
+# (skill 0.473, Dice 0.352). G grows 8x (2.1M -> 16.8M parameters at d=512).
+name: p3_rank32
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {model.embed.rank: 32}
+  - {model.embed.rank: 32, seed: 18}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}
