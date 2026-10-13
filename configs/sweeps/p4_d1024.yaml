@@ -1,0 +1,13 @@
+# Phase 4 (D7): the G3 config at d=1024/16 (3 GPUs x 48 scans = 144 per step, the screens' batch),
+# 760 steps, lr 4e-4, one seed: skill and Dice against p3_g3 at d=512 (0.473 / 0.352) at equal steps and batch.
+name: p4_d1024
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
+runs:
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:3", cpus_per_task: 24, mem: 360G, time: "04:30:00"}
