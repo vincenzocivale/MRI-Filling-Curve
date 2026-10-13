@@ -1,6 +1,7 @@
-# Gate G4 (D7: d=1024/16 chosen 13/10): lr at the final run's batch (4 GPUs x 48 scans = 192 per step, 524,288 patches),
-# 3 values x2 apart around D1's 4e-4 (Muon's update RMS already matches AdamW's across widths), 300 steps on the G3
-# config. Only optimisation changes, so the SSL loss at the end of the decay (history.csv) decides, as in p1_lr.
+# Gate G4 (D7: d=1024/16 chosen 13/10): lr at d=1024, 3 values x2 apart around D1's 4e-4 (Muon's update RMS already
+# matches AdamW's across widths), 300 steps on the G3 config. Cheap version (user, 13/10): 2 GPUs x 48 scans = 96 per
+# step, half the final batch (half nodes start in minutes; ~12 billed h per run); an optimum at the edge -> lean to the
+# larger lr at the final 192. Only optimisation changes, so the SSL loss at the end of the decay decides, as in p1_lr.
 name: p4_lr
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
@@ -9,4 +10,4 @@ fixed: {train.steps: 300, train.decay_steps: 60, train.warmup_steps: 75, train.s
         objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
 runs: [{train.lr: 2.0e-4}, {train.lr: 4.0e-4}, {train.lr: 8.0e-4}]
 tasks: []
-slurm: {gres: "gpu:4", cpus_per_task: 32, mem: 480G, time: "01:30:00"}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "01:30:00"}
