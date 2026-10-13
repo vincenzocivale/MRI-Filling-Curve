@@ -280,7 +280,7 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
            "n": {s: len(v) for s, v in sel.items()}, "subjects": {s: int(rows.iloc[v]["subject"].nunique())
                                                                       for s, v in sel.items()}}
     for variant, hidden in HIDDEN.items():
-        best = None
+        best, cands = None, {}
         for fname, f in feats.items():
             x = f[rid].float().to(device)
             mu, sd = x[sel["train"]].mean(0), x[sel["train"]].std(0).clamp_min(1e-6)
@@ -289,11 +289,12 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
             for l2 in L2_GRID:
                 head = fit(xs["train"], y["train"], kind, l2, hidden)
                 val = kind.metrics(kind.predict(head(xs["val"])), y["val"], rows.iloc[sel["val"]])
+                cands[fname] = max(cands.get(fname, -float("inf")), val[kind.key])   # best val per feature
                 if best is None or val[kind.key] > best["val"][kind.key]:
                     best = {"feature": fname, "l2": l2, "val": val, "head": head, "xs": xs}
         pred = {s: kind.predict(best["head"](best["xs"][s])) for s in sel}
         test_rows = rows.iloc[sel["test"]]
-        res = {"feature": best["feature"], "l2": best["l2"], "val": best["val"],
+        res = {"feature": best["feature"], "l2": best["l2"], "val": best["val"], "candidates": cands,
                "test": kind.metrics(pred["test"], y["test"], test_rows),
                "test_ci95": bootstrap(kind, pred["test"], y["test"], test_rows)}
         if cfg["type"] == "dex":  # age-bias correction (regression to the mean) fitted on val
@@ -305,10 +306,17 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
 
 
 def run(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, splits: pd.DataFrame,
-        out_dir: Path, seeds: list[int], device: str = "cuda", common: dict[str, Path] | None = None) -> pd.DataFrame:
+        out_dir: Path, seeds: list[int], device: str = "cuda", common: dict[str, Path] | None = None,
+        menu: dict[str, list[str]] | None = None) -> pd.DataFrame:
     """Every task x seed x model; only the volumes all `common` models (default `models`) have.
+    `menu`: per model, the only stored features its probes may choose from (default: all of them).
     Writes `<out>/<task>/s<seed>/<model>.json`."""
     loaded = {m: load_globals(d) for m, d in models.items()}
+    for m, keep in (menu or {}).items():
+        if m in loaded:
+            ids, feats = loaded[m]
+            assert set(keep) <= set(feats), (m, set(keep) - set(feats))
+            loaded[m] = ids, {k: feats[k] for k in keep}
     others = [load_globals(d)[0] for m, d in (common or {}).items() if m not in loaded]
     common = set.intersection(*(set(ids) for ids, _ in loaded.values()), *(set(i) for i in others))
     vols = vols[vols["id"].isin(common)]
