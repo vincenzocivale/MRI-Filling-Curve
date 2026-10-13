@@ -53,6 +53,9 @@ Outputs (`features`):
                                                   offsets mapped linearly onto [0, grid - tile] and rounded (so the
                                                   last tile ends on the last cell); mean over tiles of the per-tile GAP.
   <lvl> = stage{i} (ResEnc-L, args.stages, default [3, 4, 5] = strides 8/16/32) or tokens (Primus, stride 8).
+  args.crop_only: the recommended-size crop alone, no sliding window (one forward): crop_gap_last (canonical, as
+  above) and crop_fg_<lvl> [C] (ours), the mean of each kept level over the crop's nonzero mask at its stride
+  (mask cells more than half nonzero; the whole crop when none), the readout the benchmark gives every CNN.
 """
 from __future__ import annotations
 
@@ -64,6 +67,7 @@ from unittest import mock
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from .base import Image, Wrapper, add_to_path, plain_meta
@@ -181,7 +185,38 @@ class NnsslWrapper(Wrapper):
         return {f"stage{i}": skips[i][0] for i in sorted({*self.stages, len(skips) - 1})}
 
     @torch.inference_mode()
+    def _crop_features(self, prepared: dict) -> dict:
+        """args.crop_only: see the module docstring."""
+        from datasets.preprocess_3D_data.crop_to_mask import crop_center_with_padding_np, get_mask_center
+        from nnunetv2.utilities.helpers import dummy_context
+
+        dev = torch.device(self.device)
+        amp = torch.autocast(dev.type, enabled=True) if dev.type == "cuda" else dummy_context()
+        nz = prepared["nonzero"].astype(np.uint8)
+        center = get_mask_center(nz)
+        with amp:
+            out = self._encode(torch.from_numpy(crop_center_with_padding_np(prepared["data"][0], center,
+                                                                            tuple(self.patch)))[None, None].to(dev))
+        m = torch.from_numpy(crop_center_with_padding_np(nz.astype(np.float32), center, tuple(self.patch)))[None, None]
+        feats = {}
+        for k, v in out.items():
+            v = v.float().cpu()
+            st = [p // f for p, f in zip(self.patch, v.shape[1:])]
+            w = (F.avg_pool3d(m, st, st)[0, 0] > 0.5).float()
+            w = w if w.sum() > 0 else torch.ones_like(w)
+            feats[f"crop_fg_{k}"] = (v * w).flatten(1).sum(1) / w.sum()
+        last = "tokens" if self.is_primus else f"stage{max(int(k[5:]) for k in out)}"
+        feats["crop_gap_last"] = out[last].float().mean((1, 2, 3)).cpu()
+        meta = {"arch": self.arch, "patch_size": self.patch, "crop_center": tuple(int(c) for c in center),
+                "preprocessed_shape": tuple(prepared["data"].shape[1:]), "mode": "crop_only",
+                "precision": "fp16-autocast" if dev.type == "cuda" else "fp32"}
+        return {"features": feats, "canonical": "crop_gap_last", "meta": plain_meta(meta),
+                "derived": [k for k in feats if k.startswith("crop_fg_")]}
+
+    @torch.inference_mode()
     def features(self, prepared: dict) -> dict:
+        if self.args.get("crop_only"):
+            return self._crop_features(prepared)
         from acvl_utils.cropping_and_padding.padding import pad_nd_image
         from datasets.preprocess_3D_data.crop_to_mask import crop_center_with_padding_np, get_mask_center
         from nnunetv2.inference.sliding_window_prediction import compute_gaussian

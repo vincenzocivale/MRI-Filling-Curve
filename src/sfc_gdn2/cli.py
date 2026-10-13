@@ -74,7 +74,7 @@ def bench_extract(cfg: dict, args) -> None:
         vols = vols.iloc[i::int(n)]
     group, fm_cfg = cfg["fm"]["groups"][args.group], cfg["fm"]
     root = Path(args.out or fm_cfg["out_root"])
-    cfgs = [override(load_config(f"configs/fm/{s}.yaml"), args.fm_set) | {"save": fm_cfg["save"][s] | {"dtype": "float16"}}
+    cfgs = [override(load_config(f"configs/fm/{s}.yaml"), args.fm_set) | {"save": {"dtype": "float16"} | fm_cfg["save"][s]}
             for s in group["configs"]]
     extract(cfgs, vols["input"].tolist(), [root / s for s in group["configs"]], device=args.device,
             ids=vols["id"].tolist(), workers=int(group["workers"]))
