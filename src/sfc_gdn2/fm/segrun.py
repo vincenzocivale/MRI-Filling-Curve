@@ -137,7 +137,10 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
             logits = call(net, xp[(slice(None), *sl)][None], None if ctx is None else ctx[None])
         out[(slice(None), *sl)] += (logits[0].float().softmax(0) * g).to(out)
         wsum[sl] += g
-    return out.div_(wsum.to(out.device))[(slice(None),) + tuple(slice(0, s) for s in S)]
+    wsum = wsum.to(out.device)
+    for c in range(n_out):  # one class at a time: dividing the whole fp16 accumulator by an fp32 tensor made an fp32
+        out[c].div_(wsum)   # copy of it (whole-body nnF grids: 60 GB accumulator, RAM OOM at 240 GB)
+    return out[(slice(None),) + tuple(slice(0, s) for s in S)]
 
 
 def dice_on(pred: torch.Tensor, y: torch.Tensor, k: int) -> float:
