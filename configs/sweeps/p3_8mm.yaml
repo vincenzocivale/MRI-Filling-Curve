@@ -1,0 +1,15 @@
+# 8 mm patches on the G3 config (age: A5 at 8 mm took skill-age 0.08 -> 0.23 but val Dice 0.33 -> 0.20, without the rec
+# terms). Patch-unit geometry x2 as in A5, same mm as at 16 mm (levels 32/64 mm, local views 48-128 mm, mask cube 16 mm);
+# rec_cells 4 = 2 mm cells. Same patches per step as p3_g3 (so ~8x fewer volumes). Compare with p3_g3 (skill 0.473, Dice 0.352).
+name: p3_8mm
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {data.patch_mm: 8.0, objective.levels: [4, 8], objective.local_edge: [6, 16], objective.mask_cells: [2],
+     objective.max_view_tokens: 32768, objective.checkpoint_tokens: 0}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "05:00:00"}
