@@ -103,16 +103,21 @@ class KernelEmbed(nn.Module):
     so every voxel enters with its own weight and nothing is resampled (CKConv / CCNN-style continuous
     kernels: Romero et al. 2022, arXiv 2102.02611; Knigge et al. 2023, arXiv 2301.10540). K is separable
     in a learned basis, K(x, y, z) = G . (phi_x(x) (x) phi_y(y) (x) phi_z(z)), phi_a: mm -> R^rank an MLP on
-    Fourier features, so the voxel integrals reduce to 1D integrals per axis (midpoint rule on
-    `quad_mm` sub-intervals: exact up to quad_mm, whatever the spacing, 0.15 to 28 mm in the pool).
-    `weights` builds one [P, d] matrix per scan (spacing, voxels per patch axis k)."""
+    Fourier features, so the voxel integrals reduce to 1D integrals per axis (midpoint rule on `quad_mm`
+    sub-intervals: exact up to quad_mm, whatever the spacing, 0.15 to 28 mm in the pool).
+    `weights` builds one [P, d] matrix per scan (spacing, voxels per patch axis k).
+    `freq_decay` a: the Fourier feature at f is scaled by min(1, f0 / f)^a, f0 = one cycle per patch (a = 1: the 1/f
+    amplitude of natural images). A fixed gain, not an init, so AdamW's steps cannot re-roughen the curves. With a = 0
+    (all features equal, the runs before 14/10) the curves are rough down to 0.25 mm and the tokens of one patch
+    change with the voxel size (notes/kernel_trained.py, notes/kernel_init_check.py)."""
 
     def __init__(self, d: int, patch_mm: float = 16.0, rank: int = 16, freqs: int = 32, hidden: int = 128,
-                 max_cycles_per_mm: float = 4.0, quad_mm: float = 0.02):
+                 max_cycles_per_mm: float = 4.0, quad_mm: float = 0.02, freq_decay: float = 0.0):
         super().__init__()
         self.patch_mm, self.rank, self.quad_mm = patch_mm, rank, quad_mm
         f = torch.logspace(math.log10(1 / (4 * patch_mm)), math.log10(max_cycles_per_mm), freqs)
         self.register_buffer("freqs", 2 * math.pi * f, persistent=False)
+        self.register_buffer("gain", ((1 / (patch_mm * f)).clamp(max=1) ** freq_decay).repeat(2), persistent=False)
         self.phi = nn.Sequential(nn.Linear(2 * freqs, hidden), nn.GELU(), nn.Linear(hidden, 3 * rank))
         # init: a constant patch of 1s gives tokens of std ~0.5 at every spacing. The 1000 is a constant in
         # `weights`, not in G: AdamW steps are ~lr in absolute size, so G at std ~16 learned ~250x slower than the
@@ -127,7 +132,7 @@ class KernelEmbed(nn.Module):
             q = max(1, math.ceil(s / self.quad_mm))
             t = (torch.arange(int(n) * q, device=self.freqs.device, dtype=torch.float32) + 0.5) * (s / q)
             ft = t[:, None] * self.freqs
-            phi = self.phi(torch.cat([ft.sin(), ft.cos()], -1))[:, a * self.rank:(a + 1) * self.rank]
+            phi = self.phi(torch.cat([ft.sin(), ft.cos()], -1) * self.gain)[:, a * self.rank:(a + 1) * self.rank]
             out.append(phi.view(int(n), q, self.rank).mean(1) * s)
         return out
 
