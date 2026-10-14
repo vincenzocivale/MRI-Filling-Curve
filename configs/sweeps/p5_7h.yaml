@@ -1,0 +1,16 @@
+# First long run (user, 14/10): the final recipe for ~7 h on 2 GPUs. G3 config + 1/f curve prior (freq_decay 1.0,
+# the default), d=1024/16, lr 4e-4 (p4_lr, validated at this batch: 2 GPUs x 48 scans = 96 per step), WSD: warmup
+# 300, plateau, 1-sqrt decay over the last 600. 3000 steps = ~288k scans, ~0.29 epoch (the d=1024 screen: 109k).
+# 2-GPU d=1024 at 48 scans/GPU: 8.3 s/step, no data wait, peak 54 GB of 64 (p4_lr): GPU-bound.
+# Same evaluation as the screens (skill on 7 tasks, tumor_ucsf val Dice); encoders saved every 1000 steps.
+name: p5_7h
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 3000, train.decay_steps: 600, train.warmup_steps: 300, train.save_every: 1000,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
+runs:
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "09:30:00"}
