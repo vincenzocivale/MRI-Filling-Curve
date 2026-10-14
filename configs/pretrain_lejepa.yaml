@@ -38,7 +38,8 @@ model:
   embed:                      # continuous-kernel patch embedding (model.KernelEmbed), any spacing
     rank: 16                  # learned 1D basis functions per axis (kernel = G . phi_x phi_y phi_z)
     max_cycles_per_mm: 4.0    # highest Fourier frequency of phi (finest pool spacing 0.16 mm)
-    freq_decay: 0.0           # Fourier feature at f scaled by min(1, f0/f)^a, f0 = 1 cycle/patch (p3_fdecay)
+    freq_decay: 1.0           # (14/10, p3_fdecay) Fourier feature at f x min(1, f0/f)^a, f0 = 1 cycle/patch: 1/f
+                              # curves; trained tokens ~40 % more stable under 2x voxels, same skill and Dice
 
 objective:
   view_curves: [raster, morton, hilbert]  # each view: one of these curves, in a random cube symmetry; probes average all three
