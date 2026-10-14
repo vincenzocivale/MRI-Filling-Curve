@@ -151,6 +151,10 @@ class Pretrainer:
         self.net.load_state_dict(c["model"])
         self.opt.load_state_dict(c["opt"])
         self.sched.load_state_dict(c["sched"])
+        t = self.cfg["train"]  # the lr of this config's schedule, not the source's (a run that ended its decay saved 0)
+        self.sched.base_lrs = [t["lr"]] * len(self.opt.param_groups)
+        for g in self.opt.param_groups:
+            g["lr"] = t["lr"] * lr_factor(self.step, t)
         self.step, self.consumed, self.skipped, self.seconds = c["step"], c["consumed"], c["skipped"], c["seconds"]
         self.loader.batch_sampler.start = self.consumed
         if (path.parent / "history.csv").exists():

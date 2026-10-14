@@ -94,5 +94,5 @@ train:
   decay_steps: 3000           # a decay branch from a plateau checkpoint: resume_from it, steps = its step + this
   log_every: 250
   save_every: 2500            # encoder snapshot, all probed
-  ckpt_every: 500             # full state (ckpt.pt, overwritten) + history.csv: a killed job loses at most this
+  ckpt_every: 200             # full state (ckpt.pt, overwritten) + history.csv: a killed job loses at most this
   resume_from: null           # another run's ckpt.pt (used only when this run has none of its own)
