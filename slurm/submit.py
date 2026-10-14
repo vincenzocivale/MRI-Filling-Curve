@@ -22,7 +22,7 @@ Runs longer than the 24 h limit: `--chain N` submits N copies, each after the pr
     python slurm/submit.py slurm/presets/4gpu.yaml --chain 5 -- -m sfc_gdn2.cli pretrain configs/pretrain_lejepa.yaml
 
 Config = slurm/defaults.yaml <- slurm/local.yaml (per user, gitignored) <- preset <- --set key=value.
-Logs in outputs/slurm/.
+Logs in outputs/slurm/. Short analyses: slurm/qrun.py (a step in a running job, no new job).
 """
 from __future__ import annotations
 
@@ -97,14 +97,18 @@ def build_script(cfg: dict[str, Any], command: list[str]) -> tuple[str, str]:
     else:
         raise SystemExit(f"launch.type must be single | torchrun, got {launch['type']!r}")
 
-    body = [f"cd {shlex.quote(str(REPO))}",
-            *(f"module load {m}" for m in cfg.get("modules") or []),
-            f"source {shlex.quote(str(cfg['conda']['base']) + '/etc/profile.d/conda.sh')}",
-            f"conda activate {shlex.quote(str(cfg['conda']['env']))}",
-            *(f"export {k}={shlex.quote(str(v))}" for k, v in (cfg.get("env") or {}).items()),
+    body = [f"cd {shlex.quote(str(REPO))}", *setup_lines(cfg),
             'echo "[sfc] $(date) job $SLURM_JOB_ID on $SLURM_NODELIST, commit $(git rev-parse --short HEAD)"',
             *run]
     return "\n".join(["#!/bin/bash", *filter(None, head), "set -eo pipefail", "", *body]) + "\n", logs_dir
+
+
+def setup_lines(cfg: dict[str, Any]) -> list[str]:
+    """Shell lines that load the modules, activate the conda env and export `env` (batch scripts, qrun steps)."""
+    return [*(f"module load {m}" for m in cfg.get("modules") or []),
+            f"source {shlex.quote(str(cfg['conda']['base']) + '/etc/profile.d/conda.sh')}",
+            f"conda activate {shlex.quote(str(cfg['conda']['env']))}",
+            *(f"export {k}={shlex.quote(str(v))}" for k, v in (cfg.get("env") or {}).items())]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
