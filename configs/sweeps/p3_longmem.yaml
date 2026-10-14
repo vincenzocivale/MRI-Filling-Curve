@@ -1,0 +1,17 @@
+# Long memory (notes/loss_stato.md, user 14/10): the first 8 of 64 key channels of every head start with decay
+# half-lives 1000-5000 tokens (GDN-2 init: median ~10, untouched by training) against views of 1-2k tokens.
+# Paired with p3_g3 (G3 config before 1/f, seeds 17 / 18: skill 0.489 / 0.458, Dice 0.351 / 0.353, age 0.264 / 0.242):
+# same fixed config, freq_decay 0 as then; long_memory draws nothing, so every other weight starts identical.
+name: p3_longmem
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144, model.embed.freq_decay: 0.0,
+        model.long_mem: {channels: 8, half_life: [1000, 5000]}}
+runs:
+  - {}
+  - {seed: 18}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}

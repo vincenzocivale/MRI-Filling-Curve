@@ -1,0 +1,14 @@
+# Long memory at the final size (as p3_longmem): paired with p4_d1024 (G3 config before 1/f, d=1024/16, seed 17,
+# 3 GPUs x 48 scans: skill 0.498, Dice 0.383, age 0.266; mean + covariance reading 0.519, age 0.311).
+name: p4_longmem
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0, model.embed.freq_decay: 0.0,
+        model.long_mem: {channels: 8, half_life: [1000, 5000]}}
+runs:
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:3", cpus_per_task: 24, mem: 360G, time: "04:30:00"}

@@ -94,6 +94,20 @@ class GDN2Block(nn.Module):
         return x + self.ffn(self.ffn_norm(x))
 
 
+def long_memory(mix: nn.Module, channels: int, half_life: tuple[float, float]) -> None:
+    """Slow decay for the first `channels` key channels of every head of a GDN-2 mixer (notes/loss_stato.md, 14/10).
+    The decay of key channel i (row i of each head's state S) is exp(-A_h softplus(f_i(x) + dt_bias_i)); at GDN-2's init
+    (A_h in [1, 16], softplus(dt_bias) log-uniform in [1e-3, 0.1]) its half-life ln 2 / (A_h dt_i) has median ~10
+    tokens, and training does not move it (p4_d1024: 10 tokens at step 760, none above 1000) against views of 1-2k
+    tokens. Here dt_i = ln 2 / (A_h n_i), half-lives n_i log-spaced over `half_life` tokens: those rows sum k u^T over
+    the whole view (an order-free second-order summary every token can read). No random draw: the other weights'
+    init is unchanged (paired screens)."""
+    with torch.no_grad():
+        n = torch.logspace(math.log10(half_life[0]), math.log10(half_life[1]), channels)
+        dt = math.log(2) / (mix.A_log.float().exp()[:, None] * n)          # [heads, channels]
+        mix.dt_bias.view(mix.num_heads, mix.head_k_dim)[:, :channels] = dt + torch.log(-torch.expm1(-dt))  # softplus^-1
+
+
 class KernelEmbed(nn.Module):
     """Patch embedding for native voxels of any spacing: a learned continuous kernel K: mm^3 -> R^d,
     integrated over each voxel's physical extent,
@@ -185,7 +199,7 @@ class Encoder(nn.Module):
 
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
                  grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, bidir: str = "late",
-                 **embed):
+                 long_mem: dict | None = None, **embed):
         super().__init__()
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
@@ -194,6 +208,9 @@ class Encoder(nn.Module):
         self.pos = ViewPos(d_model) if view_pos else None
         self.blocks = nn.ModuleList(GDN2Block(d_model, head_dim, num_heads, use_short_conv, i)
                                     for i in range(depth))
+        if long_mem:
+            for b in self.blocks:
+                long_memory(b.mix, long_mem["channels"], long_mem["half_life"])
         self.norm = nn.LayerNorm(d_model)
 
     @classmethod
@@ -201,7 +218,7 @@ class Encoder(nn.Module):
         m = cfg["model"]
         return cls(m["d_model"], m["depth"], m["head_dim"], m["num_heads"], m.get("use_short_conv", True),
                    m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
-                   m.get("bidir", "late"), **m.get("embed", {}))
+                   m.get("bidir", "late"), m.get("long_mem"), **m.get("embed", {}))
 
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         """[...,N,d] tokens, masked ones replaced by the learned mask token."""

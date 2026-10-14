@@ -34,6 +34,8 @@ model:
   view_pos: false             # model.ViewPos: coordinates inside each view's own box (ablation A3, PIANO_TARATURA)
   bidir: alternate            # (G3, p3 12/10) late: the stack reads each view forwards and backwards, bi = fwd ++ bwd; alternate: odd
                               # blocks read backwards (one stream, half the cost); block: both ways in every block
+  long_mem: null              # (14/10, p3/p4_longmem) {channels: n, half_life: [a, b]}: the first n key channels of every
+                              # head start with decay half-lives log-spaced in [a, b] tokens (GDN-2 init: median ~10)
   grad_checkpoint: true         # GDN-2 blocks recomputed in backward when a step's views exceed objective.checkpoint_tokens
   embed:                      # continuous-kernel patch embedding (model.KernelEmbed), any spacing
     rank: 16                  # learned 1D basis functions per axis (kernel = G . phi_x phi_y phi_z)
