@@ -122,7 +122,7 @@ class LeJEPA(nn.Module):
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
                  w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
-                 coarse_prob: float = 0.3):
+                 coarse_prob: float = 0.3, cov_dim: int = 0):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -144,6 +144,9 @@ class LeJEPA(nn.Module):
         self.rec = nn.Sequential(nn.Linear(2 * encoder.dim, proj_hidden), nn.GELU(),
                                  nn.Linear(proj_hidden, rec_cells ** 3)) if rec_weight or rec_visible else None
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
+        # cov_dim > 0: a second-order view level (view_cov), invariant across A/B and SIGReg'd like the view mean
+        self.cov_proj = nn.Linear(2 * encoder.dim, cov_dim, bias=False) if cov_dim else None
+        self.cov = Projector(cov_dim * (cov_dim + 1) // 2, proj_hidden, proj_dim) if cov_dim else None
         perms, flips = symmetries()
         self.register_buffer("perms", perms, persistent=False)
         self.register_buffer("flips", flips, persistent=False)
@@ -343,7 +346,7 @@ class LeJEPA(nn.Module):
         rec, recv = [], []
         corner, edge = self.jittered(*self.boxes(fg, xyz, grid, gen), grid, gen)           # [B,G,2,3]
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
-        zg, pred, tgt, ztok, tvol, tfg, lens, tops = [], [], [], [], [], [], [], []
+        zg, pred, tgt, ztok, tvol, tfg, lens, tops, zc = [], [], [], [], [], [], [], [], []
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
             c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
@@ -356,6 +359,8 @@ class LeJEPA(nn.Module):
                 / torch.zeros(nv, device=dev).index_add_(0, tv, w)[:, None]
             zg.append(self.glob(top).float().view(b, -1, 2, self.glob[-1].out_features))
             tops.append(top.view(b, -1, top.shape[-1]))
+            if self.cov is not None:
+                zc.append(self.cov(self.view_cov(bi, tv, w, off, n_h)).float().view(b, -1, 2, self.cov[-1].out_features))
             for i, (cs, head) in enumerate(zip(self.levels, self.cell)):
                 p, q, zb, vb = self.cells(bi, tv, fgv, mask, pxyz, grid[v[tv]], cs, n_patch, head)
                 cpred[i].append(p)
@@ -400,6 +405,10 @@ class LeJEPA(nn.Module):
 
         sig_g, sig_t = sig(zg.permute(2, 0, 1, 3).reshape(2, -1, zg.shape[-1])), sig(ztok[keep][None])
         out = {}
+        if zc:
+            zc = torch.cat(zc, 1)
+            out["inv_cov"] = (zc - zc.mean(2, keepdim=True)).square().mean()
+            out["sigreg_cov"] = sig(zc.permute(2, 0, 1, 3).reshape(2, -1, zc.shape[-1]))
         for cs, p, q, z, vb in zip(self.levels, cpred, ctgt, cz, cvol):
             p, q, z, vb = torch.cat(p), torch.cat(q), torch.cat(z), torch.cat(vb)
             out[f"inv_cell{cs}"] = (p - q).square().mean(-1).sum() / max(len(p), 1) / 4
@@ -422,9 +431,11 @@ class LeJEPA(nn.Module):
             means = torch.zeros(b, zt.shape[1], device=zt.device).index_add_(0, tv, zt)
             means /= torch.bincount(tv, minlength=b).clamp_min(1)[:, None]
             vol_share = 1 - (zt - means[tv]).var(0).sum() / zt.var(0).sum()
-        inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels), *(out[f"inv_{n}"] for n in self.top)]
-        sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels), *(out[f"sigreg_{n}"] for n in self.top)]
-        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), *(self.w_top for _ in self.top)]
+        cov = ["cov"] if self.cov is not None else []
+        inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels), *(out[f"inv_{n}"] for n in [*self.top, *cov])]
+        sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels),
+                *(out[f"sigreg_{n}"] for n in [*self.top, *cov])]
+        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), *(self.w_top for _ in [*self.top, *cov])]
         wmean = lambda xs: sum(a * x for a, x in zip(w, xs)) / sum(w)
         for k, r in (("rec", rec), ("rec_visible", recv)):
             if r:
@@ -433,6 +444,26 @@ class LeJEPA(nn.Module):
                 + self.rec_visible * out.get("rec_visible", 0),
                 "inv_global": inv_g, "inv_token": inv_t, "sigreg_global": sig_g, "sigreg_token": sig_t, **out,
                 "vol_share": vol_share, "len_global": lens[0], "len_local": lens[1]}
+
+    def view_cov(self, bi, tv, w, off, n_h):
+        """Order-free second-order reading of every view (notes/loss_stato.md: the covariance of the tokens holds age
+        and sex that their mean drops): its foreground tokens (weights w) projected to cov_dim, their covariance, its
+        square root by Newton-Schulz with trace normalisation (iSQRT-COV) -> upper triangle [V, r(r+1)/2]."""
+        y, nv = self.cov_proj(bi).float(), len(n_h)                       # [T, r]: no fp32 copy of bi
+        with torch.autocast(bi.device.type, enabled=False):
+            s = torch.zeros(nv, device=y.device).index_add_(0, tv, w)
+            m = torch.zeros(nv, y.shape[1], device=y.device).index_add_(0, tv, y * w[:, None]) / s[:, None]
+            pad = y.new_zeros(nv, max(n_h), y.shape[1])                    # views padded: one bmm for every view
+            pad[tv, torch.arange(len(tv), device=y.device) - off[tv]] = (y - m[tv]) * w[:, None].sqrt()
+            eye = torch.eye(y.shape[1], device=y.device).expand(nv, -1, -1)
+            c = pad.transpose(1, 2) @ pad / s[:, None, None] + 1e-4 * eye
+            tr = c.diagonal(dim1=1, dim2=2).sum(-1)[:, None, None]
+            a, z = c / tr, eye
+            for _ in range(10):                                            # ~1 % from the exact root (5: ~20 %)
+                t = 0.5 * (3 * eye - z @ a)
+                a, z = a @ t, t @ z
+            iu = torch.triu_indices(y.shape[1], y.shape[1], device=y.device)
+            return (a * tr.sqrt())[:, iu[0], iu[1]]
 
     def _sample(self, vol: torch.Tensor, fg: torch.Tensor, b: int, gen) -> torch.Tensor:
         """`tokens_per_volume` row indices per volume, drawn among its foreground rows (with replacement: a fixed

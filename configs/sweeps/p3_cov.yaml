@@ -1,0 +1,16 @@
+# Second-order view level (notes/loss_stato.md): without training, the square root of the covariance of the tokens
+# (PCA-64) read age 0.266 -> 0.308 and sex 0.850 -> 0.910 from p4_d1024's tokens. Here the objective gets it too
+# (objective.cov_dim: learned projection to 64, covariance, Newton-Schulz root, invariance + SIGReg like the view mean).
+# One seed (user, 14/10), paired with p3_fdecay #0 (the current defaults at d=512, seed 17: skill 0.481, Dice 0.342,
+# age 0.281); afterwards notes/second_order_feats.py + probe_2nd.py on both.
+name: p3_cov
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {objective.cov_dim: 64}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}

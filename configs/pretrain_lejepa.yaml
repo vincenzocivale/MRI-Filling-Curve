@@ -76,6 +76,8 @@ objective:
   top_levels: [volume, session]   # the levels above the view ([] for the A/B check)
   rec_weight: 0.2             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
   rec_visible: 0.2            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens
+  cov_dim: 0                  # > 0: second-order view level (token covariance projected to this, its square root;
+                              # invariance + SIGReg like the view mean; notes/loss_stato.md); 0 = off
   max_packed_tokens: 65536    # tokens per encoder call (GDN-2's backward peak follows it; 262144: -12% s/step at d=512)
 
 train:
