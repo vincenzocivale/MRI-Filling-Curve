@@ -34,8 +34,9 @@ def pretrain_rows(cfg: dict) -> pd.DataFrame:
 def lr_factor(step: int, t: dict) -> float:
     """Linear warmup, then `schedule`: cosine to 0 at `steps`, or wsd (warmup-stable-decay): constant until the
     last `decay_steps`, then 1 - sqrt to 0 (Hägele et al. 2024). WSD's decay can start from any checkpoint of
-    the plateau: resume it with train.steps = its step + decay_steps."""
-    warm = min(1.0, (step + 1) / max(t.get("warmup_steps", 0), 1))
+    the plateau: resume it with train.steps = its step + decay_steps. `warmup_from`: the step the warmup starts at
+    (a run continued from a decayed checkpoint warms up again from there)."""
+    warm = min(1.0, max(0.0, step + 1 - t.get("warmup_from", 0)) / max(t.get("warmup_steps", 0), 1))
     if t.get("schedule", "cosine") == "cosine":
         return warm * 0.5 * (1 + math.cos(math.pi * min(step / t["steps"], 1.0)))
     left = (t["steps"] - step) / max(t["decay_steps"], 1)   # 1 at the decay's start, 0 at the end

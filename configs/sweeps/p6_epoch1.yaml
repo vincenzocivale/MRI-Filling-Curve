@@ -1,0 +1,15 @@
+# Continuation of p5_7h to one epoch (user, 14/10): same recipe (G3 + 1/f, d=1024/16, lr 4e-4, 2 GPUs x 48 scans =
+# 96 per step, ~10.2k steps per epoch of the 977,613-scan pool). From p5_7h's last checkpoint (step 3000, already
+# decayed to lr 0): warmup again over 300 steps from step 3000 (warmup_from), then plateau to step 9200, no decay
+# (decay_steps 0): ckpt.pt at 9200 is the plateau state any later continuation or decay branch starts from.
+# The decay to one epoch is p6_epoch1_decay (9200 -> 10200), queued after this job. No evaluation here.
+name: p6_epoch1
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 9200, train.decay_steps: 0, train.warmup_steps: 300, train.warmup_from: 3000,
+        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p5_7h/00/lejepa-df54621a18/ckpt.pt,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
+runs:
+  - {}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}

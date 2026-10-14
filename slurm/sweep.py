@@ -91,6 +91,7 @@ def main() -> None:
     ap.add_argument("spec", type=Path)
     ap.add_argument("--dry-run", action="store_true", help="print the configs and the first job script, submit nothing")
     ap.add_argument("--collect", action="store_true", help="gather the finished runs' results into results.csv")
+    ap.add_argument("--after-job", metavar="JOB_ID", help="every run starts after JOB_ID ends (submit.py --after-job)")
     a = ap.parse_args()
     spec = yaml.safe_load(a.spec.read_text())
     rng, root = random.Random(spec.get("seed", 0)), Path(spec["root"]) / spec["name"]
@@ -110,7 +111,8 @@ def main() -> None:
             run.mkdir(parents=True, exist_ok=True)
             (run / "job.sh").write_text(script)
             cmd = [sys.executable, str(REPO / "slurm" / "submit.py"), "slurm/presets/1gpu.yaml", "--job-name",
-                   f"{spec['name']}_{i:02d}", *sets, "--", "bash", str(run / "job.sh")]
+                   f"{spec['name']}_{i:02d}", *sets, *(["--after-job", a.after_job] if a.after_job else []), "--", "bash",
+                   str(run / "job.sh")]
             out = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=REPO).stdout
             row["job"] = out.split("Submitted batch job ")[1].split()[0]
         rows.append(row)

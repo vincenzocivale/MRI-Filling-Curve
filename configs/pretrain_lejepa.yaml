@@ -90,6 +90,7 @@ train:
   weight_decay: 0.05          # matrices only (see pretrain.param_groups)
   grad_clip: 1.0              # rare single-token gradient spikes (50-1500x median) otherwise; skip non-finite steps
   warmup_steps: 1000
+  warmup_from: 0              # step the warmup starts at (a run continued from a decayed checkpoint)
   schedule: wsd               # warmup, constant, 1-sqrt decay over the last decay_steps (cosine: v8 and before)
   decay_steps: 3000           # a decay branch from a plateau checkpoint: resume_from it, steps = its step + this
   log_every: 250
