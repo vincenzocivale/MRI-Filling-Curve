@@ -6,7 +6,7 @@ name: p7_epoch2_decay
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
 fixed: {train.lr: 4.0e-4, train.steps: 20400, train.decay_steps: 1000, train.warmup_steps: 300, train.warmup_from: 3000,
-        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p7_epoch2/00/lejepa-8fb77b9f7f/ckpt.pt,
+        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p7_epoch2/00/lejepa-a5d3204c4b/ckpt.pt,
         data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
         objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
 runs:
