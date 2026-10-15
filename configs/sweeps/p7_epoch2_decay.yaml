@@ -1,0 +1,16 @@
+# Decay branch of p7_epoch2 to two epochs (user, 15/10): from its plateau checkpoint at step 19400, 1-sqrt decay over
+# 1000 steps to step 20400 (~1.96M scans), queued after p7_epoch2 (afterany: if that job stopped early, this one
+# resumes from its last checkpoint and runs the rest of the plateau first). On 2 GPUs x 48 (same global batch): the
+# evaluation (skill on 7 tasks, tumor_ucsf val Dice, as p6_epoch1_decay) uses two GPUs, so 4 would idle two of them.
+name: p7_epoch2_decay
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 20400, train.decay_steps: 1000, train.warmup_steps: 300, train.warmup_from: 3000,
+        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p7_epoch2/00/lejepa-8fb77b9f7f/ckpt.pt,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
+runs:
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}

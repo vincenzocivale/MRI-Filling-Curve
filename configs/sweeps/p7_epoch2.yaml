@@ -1,0 +1,15 @@
+# Second epoch of p6 (user, 15/10): from p6_epoch1's plateau checkpoint (step 9200, lr 4e-4), plateau to step 19400
+# (+10.2k steps = one more epoch of the 977,613-scan pool); p7_epoch2_decay (19400 -> 20400, two epochs) is queued
+# after it. Same recipe and global batch (96 scans, lr 4e-4) on 4 GPUs x 24 scans (half the patches per GPU): the same
+# GPU-hours per step as 2 x 48 if the per-GPU throughput holds, half the wall-clock. Recompute stays on everywhere
+# (checkpoint_tokens 0: d=1024 is OOM without it already at 12 scans per GPU). No evaluation here.
+name: p7_epoch2
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 19400, train.decay_steps: 0, train.warmup_steps: 300, train.warmup_from: 3000,
+        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p6_epoch1/00/lejepa-5094295066/ckpt.pt,
+        data.patches_per_batch: 65536, train.batch_size: 24, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0}
+runs:
+  - {}
+slurm: {gres: "gpu:4", cpus_per_task: 32, mem: 480G, time: "18:00:00"}
