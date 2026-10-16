@@ -133,7 +133,10 @@ class SFC(Wrapper):
 
     def seg_net(self, n_out: int, pretrained: bool = True):
         enc = self._encoder(pretrained)
-        enc.taps = tuple(self.args.get("taps") or ())  # also these blocks' outputs (layer-normed) to the decoder
+        taps = self.args.get("taps") or ()  # also these blocks' outputs (layer-normed) to the decoder; an int k: the k
+        if isinstance(taps, int):           # quarter points below the last block (2: n/2, 3n/4; 3: also n/4)
+            taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]
+        enc.taps = tuple(taps)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]),
                      self.run_cfg["data"]["patch_mm"], n_out, embed_only=self.args.get("encoder") == "none")
         return net, ["encoder"], SEG_PATCH

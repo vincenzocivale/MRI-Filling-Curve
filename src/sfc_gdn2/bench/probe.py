@@ -406,13 +406,55 @@ def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.T
             "subjects": len(subjects), "chosen": [{k: c[k] for k in ("head", "feature", "l2")} for c in (a, b)]}
 
 
-TUNE_FEATURES = {"mean"}  # sfc_gdn2's map mean is 0.98 cosine-similar to its mean (p1_lr/00): half the fits
+def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400) -> torch.Tensor:
+    """[N, dim (dim + 1) / 2]: per volume the square root of the covariance of its tokens (`map`, every patch)
+    projected on the first `dim` principal directions of 200 tokens from each of `sample` random volumes (no label;
+    iSQRT-COV normalisation, upper triangle): how the tokens vary together, which their mean drops (notes/loss_stato.md;
+    age 0.374 -> 0.405 with the mean at two epochs). Cached in <d>/_second_order.pt."""
+    cache = d / "_second_order.pt"
+    if cache.exists() and (c := torch.load(cache))["ids"] == ids:
+        return c["covsqrt"]
+
+    def tokens(i):
+        t = torch.load(d / f"{i}.pt", map_location="cpu", weights_only=False)["features"]["map"].float().flatten(1).T
+        return t[t.norm(dim=1) > 0]
+
+    g = torch.Generator().manual_seed(0)
+    x = torch.cat([(t := tokens(ids[k]))[torch.randperm(len(t), generator=g)[:200]]
+                   for k in torch.randperm(len(ids), generator=g)[:sample].tolist()])
+    mu = x.mean(0)
+    p = torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))[1][:, -dim:]
+    iu, out = torch.triu_indices(dim, dim), []
+    for n, i in enumerate(ids):
+        z = (tokens(i) - mu) @ p
+        z = z - z.mean(0)
+        e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dim))
+        out.append(((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half())
+        if n % 1000 == 0:
+            print(f"[tune] second order {n}/{len(ids)}", flush=True)
+    torch.save({"ids": ids, "covsqrt": torch.stack(out)}, cache)
+    return torch.stack(out)
+
+
+def readings(m: str, d: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
+    """The readings a model's tuning probe chooses from on val, together with head and L2 (user, 16/10: try them all,
+    keep the best on val). Ours: the last block's mean, the intermediate blocks' means (mean_b<k>), all of them
+    concatenated, the covariance square root (`second_order`), and the means with it. Another model: its features."""
+    ids, f = load_globals(d)
+    if not m.startswith("sfc_gdn2"):
+        return ids, f
+    cov = second_order(d, ids)
+    inter = {k: f[k] for k in sorted(f) if k.startswith("mean_b")}
+    menu = {"mean": f["mean"], **inter, "covsqrt": cov, "mean+covsqrt": torch.cat([f["mean"], cov], 1)}
+    if inter:
+        blocks = torch.cat([*inter.values(), f["mean"]], 1)
+        menu |= {"blocks": blocks, "blocks+covsqrt": torch.cat([blocks, cov], 1)}
+    return ids, menu
 
 
 def _tune_one(m: str, d: Path, tname: str, cfg: dict, rows: pd.DataFrame, device: str) -> dict:
     torch.set_num_threads(2)
-    ids, feats = load_globals(d)
-    feats = {k: f for k, f in feats.items() if k in TUNE_FEATURES} or feats
+    ids, feats = readings(m, d)
     r = tune_task(tname, cfg, rows, feats, {i: k for k, i in enumerate(ids)}, device)
     print(f"[tune] {m} {tname}: skill {r['skill']:.3f} ({r['subjects']} subjects)", flush=True)
     return {"model": m, **{k: r[k] for k in ("task", "skill", "subjects")}, "chosen": r["chosen"]}
@@ -427,7 +469,7 @@ def tune(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, sp
     from multiprocessing import get_context
     keep, jobs, out = tune_subjects(splits), [], []
     for m, d in models.items():
-        ids, _ = load_globals(d)  # builds the cache once, before the workers read it
+        ids, _ = readings(m, d)  # builds the caches once, before the workers read them
         v = vols[vols["id"].isin(set(ids)) & vols["subject"].isin(keep)]
         jobs += [(m, d, t, cfg, task_rows(v, splits, cfg, 0)) for t, cfg in tasks.items() if cfg["type"] != "seg"]
     gpus = torch.cuda.device_count() if device == "cuda" else 0
