@@ -1,0 +1,18 @@
+# Cell levels (32/64 mm) under single-patch masks (user, 16/10): a cell pairs only when all of its foreground patches
+# are masked in A, which with mask_cells [1] (G3) happens almost only to cells holding 1-3 foreground patches (edge of
+# the head or of the view box): ~560 / ~60 pairs per step vs thousands of tokens, yet the two levels weigh 40 % of the
+# invariance. Arms: mask_cells [1, 2] (half of the A views masked in aligned 2-cubes = whole 32 mm cells, as before G3
+# without the 4-cubes) and levels [] (no cell levels). One seed, paired with p3_fdecay #0 (the current defaults at
+# d=512, seed 17: skill 0.481, Dice 0.342, age 0.281), as p3_cov.
+name: p3_cells
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {objective.mask_cells: [1, 2]}
+  - {objective.levels: []}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}
