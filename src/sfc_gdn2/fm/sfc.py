@@ -36,7 +36,8 @@ class SegNet(nn.Module):
     """`encoder` (frozen: segrun) read along `curves` as in extraction -> bi tokens -> `decode` per token."""
 
     def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int, embed_only: bool = False,
-                 context: bool = False, tta: bool = False, neighbors: bool = False):
+                 context: bool = False, tta: bool = False, neighbors: bool = False, kernel: bool = False,
+                 refine: bool = False, image: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -57,6 +58,18 @@ class SegNet(nn.Module):
             nn.init.zeros_(self.mix[2].weight), nn.init.zeros_(self.mix[2].bias)
         self.decode = PatchDecode((DECODE,) * 3, min(width, encoder.dim), n_out, norm=LayerNormNd, activation=nn.GELU)
         self.decode.apply(InitWeights_He(1e-2))
+        # kernel: the kernel embedding run backwards: each token gives the coefficients of a function in the basis
+        # phi_x phi_y phi_z of a KernelEmbed, integrated over every native voxel (no 16^3 grid, nothing resampled).
+        # refine: first 16 -> 8 mm along the Hilbert curve (a cell's 8 children are consecutive on it) by a 2-block
+        # GDN-2 Encoder at 8 mm, decoded in its own KernelEmbed's basis; image: + that KernelEmbed of the voxels.
+        self.kernel, self.refine, self.image, self.seed = kernel or refine, refine, image, seed
+        if refine:
+            from ..model import Encoder
+            self.fine = Encoder(128, 2, 64, 2, bidir="alternate", patch_mm=patch_mm / 2, freq_decay=1.0)
+            self.up, c = nn.Linear(c, 128), 128
+        if self.kernel:
+            self.coef = nn.Sequential(nn.Linear(c, 64), nn.GELU(), nn.Linear(64, n_out * encoder.patch_embed.rank ** 3))
+            del self.decode
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
@@ -78,10 +91,47 @@ class SegNet(nn.Module):
             if self.context:  # the tile's mean token beside each token: the decoder can centre it (token - mean)
                 tok = torch.cat([tok, tok.mean(0, keepdim=True).expand_as(tok)], -1)
             z = self.proj(tok).T.reshape(1, -1, *g)
-            m = self.decode(z if self.mix is None else z + self.mix(z))                   # [1, n_out, 16 g]
+            z = z if self.mix is None else z + self.mix(z)
+            if self.kernel:
+                emb, z = self.encoder.patch_embed, z[0].flatten(1).T                      # [N, c]
+                if self.refine:
+                    z, k, g = self.to_fine(z, x[b, 0], spacing[b], k, g)
+                    emb = self.fine.patch_embed
+                out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : T[0], : T[1], : T[2]])
+                continue
+            m = self.decode(z)                                                            # [1, n_out, 16 g]
             m = F.interpolate(m, size=[a * c for a, c in zip(k, g)], mode="trilinear", align_corners=False)
             out.append(m[0, :, : T[0], : T[1], : T[2]])
         return torch.stack(out)
+
+    def to_fine(self, z, vol, sp, k, g):
+        """Tokens [N, c] of the 16 mm grid g -> [Nf, 128] of the 8 mm grid (parent token + the voxels' embedding),
+        mixed along its Hilbert curve; returns them with the fine patch dims and grid."""
+        from ..curves import grid_coords, keys
+        from ..data.volume import patch_dims, patch_grid, patchify
+
+        kf = patch_dims(sp.tolist(), self.patch_mm / 2)
+        gf = patch_grid(vol.shape, kf).to(z.device)
+        xyz = grid_coords(gf[None], int(gf.prod()))[0]                                    # [Nf, 3] raster
+        par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
+        par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
+        t = self.up(z)[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]]
+        if self.image:
+            e = self.fine.patch_embed
+            t = t + e(patchify(vol.float(), kf), e.weights(sp.float(), kf))
+        order = keys("hilbert", xyz, gf, self.seed).argsort()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            h = self.fine.flat(t[order], torch.tensor([0, len(t)], device=z.device, dtype=torch.int32)).float()
+        return h[order.argsort()], kf, gf.tolist()
+
+    def kernel_decode(self, z, emb, sp, k, g):
+        """Tokens [N, c] on grid g -> logits [n_out, *(g k)] at the native voxels: per token coefficients in the
+        basis of `emb` (KernelEmbed), each voxel the mean of that function over its extent (same 1D integrals)."""
+        px, py, pz = (p / s for p, s in zip(emb.axis_integrals(sp, k), sp.tolist()))
+        r = emb.rank
+        m = torch.einsum("noabc,xa,yb,zc->noxyz", self.coef(z).view(len(z), -1, r, r, r), px, py, pz)
+        o = m.shape[1]
+        return m.reshape(*g, o, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(o, *(a * c for a, c in zip(g, k)))
 
 
 def checkpoint_path(path: str | Path, step: int | None = None) -> Path:
@@ -156,7 +206,9 @@ class SFC(Wrapper):
         enc.taps = tuple(taps)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
-                     tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")))
+                     tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")),
+                     kernel=bool(self.args.get("kernel")), refine=bool(self.args.get("refine")),
+                     image=bool(self.args.get("image")))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
