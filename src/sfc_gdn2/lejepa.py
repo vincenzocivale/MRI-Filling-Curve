@@ -22,7 +22,8 @@ bounds the tokens per step whatever the field of view.
   A and B + SIGReg (per view, over the batch).
 - token: for every masked patch of A that B also contains, the `bi` token (forward ++ backward
   output at that patch, as in the segmentation probe) of A and of B -> `tok` head, pulled together
-  (symmetric, no stop-grad, as LeJEPA's invariance);
+  (symmetric, no stop-grad, as LeJEPA's invariance); `tok_joint_bn`: both through one head call, so its
+  BatchNorm normalises them with the same statistics (off: two calls, A's masked tokens and all of B's apart);
   Token targets are foreground only (as Vol-JEPA's head mask): background patches stay in the
   sequence (with no position embedding their count is spatial signal) but are never masked, paired or
   sampled for SIGReg, so near-identical air tokens neither give free pairs nor a degenerate mass.
@@ -122,13 +123,13 @@ class LeJEPA(nn.Module):
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
                  w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
-                 coarse_prob: float = 0.3, cov_dim: int = 0):
+                 coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
         self.max_view_tokens = float("inf") if max_view_tokens is None else max_view_tokens
         self.embed_chunk_voxels, self.max_packed_tokens = embed_chunk_voxels, max_packed_tokens
-        self.checkpoint_tokens = checkpoint_tokens
+        self.checkpoint_tokens, self.tok_joint_bn = checkpoint_tokens, tok_joint_bn
         self.thick_prob, self.thick_mm = thick_prob, tuple(float(t) for t in thick_mm)
         self.coarse_max, self.coarse_prob = int(coarse_max), coarse_prob
         self.tokens_per_volume, self.sigreg_samples, self.w_top = tokens_per_volume, sigreg_samples, w_top
@@ -377,8 +378,13 @@ class LeJEPA(nn.Module):
             # (deterministic: batch-statistics BatchNorm)
             head = (lambda x: checkpoint(self.tok, x, use_reentrant=False)) if len(bi) > self.checkpoint_tokens \
                 else self.tok
-            z_b = head(bi.index_select(0, ib)).float()                                     # B's tokens
-            pred.append(head(bi.index_select(0, ia[pair])).float())
+            xa = bi.index_select(0, ia[pair])                                              # A's masked, paired
+            if self.tok_joint_bn:  # one call: A's predictions and B's tokens under the same BatchNorm statistics
+                z = head(torch.cat([xa, bi.index_select(0, ib)])).float()
+                za, z_b = z[: len(xa)], z[len(xa):]
+            else:  # two calls (runs before 16/10): B's statistics hold its background, A's only masked foreground,
+                z_b, za = head(bi.index_select(0, ib)).float(), head(xa).float()   # and a perfect one scores > 0
+            pred.append(za)
             tgt.append(z_b[j_b[pair]])
             ztok.append(z_b)
             tvol.append(v[tv[ib]])

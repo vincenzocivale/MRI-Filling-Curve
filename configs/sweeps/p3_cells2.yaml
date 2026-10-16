@@ -1,0 +1,17 @@
+# Second round on the masked objective (user, 16/10), paired with p3_cells #0 (mask_cells [1, 2], d=512, seed 17:
+# skill 0.484, Dice 0.375, age 0.260). (a) + tok_joint_bn: the token head took A's masked tokens and B's tokens in two
+# calls, so its BatchNorm normalised them with different statistics (B's hold its background) and a perfect
+# prediction scored > 0; one call now. Same random draws as the base. (b) mask_cells [1, 2, 4]: 4-cubes (views with
+# >= 8 patches per edge, i.e. mostly global ones) make whole 64 mm cells too, the default before G3.
+name: p3_cells2
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144}
+runs:
+  - {objective.mask_cells: [1, 2], objective.tok_joint_bn: true}
+  - {objective.mask_cells: [1, 2, 4]}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}
