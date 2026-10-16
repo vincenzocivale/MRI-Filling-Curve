@@ -203,6 +203,7 @@ class Encoder(nn.Module):
         super().__init__()
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
+        self.taps: tuple = ()  # block indices whose outputs `flat` also returns (segmentation decoder input, fm/sfc.py)
         self.patch_embed = KernelEmbed(d_model, patch_mm, **embed)
         self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
         self.pos = ViewPos(d_model) if view_pos else None
@@ -229,11 +230,14 @@ class Encoder(nn.Module):
         """[B,S,d] curve-ordered tokens -> [B,S,d] hidden states (pre final norm). With `cu_seqlens`
         (int32 [n+1] offsets), x is [1,T,d]: n sequences packed back to back, no padding. rev: see `bidir`."""
         ckpt = self.grad_checkpoint if ckpt is None else ckpt
+        taps = []
         for i, block in enumerate(self.blocks):
             r = rev if self.bidir == "block" or i % 2 else None
             x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", use_reentrant=False) if ckpt and self.training
                  else block(x, cu_seqlens, r, self.bidir == "block"))
-        return x
+            if i in self.taps:
+                taps.append(x)
+        return torch.cat([x, *taps], -1) if taps else x
 
     def packed(self, x: torch.Tensor, valid: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
         """[V,L,d] curve-ordered tokens, [V,L] valid (a prefix of each row) -> [V,L,d] normed hidden
@@ -254,7 +258,11 @@ class Encoder(nn.Module):
             k, cu = torch.arange(len(x), device=x.device), cu_seqlens.long()
             s = torch.searchsorted(cu[1:], k, right=True)
             rev = cu[s] + cu[s + 1] - 1 - k
-        return self.norm(self.run(x[None], cu_seqlens, ckpt, rev)[0, :total])
+        h = self.run(x[None], cu_seqlens, ckpt, rev)[0, :total]
+        if not self.taps:
+            return self.norm(h)
+        h = h.split(self.dim, -1)  # the last block's output (final norm) ++ the taps' (plain layer norm)
+        return torch.cat([self.norm(h[0]), *(nn.functional.layer_norm(t, t.shape[-1:]) for t in h[1:])], -1)
 
 
 # scans on the device (`dataset.to_device`) -> {"bi": [B,N,F] (patch level, N = the batch's largest grid),

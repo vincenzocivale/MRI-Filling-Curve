@@ -43,7 +43,8 @@ class SegNet(nn.Module):
         from ..model import encoder_extractor
 
         self.encoder, self.patch_mm = encoder, patch_mm
-        self.decode = PatchDecode((DECODE,) * 3, 2 * encoder.dim, n_out, norm=LayerNormNd, activation=nn.GELU)
+        self.decode = PatchDecode((DECODE,) * 3, 2 * encoder.dim * (1 + len(encoder.taps)), n_out, norm=LayerNormNd,
+                                  activation=nn.GELU)
         self.decode.apply(InitWeights_He(1e-2))
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only)
 
@@ -131,7 +132,9 @@ class SFC(Wrapper):
         return enc
 
     def seg_net(self, n_out: int, pretrained: bool = True):
-        net = SegNet(self._encoder(pretrained), self.curves, int(self.run_cfg["seed"]),
+        enc = self._encoder(pretrained)
+        enc.taps = tuple(self.args.get("taps") or ())  # also these blocks' outputs (layer-normed) to the decoder
+        net = SegNet(enc, self.curves, int(self.run_cfg["seed"]),
                      self.run_cfg["data"]["patch_mm"], n_out, embed_only=self.args.get("encoder") == "none")
         return net, ["encoder"], SEG_PATCH
 
