@@ -1,0 +1,15 @@
+# Third epoch (user, 16/10): from p7_epoch2's plateau checkpoint (step 19400, lr 4e-4), plateau to step 29600
+# (+10.2k steps = one more epoch), with the one objective change that held in the screens of 16/10: mask_cells [1, 2]
+# (half of the A views masked in 2-cubes, so the 32 mm cell level gets whole cells inside the brain: p3_cells
+# Dice +0.033). Not taken: tok_joint_bn, mask_cells [1, 2, 4], thick_prob 0, rec_cells 8, volume_locals false
+# (p3_cells2, p3_dense). Same recipe otherwise (2 GPUs x 48 scans). p8_epoch3_decay (29600 -> 30600) queued after it.
+name: p8_epoch3
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 29600, train.decay_steps: 0, train.warmup_steps: 300, train.warmup_from: 3000,
+        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p7_epoch2/00/lejepa-a5d3204c4b/ckpt.pt,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0, objective.mask_cells: [1, 2]}
+runs:
+  - {}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}
