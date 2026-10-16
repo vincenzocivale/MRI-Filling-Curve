@@ -36,7 +36,7 @@ class SegNet(nn.Module):
     """`encoder` (frozen: segrun) read along `curves` as in extraction -> bi tokens -> `decode` per token."""
 
     def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int, embed_only: bool = False,
-                 context: bool = False, tta: bool = False):
+                 context: bool = False, tta: bool = False, neighbors: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -49,6 +49,12 @@ class SegNet(nn.Module):
         # more information, not a bigger decoder (user, 16/10): Primus' PatchDecode scales its channels with its input
         # (2.1M parameters at 1024, ~400M at 20480), so a wider input is first projected to d per token
         self.proj = nn.Linear(width, encoder.dim) if width > encoder.dim else nn.Identity()
+        # neighbors: each token also sees its 26 neighbours on the patch grid (a ConvNeXt-style residual block, ~1M
+        # parameters, starting as the identity); the decoder itself stays per token
+        c, self.mix = min(width, encoder.dim), None
+        if neighbors:
+            self.mix = nn.Sequential(nn.Conv3d(c, c, 3, padding=1, groups=c), LayerNormNd(c), nn.Conv3d(c, c, 1), nn.GELU())
+            nn.init.zeros_(self.mix[2].weight), nn.init.zeros_(self.mix[2].bias)
         self.decode = PatchDecode((DECODE,) * 3, min(width, encoder.dim), n_out, norm=LayerNormNd, activation=nn.GELU)
         self.decode.apply(InitWeights_He(1e-2))
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
@@ -71,7 +77,8 @@ class SegNet(nn.Module):
                 tok = tok[:, : tok.shape[1] // 2]
             if self.context:  # the tile's mean token beside each token: the decoder can centre it (token - mean)
                 tok = torch.cat([tok, tok.mean(0, keepdim=True).expand_as(tok)], -1)
-            m = self.decode(self.proj(tok).T.reshape(1, -1, *g))                       # [1, n_out, 16 g]
+            z = self.proj(tok).T.reshape(1, -1, *g)
+            m = self.decode(z if self.mix is None else z + self.mix(z))                   # [1, n_out, 16 g]
             m = F.interpolate(m, size=[a * c for a, c in zip(k, g)], mode="trilinear", align_corners=False)
             out.append(m[0, :, : T[0], : T[1], : T[2]])
         return torch.stack(out)
@@ -149,7 +156,7 @@ class SFC(Wrapper):
         enc.taps = tuple(taps)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
-                     tta=bool(self.args.get("tta")))  # tile mean beside each token; each curve also read backwards
+                     tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
