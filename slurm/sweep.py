@@ -42,12 +42,10 @@ def draw(space: dict, rng: random.Random) -> dict:
 
 
 SEGDEC = (("segdec", ""), ("segdec_taps2", "args.taps=2"), ("segdec_taps3", "args.taps=3"),
-          ("segdec_taps4", "args.taps=4"), ("segdec_taps4_ctx", "args.taps=4 args.context=true"),
-          ("segdec_taps4_ctx_tta", "args.taps=4 args.context=true args.tta=true"), ("segdec_nb", "args.neighbors=true"),
-          ("segdec_taps3_nb", "args.taps=3 args.neighbors=true"))
-# the segdec pilots of every run (user, 16/10): decoder on the last block; + 2, 3 intermediate blocks; + the patch
-# embedding; + the tile's mean token beside each token; + each curve also read from its other end; a 3^3 mixing of each
-# token with its neighbours (last block; + 3 intermediate blocks). Best val Dice wins: our official decoder.
+          ("segdec_nb", "args.neighbors=true"), ("segdec_taps3_nb", "args.taps=3 args.neighbors=true"))
+# the segdec pilots of every run (user, 16/10): decoder on the last block; + 2, 3 intermediate blocks; a 3^3 mixing of
+# each token with its neighbours (last block; + 3 intermediate blocks). Best val Dice wins: our official decoder.
+# Dropped on p7 (17/10): + the patch embedding, + the tile's mean token, + reversed readings (no gain).
 
 
 def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
