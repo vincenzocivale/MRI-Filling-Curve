@@ -143,6 +143,10 @@ class SFC(Wrapper):
             from ..model import encoder_extractor
 
             enc = self._encoder().to(self.device).eval().requires_grad_(False)
+            if self.args.get("encoder") != "none":  # also blocks n/2 and 3n/4 (probe menu: mean_b<block>)
+                n = len(enc.blocks)
+                enc.taps = tuple(self.args.get("probe_taps") or (n // 2 - 1, 3 * n // 4 - 1))
+            self._taps, self._dim = enc.taps, enc.dim
             obj = self.run_cfg["objective"]
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
                                               obj.get("fg_threshold", 0.05), crop=bool(self.args.get("crop")),
@@ -159,8 +163,14 @@ class SFC(Wrapper):
         x = patchify(prepared["volume"].to(dev).float() * a + c, k.tolist())
         out = self.extractor()({"patches": [x], "grid": grid[None].to(dev), "k": k[None].to(dev),
                                 "spacing": prepared["spacing"][None].to(dev)})
-        bi = out["bi"][0, : len(x)]
-        feats = {"mean": out["mean"][0], "map": bi.T.reshape(bi.shape[1], *grid.tolist())}
+        d, n = self._dim, len(self._taps) + 1
+
+        def block(v, j):  # [..., 2dn] = fwd (last block, taps) ++ bwd (same) -> block j's fwd ++ bwd [..., 2d]
+            return torch.cat([v[..., j * d: (j + 1) * d], v[..., (n + j) * d: (n + j + 1) * d]], -1)
+
+        bi, mean = block(out["bi"][0, : len(x)], 0), out["mean"][0]
+        feats = {"mean": block(mean, 0), "map": bi.T.reshape(bi.shape[1], *grid.tolist())}
+        feats |= {f"mean_b{t + 1}": block(mean, j + 1) for j, t in enumerate(self._taps)}
         return {"features": feats, "canonical": "mean", "derived": [],
                 "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt)}}
 
