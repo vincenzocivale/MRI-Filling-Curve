@@ -47,7 +47,8 @@ fm:
                                     pool: [{from: layer4, factor: [1, 4, 4], to: layer4_pool144}]}
     nnunet_totalseg_mr_870: {features: [fg_mean_stage0, fg_mean_stage1, fg_mean_stage2, fg_mean_stage3,
                                         fg_mean_stage4, stage4, stage3]}
-    sfc_gdn2: &sfc {features: [mean, map]}   # map: bi tokens on the patch grid (~16 mm)
+    sfc_gdn2: &sfc {}   # everything the wrapper computes: mean, map (bi tokens on the ~16 mm patch grid), fg, std,
+                        # mean_b<k>/std_b<k> (intermediate blocks), *_tta (2x readings): the probe menu (probe.readings)
     sfc_gdn2_raster: *sfc
     sfc_gdn2_morton: *sfc
     sfc_gdn2_hilbert: *sfc
