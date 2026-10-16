@@ -127,9 +127,11 @@ class SegNet(nn.Module):
     def kernel_decode(self, z, emb, sp, k, g):
         """Tokens [N, c] on grid g -> logits [n_out, *(g k)] at the native voxels: per token coefficients in the
         basis of `emb` (KernelEmbed), each voxel the mean of that function over its extent (same 1D integrals)."""
-        px, py, pz = (p / s for p, s in zip(emb.axis_integrals(sp, k), sp.tolist()))
+        # each basis function at RMS 1 over the patch's voxels (any spacing), the sum of r^3 terms over r^1.5: the
+        # trained encoder's phi reach 1.3, unscaled every Adam step moved the logits by ~10 (no learning, 17/10)
+        px, py, pz = (p / p.pow(2).mean(0, keepdim=True).sqrt().clamp_min(1e-6) for p in emb.axis_integrals(sp, k))
         r = emb.rank
-        m = torch.einsum("noabc,xa,yb,zc->noxyz", self.coef(z).view(len(z), -1, r, r, r), px, py, pz)
+        m = torch.einsum("noabc,xa,yb,zc->noxyz", self.coef(z).view(len(z), -1, r, r, r), px, py, pz) / r ** 1.5
         o = m.shape[1]
         return m.reshape(*g, o, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(o, *(a * c for a, c in zip(g, k)))
 
