@@ -235,8 +235,7 @@ class Encoder(nn.Module):
             r = rev if self.bidir == "block" or i % 2 else None
             x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", use_reentrant=False) if ckpt and self.training
                  else block(x, cu_seqlens, r, self.bidir == "block"))
-            if i in self.taps:
-                taps.append(x)
+            taps += [x] * self.taps.count(i)  # a repeated index: same input width, no new block (control)
         return torch.cat([x, *taps], -1) if taps else x
 
     def packed(self, x: torch.Tensor, valid: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
