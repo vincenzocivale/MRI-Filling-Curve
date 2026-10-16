@@ -1,0 +1,20 @@
+# Size and fine detail (user, 16/10: age stalls at ~0.37 from 1 to 2 epochs, Dice 0.637 vs ~0.78 for the best FMs).
+# Paired with p3_cells #0 (mask_cells [1, 2], d=512, seed 17: skill 0.484, Dice 0.375, age 0.260); each arm one change.
+# (S1) thick_prob 0: A <-> B invariance under 4-8 mm slabs in 30 % of the views teaches tokens to drop detail below
+# ~8 mm along an axis (atrophy, lesion borders); never ablated. (S2) rec_cells 8: masked tokens predict their patch in
+# 2 mm cells (512 numbers) instead of 4 mm (64): the sub-patch layout the per-token segmentation decoder needs.
+# (S3) volume_locals false: the volume level pulls only the global views together; with the locals in, a 48-128 mm
+# crop must predict the whole-volume code, which pushes out what a crop cannot see (the volume's size).
+name: p3_dense
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144, objective.mask_cells: [1, 2]}
+runs:
+  - {objective.thick_prob: 0.0}
+  - {objective.rec_cells: 8}
+  - {objective.volume_locals: false}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "03:00:00"}

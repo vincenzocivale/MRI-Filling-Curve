@@ -39,7 +39,8 @@ bounds the tokens per step whatever the field of view.
 - session: the same over the scans of one session in the batch (the loader batches each scan with a random other
   scan of its session): what all its sequences share (anatomy, age, sex), not the acquisition signature that
   alone tells a volume's boxes from the rest of the batch. Its own head; SIGReg one sample per session.
-  `top_levels` lists which of the two are on (both by default; [] for the A/B check).
+  `top_levels` lists which of the two are on (both by default; [] for the A/B check). `volume_locals` false: the
+  volume level over the global views only (a local crop cannot see the volume's size, which the pull asks it to).
 View position (model.view_pos, `model.ViewPos`): each token gets its coordinates inside its own view's box after
 the view's symmetry, so A and B place a patch differently and position alone cannot pair them.
 loss = (1 - lam) * wmean(invariances) + lam * wmean(SIGRegs), one of each per scale, weight `w_top` for the view,
@@ -123,13 +124,14 @@ class LeJEPA(nn.Module):
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
                  w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
-                 coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False):
+                 coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False,
+                 volume_locals: bool = True):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
         self.max_view_tokens = float("inf") if max_view_tokens is None else max_view_tokens
         self.embed_chunk_voxels, self.max_packed_tokens = embed_chunk_voxels, max_packed_tokens
-        self.checkpoint_tokens, self.tok_joint_bn = checkpoint_tokens, tok_joint_bn
+        self.checkpoint_tokens, self.tok_joint_bn, self.volume_locals = checkpoint_tokens, tok_joint_bn, volume_locals
         self.thick_prob, self.thick_mm = thick_prob, tuple(float(t) for t in thick_mm)
         self.coarse_max, self.coarse_prob = int(coarse_max), coarse_prob
         self.tokens_per_volume, self.sigreg_samples, self.w_top = tokens_per_volume, sigreg_samples, w_top
@@ -426,7 +428,8 @@ class LeJEPA(nn.Module):
         for name, head in self.top.items():
             grp = groups[name]
             n = int(grp.max()) + 1
-            z = head(tops.flatten(0, 1)).float().view(b, -1, head[-1].out_features)       # [B,V,D]
+            t = tops if name != "volume" or self.volume_locals else tops[:, : 2 * self.gg]  # off: globals only
+            z = head(t.flatten(0, 1)).float().view(b, -1, head[-1].out_features)          # [B,V,D]
             cnt = torch.bincount(grp, minlength=n).clamp_min(1)[:, None]
             centre = z.new_zeros(n, z.shape[-1]).index_add_(0, grp, z[:, : 2 * self.gg].mean(1)) / cnt
             out[f"inv_{name}"] = (z - centre[grp][:, None]).square().mean()
