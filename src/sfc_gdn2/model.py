@@ -230,7 +230,7 @@ class Encoder(nn.Module):
         """[B,S,d] curve-ordered tokens -> [B,S,d] hidden states (pre final norm). With `cu_seqlens`
         (int32 [n+1] offsets), x is [1,T,d]: n sequences packed back to back, no padding. rev: see `bidir`."""
         ckpt = self.grad_checkpoint if ckpt is None else ckpt
-        taps = []
+        taps = [x] * self.taps.count(-1)  # -1: the input tokens (patch embedding)
         for i, block in enumerate(self.blocks):
             r = rev if self.bidir == "block" or i % 2 else None
             x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", use_reentrant=False) if ckpt and self.training
@@ -270,14 +270,17 @@ Extractor = Callable[[dict], dict[str, torch.Tensor]]
 
 
 def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int, fg_threshold: float,
-                      crop: bool = False, embed_only: bool = False) -> Extractor:
+                      crop: bool = False, embed_only: bool = False, reverse: bool = False) -> Extractor:
     """Each volume read along each of `curves` over its whole patch grid (untransformed view), forwards and
     backwards; `bi` = forward ++ backward output per patch, averaged over the curves (test-time augmentation).
     patch: `bi` per patch (raster order). both: `bi` and `mean`, bi averaged over the foreground patches (the top of
     the pretraining pyramid; the benchmark wrapper, fm/sfc.py).
     crop: only the foreground's bounding box is read, as the training's global views (patches outside: bi 0);
     embed_only: no encoder, bi = the patch embedding twice (what the encoder adds to its input). The view position
-    (`Encoder.pos`) is the coordinate inside the box read."""
+    (`Encoder.pos`) is the coordinate inside the box read.
+    both also gives `std` (per channel over the same patches) and `fg` [B,N]. reverse (one-stream encoders): each curve
+    is also read from its other end (test-time augmentation, 2x the readings): patch -> `bi` over all of them; both ->
+    `bi`, `mean`, `std` as without it plus `bi_tta`, `mean_tta`, `std_tta` over all of them."""
     from .data.dataset import per_patch
 
     def extract(vols):
@@ -303,6 +306,8 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
         if encoder.pos is not None:
             t = t + encoder.pos(local) * inside[..., None]
         bi = torch.cat([t, t], -1) * inside[..., None] if embed_only else 0
+        rv = reverse and not embed_only and encoder.bidir != "late"  # late already reads both ways
+        bir = 0
         for curve in [] if embed_only else curves:
             order = torch.stack([keys(curve, c, d, seed).masked_fill(~m, 1 << 62).argsort()
                                  for c, d, m in zip(local, dims, inside)])  # per volume: no batch-dependent curve
@@ -313,11 +318,24 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
                     fb = torch.cat([h[: len(grid)], h[len(grid):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))], -1)
                 else:                                                          # one stream: bi = h ++ h
                     fb = encoder.packed(s, valid).float().repeat(1, 1, 2)
+                    if rv:                                                     # the curve from its other end
+                        hr = encoder.packed(s.gather(1, rev[..., None].expand_as(s)), valid).float()
+                        fr = hr.gather(1, rev[..., None].expand(-1, -1, hr.shape[-1])).repeat(1, 1, 2)
             back = order.argsort(1)[..., None]                                 # curve position -> raster
             bi = bi + fb.gather(1, back.expand(-1, -1, fb.shape[-1])) / len(curves)
+            if rv:
+                bir = bir + fr.gather(1, back.expand(-1, -1, fr.shape[-1])) / len(curves)
+        tta = (bi + bir) / 2 if rv else bi
         if level == "patch":
-            return {"bi": bi}
-        w = (fg | (inside & ~fg.any(1, keepdim=True))).float()
-        mean = (w[..., None] * bi).sum(1) / w.sum(1, keepdim=True)
-        return {"bi": bi, "mean": mean}
+            return {"bi": tta if reverse else bi}
+        w = (fg | (inside & ~fg.any(1, keepdim=True))).float()[..., None]
+
+        def stats(b):  # foreground mean and std per channel
+            m = (w * b).sum(1) / w.sum(1)
+            return m, ((w * (b - m[:, None]) ** 2).sum(1) / w.sum(1)).sqrt()
+
+        (mean, std), out = stats(bi), {}
+        if reverse:
+            out = dict(zip(("bi_tta", "mean_tta", "std_tta"), (tta, *stats(tta))))
+        return {"bi": bi, "mean": mean, "std": std, "fg": fg} | out
     return extract

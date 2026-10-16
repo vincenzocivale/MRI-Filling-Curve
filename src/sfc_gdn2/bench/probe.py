@@ -406,49 +406,78 @@ def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.T
             "subjects": len(subjects), "chosen": [{k: c[k] for k in ("head", "feature", "l2")} for c in (a, b)]}
 
 
-def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400) -> torch.Tensor:
-    """[N, dim (dim + 1) / 2]: per volume the square root of the covariance of its tokens (`map`, every patch)
-    projected on the first `dim` principal directions of 200 tokens from each of `sample` random volumes (no label;
-    iSQRT-COV normalisation, upper triangle): how the tokens vary together, which their mean drops (notes/loss_stato.md;
-    age 0.374 -> 0.405 with the mean at two epochs). Cached in <d>/_second_order.pt."""
+def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400) -> dict[str, torch.Tensor]:
+    """{"covsqrt": [N, dim (dim + 1) / 2], and "covsqrt_fg" when the files hold `fg`}: per volume the square root of
+    the covariance of its tokens (`map`: every patch; _fg: foreground patches only) projected on the first `dim`
+    principal directions of 200 such tokens from each of `sample` random volumes (no label; iSQRT-COV normalisation,
+    upper triangle): how the tokens vary together, which their mean drops (notes/loss_stato.md; age 0.374 -> 0.405
+    with the mean at two epochs). One pass over the files for both; cached in <d>/_second_order.pt."""
     cache = d / "_second_order.pt"
     if cache.exists() and (c := torch.load(cache))["ids"] == ids:
-        return c["covsqrt"]
+        return c["feats"]
 
-    def tokens(i):
-        t = torch.load(d / f"{i}.pt", map_location="cpu", weights_only=False)["features"]["map"].float().flatten(1).T
-        return t[t.norm(dim=1) > 0]
+    def tokens(i):  # {"covsqrt": all tokens, "covsqrt_fg": foreground tokens}
+        f = torch.load(d / f"{i}.pt", map_location="cpu", weights_only=False)["features"]
+        t = f["map"].float().flatten(1).T
+        keep = t.norm(dim=1) > 0
+        return {"covsqrt": t[keep]} | ({"covsqrt_fg": t[keep & f["fg"].flatten()]} if "fg" in f else {})
 
     g = torch.Generator().manual_seed(0)
-    x = torch.cat([(t := tokens(ids[k]))[torch.randperm(len(t), generator=g)[:200]]
-                   for k in torch.randperm(len(ids), generator=g)[:sample].tolist()])
-    mu = x.mean(0)
-    p = torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))[1][:, -dim:]
-    iu, out = torch.triu_indices(dim, dim), []
+    pool: dict[str, list] = {}
+    for k in torch.randperm(len(ids), generator=g)[:sample].tolist():
+        for name, t in tokens(ids[k]).items():
+            pool.setdefault(name, []).append(t[torch.randperm(len(t), generator=g)[:200]])
+    basis = {}
+    for name, ts in pool.items():
+        x = torch.cat(ts)
+        mu = x.mean(0)
+        basis[name] = mu, torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))[1][:, -dim:]
+    iu, out = torch.triu_indices(dim, dim), {name: [] for name in basis}
     for n, i in enumerate(ids):
-        z = (tokens(i) - mu) @ p
-        z = z - z.mean(0)
-        e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dim))
-        out.append(((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half())
+        for name, t in tokens(i).items():
+            mu, p = basis[name]
+            z = (t - mu) @ p
+            z = z - z.mean(0)
+            e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dim))
+            out[name].append(((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half())
         if n % 1000 == 0:
             print(f"[tune] second order {n}/{len(ids)}", flush=True)
-    torch.save({"ids": ids, "covsqrt": torch.stack(out)}, cache)
-    return torch.stack(out)
+    feats = {name: torch.stack(v) for name, v in out.items()}
+    torch.save({"ids": ids, "feats": feats}, cache)
+    return feats
 
 
 def readings(m: str, d: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
     """The readings a model's tuning probe chooses from on val, together with head and L2 (user, 16/10: try them all,
-    keep the best on val). Ours: the last block's mean, the intermediate blocks' means (mean_b<k>), all of them
-    concatenated, the covariance square root (`second_order`), and the means with it. Another model: its features."""
+    keep the best on val). Ours: the last block's foreground mean (`mean`), the intermediate blocks' (mean_b<k>), all
+    of them concatenated (`blocks`), each with the per-channel std, with the covariance square root (`second_order`,
+    all patches or foreground only), and the same means over twice the readings (_tta: each curve also read from its
+    other end). Another model: its stored features."""
     ids, f = load_globals(d)
     if not m.startswith("sfc_gdn2"):
         return ids, f
-    cov = second_order(d, ids)
-    inter = {k: f[k] for k in sorted(f) if k.startswith("mean_b")}
-    menu = {"mean": f["mean"], **inter, "covsqrt": cov, "mean+covsqrt": torch.cat([f["mean"], cov], 1)}
+    so = second_order(d, ids)
+    cov = so["covsqrt"]
+
+    def cat(*xs):
+        return torch.cat(xs, 1)
+
+    inter = sorted(k[4:] for k in f if k.startswith("mean_b"))  # "_b8", "_b12"
+    menu = {"mean": f["mean"], "mean+covsqrt": cat(f["mean"], cov)}
     if inter:
-        blocks = torch.cat([*inter.values(), f["mean"]], 1)
-        menu |= {"blocks": blocks, "blocks+covsqrt": torch.cat([blocks, cov], 1)}
+        blocks = cat(*(f["mean" + b] for b in inter), f["mean"])
+        menu |= {"mean" + b: f["mean" + b] for b in inter} | {"blocks": blocks, "blocks+covsqrt": cat(blocks, cov)}
+    if "std" in f:
+        menu |= {"mean+std": cat(f["mean"], f["std"]), "mean+std+covsqrt": cat(f["mean"], f["std"], cov)}
+        if inter:
+            menu["blocks+std"] = cat(blocks, *(f["std" + b] for b in inter), f["std"])
+    if "covsqrt_fg" in so:
+        menu["mean+covsqrt_fg"] = cat(f["mean"], so["covsqrt_fg"])
+    if "mean_tta" in f:
+        menu |= {"mean_tta": f["mean_tta"], "mean_tta+std_tta": cat(f["mean_tta"], f["std_tta"]),
+                 "mean_tta+covsqrt": cat(f["mean_tta"], cov)}
+        if inter:
+            menu["blocks_tta"] = cat(*(f["mean_tta" + b] for b in inter), f["mean_tta"])
     return ids, menu
 
 

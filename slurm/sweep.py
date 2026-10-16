@@ -41,32 +41,37 @@ def draw(space: dict, rng: random.Random) -> dict:
     return out
 
 
+SEGDEC = (("segdec", ""), ("segdec_taps2", "args.taps=2"), ("segdec_taps3", "args.taps=3"),
+          ("segdec_taps4", "args.taps=4"), ("segdec_taps4_ctx", "args.taps=4 args.context=true"),
+          ("segdec_taps4_ctx_tta", "args.taps=4 args.context=true args.tta=true"))
+# the segdec pilots of every run (user, 16/10): decoder on the last block; + 2, 3 intermediate blocks; + the patch
+# embedding; + the tile's mean token beside each token; + each curve also read from its other end. Best val Dice wins.
+
+
 def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
-    """Pretraining on all the job's GPUs, then the evaluation (user, 16/10: always the full reading, chosen on val): the
-    tuning extraction split over them (--shard); the probe over every reading of `probe.readings` (GPU 0) beside the
-    segdec pilots with the decoder on the last block, on 2 and on 3 intermediate blocks too (args.taps; GPU 1, or after
-    the probe with one GPU); `collect` keeps the best val Dice."""
+    """Pretraining on all the job's GPUs, then the one evaluation (user, 16/10: always the full reading, chosen on val):
+    the tuning extraction split over the GPUs (--shard); on the CPU the probe's readings (`probe.readings`: means of
+    the last and intermediate blocks, stds, covariance square roots, the 2x-reading means) while the GPUs share the
+    SEGDEC pilots; then the probe over every reading on all GPUs. `collect` keeps the best val Dice."""
     over = " ".join(shlex.quote(f"{k}={json.dumps(v)}") for k, v in cfg.items())
     fm = f"--fm-set checkpoint={run}"
-    lines = ["#!/bin/bash", f"# {run.name} of sweep {spec['name']}: pretraining, then its evaluations", "set -eo pipefail",
+    lines = ["#!/bin/bash", f"# {run.name} of sweep {spec['name']}: pretraining, then its evaluation", "set -eo pipefail",
              (f"torchrun --standalone --nproc_per_node={gpus} -m sfc_gdn2.cli pretrain {spec['config']} --override {over}"
               f" output_root={run}")]
-    evals = []
     if spec.get("tasks"):
         lines += [f"CUDA_VISIBLE_DEVICES={g} sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune {fm}"
                   f" --shard {g}/{gpus} --out {run}/features & x{g}=$!" for g in range(gpus)]
         lines += [f"wait $x{g}" for g in range(gpus)]
-        evals.append(f"sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune --tasks {' '.join(spec['tasks'])}"
-                     f" --out {run}/tune --override fm.out_root={run}/features")
+        code = f"from pathlib import Path; from sfc_gdn2.bench.probe import readings; readings('sfc_gdn2', Path('{run}/features/sfc_gdn2'))"
+        lines.append(f"python -c {shlex.quote(code)} & c=$!")
     if d := spec.get("dense"):
-        evals.append(" ; ".join(f"sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --tasks {d['task']}"
-                                f" --iters {d['iters']} --val-only {fm} args.taps={t} --override segdec.out={run}/{out}"
-                                for t, out in ((0, "segdec"), (2, "segdec_taps2"), (3, "segdec_taps3"))))
-    if gpus > 1:
-        lines += [f"CUDA_VISIBLE_DEVICES={g} bash -c {shlex.quote(e)} & p{g}=$!" for g, e in enumerate(evals)]
-        lines += [f"wait $p{g}" for g in range(len(evals))]
-    else:
-        lines += evals
+        seg = [f"sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --tasks {d['task']}"
+               f" --iters {d['iters']} --val-only {fm} {a} --override segdec.out={run}/{out}" for out, a in SEGDEC]
+        lines += [f"CUDA_VISIBLE_DEVICES={g} bash -c {shlex.quote(' ; '.join(seg[g::gpus]))} & s{g}=$!" for g in range(gpus)]
+        lines += [f"wait $s{g} || true" for g in range(gpus)]  # a failed pilot must not skip the probe
+    if spec.get("tasks"):
+        lines += ["wait $c || true", (f"sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune --tasks"
+                                      f" {' '.join(spec['tasks'])} --out {run}/tune --override fm.out_root={run}/features")]
     return "\n".join(lines) + "\n"
 
 

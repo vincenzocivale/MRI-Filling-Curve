@@ -35,18 +35,19 @@ DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
 class SegNet(nn.Module):
     """`encoder` (frozen: segrun) read along `curves` as in extraction -> bi tokens -> `decode` per token."""
 
-    def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int, embed_only: bool = False):
+    def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int, embed_only: bool = False,
+                 context: bool = False, tta: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
 
         from ..model import encoder_extractor
 
-        self.encoder, self.patch_mm = encoder, patch_mm
-        self.decode = PatchDecode((DECODE,) * 3, 2 * encoder.dim * (1 + len(encoder.taps)), n_out, norm=LayerNormNd,
-                                  activation=nn.GELU)
+        self.encoder, self.patch_mm, self.context = encoder, patch_mm, context
+        width = 2 * encoder.dim * (1 + len(encoder.taps)) * (2 if context else 1)
+        self.decode = PatchDecode((DECODE,) * 3, width, n_out, norm=LayerNormNd, activation=nn.GELU)
         self.decode.apply(InitWeights_He(1e-2))
-        self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only)
+        self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
         """x [B, 1, *T] native voxels, spacing [B, 3] mm -> logits [B, n_out, *T]."""
@@ -61,7 +62,10 @@ class SegNet(nn.Module):
         out = []
         for b, k in enumerate(ks):
             g = grid[b].tolist()
-            m = self.decode(bi[b, : int(grid[b].prod())].T.reshape(1, -1, *g))     # [1, n_out, 16 g]
+            tok = bi[b, : int(grid[b].prod())]
+            if self.context:  # the tile's mean token beside each token: the decoder can centre it (token - mean)
+                tok = torch.cat([tok, tok.mean(0, keepdim=True).expand_as(tok)], -1)
+            m = self.decode(tok.T.reshape(1, -1, *g))                                  # [1, n_out, 16 g]
             m = F.interpolate(m, size=[a * c for a, c in zip(k, g)], mode="trilinear", align_corners=False)
             out.append(m[0, :, : T[0], : T[1], : T[2]])
         return torch.stack(out)
@@ -134,11 +138,12 @@ class SFC(Wrapper):
     def seg_net(self, n_out: int, pretrained: bool = True):
         enc = self._encoder(pretrained)
         taps = self.args.get("taps") or ()  # also these blocks' outputs (layer-normed) to the decoder; an int k: the k
-        if isinstance(taps, int):           # quarter points below the last block (2: n/2, 3n/4; 3: also n/4)
-            taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]
+        if isinstance(taps, int):           # quarter points below the last block (2: n/2, 3n/4; 3: also n/4; 4: also
+            taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
-        net = SegNet(enc, self.curves, int(self.run_cfg["seed"]),
-                     self.run_cfg["data"]["patch_mm"], n_out, embed_only=self.args.get("encoder") == "none")
+        net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
+                     embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
+                     tta=bool(self.args.get("tta")))  # tile mean beside each token; each curve also read backwards
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
@@ -153,7 +158,8 @@ class SFC(Wrapper):
             obj = self.run_cfg["objective"]
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
                                               obj.get("fg_threshold", 0.05), crop=bool(self.args.get("crop")),
-                                              embed_only=self.args.get("encoder") == "none")
+                                              embed_only=self.args.get("encoder") == "none",
+                                              reverse=self.args.get("tta", True))  # also the *_tta readings
         return self._extract
 
     @torch.no_grad()
@@ -171,9 +177,11 @@ class SFC(Wrapper):
         def block(v, j):  # [..., 2dn] = fwd (last block, taps) ++ bwd (same) -> block j's fwd ++ bwd [..., 2d]
             return torch.cat([v[..., j * d: (j + 1) * d], v[..., (n + j) * d: (n + j + 1) * d]], -1)
 
-        bi, mean = block(out["bi"][0, : len(x)], 0), out["mean"][0]
-        feats = {"mean": block(mean, 0), "map": bi.T.reshape(bi.shape[1], *grid.tolist())}
-        feats |= {f"mean_b{t + 1}": block(mean, j + 1) for j, t in enumerate(self._taps)}
+        bi, g = block(out["bi"][0, : len(x)], 0), grid.tolist()
+        feats = {"map": bi.T.reshape(bi.shape[1], *g), "fg": out["fg"][0, : len(x)].view(*g)}  # last block's tokens
+        for stat in ("mean", "std", "mean_tta", "std_tta"):  # per block: last (no suffix), taps (_b<block>)
+            if stat in out:
+                feats |= {stat + ("" if j == 0 else f"_b{self._taps[j - 1] + 1}"): block(out[stat][0], j) for j in range(n)}
         return {"features": feats, "canonical": "mean", "derived": [],
                 "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt)}}
 
