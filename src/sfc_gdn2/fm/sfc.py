@@ -44,8 +44,12 @@ class SegNet(nn.Module):
         from ..model import encoder_extractor
 
         self.encoder, self.patch_mm, self.context = encoder, patch_mm, context
-        width = 2 * encoder.dim * (1 + len(encoder.taps)) * (2 if context else 1)
-        self.decode = PatchDecode((DECODE,) * 3, width, n_out, norm=LayerNormNd, activation=nn.GELU)
+        self.unique = encoder.bidir != "late"  # one stream: bi = h ++ h, the decoder takes h once
+        width = encoder.dim * (1 + len(encoder.taps)) * (1 if self.unique else 2) * (2 if context else 1)
+        # more information, not a bigger decoder (user, 16/10): Primus' PatchDecode scales its channels with its input
+        # (2.1M parameters at 1024, ~400M at 20480), so a wider input is first projected to d per token
+        self.proj = nn.Linear(width, encoder.dim) if width > encoder.dim else nn.Identity()
+        self.decode = PatchDecode((DECODE,) * 3, min(width, encoder.dim), n_out, norm=LayerNormNd, activation=nn.GELU)
         self.decode.apply(InitWeights_He(1e-2))
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
 
@@ -63,9 +67,11 @@ class SegNet(nn.Module):
         for b, k in enumerate(ks):
             g = grid[b].tolist()
             tok = bi[b, : int(grid[b].prod())]
+            if self.unique:
+                tok = tok[:, : tok.shape[1] // 2]
             if self.context:  # the tile's mean token beside each token: the decoder can centre it (token - mean)
                 tok = torch.cat([tok, tok.mean(0, keepdim=True).expand_as(tok)], -1)
-            m = self.decode(tok.T.reshape(1, -1, *g))                                  # [1, n_out, 16 g]
+            m = self.decode(self.proj(tok).T.reshape(1, -1, *g))                       # [1, n_out, 16 g]
             m = F.interpolate(m, size=[a * c for a, c in zip(k, g)], mode="trilinear", align_corners=False)
             out.append(m[0, :, : T[0], : T[1], : T[2]])
         return torch.stack(out)

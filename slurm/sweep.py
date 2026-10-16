@@ -49,15 +49,20 @@ SEGDEC = (("segdec", ""), ("segdec_taps2", "args.taps=2"), ("segdec_taps3", "arg
 
 
 def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
-    """Pretraining on all the job's GPUs, then the one evaluation (user, 16/10: always the full reading, chosen on val):
-    the tuning extraction split over the GPUs (--shard); on the CPU the probe's readings (`probe.readings`: means of
-    the last and intermediate blocks, stds, covariance square roots, the 2x-reading means) while the GPUs share the
-    SEGDEC pilots; then the probe over every reading on all GPUs. `collect` keeps the best val Dice."""
+    """Pretraining on all the job's GPUs, then its `evaluation`."""
     over = " ".join(shlex.quote(f"{k}={json.dumps(v)}") for k, v in cfg.items())
-    fm = f"--fm-set checkpoint={run}"
     lines = ["#!/bin/bash", f"# {run.name} of sweep {spec['name']}: pretraining, then its evaluation", "set -eo pipefail",
              (f"torchrun --standalone --nproc_per_node={gpus} -m sfc_gdn2.cli pretrain {spec['config']} --override {over}"
               f" output_root={run}")]
+    return "\n".join(lines + evaluation(spec, run, run, gpus)) + "\n"
+
+
+def evaluation(spec: dict, ckpt: Path, run: Path, gpus: int) -> list[str]:
+    """The one evaluation of a checkpoint (user, 16/10: always the full reading, chosen on val), outputs in `run`: the
+    tuning extraction split over the GPUs (--shard); on the CPU the probe's readings (`probe.readings`: means of the
+    last and intermediate blocks, stds, covariance square roots, the 2x-reading means) while the GPUs share the SEGDEC
+    pilots; then the probe over every reading on all GPUs. `collect` keeps the best val Dice."""
+    fm, lines = f"--fm-set checkpoint={ckpt}", []
     if spec.get("tasks"):
         lines += [f"CUDA_VISIBLE_DEVICES={g} sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune {fm}"
                   f" --shard {g}/{gpus} --out {run}/features & x{g}=$!" for g in range(gpus)]
@@ -72,15 +77,16 @@ def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
     if spec.get("tasks"):
         lines += ["wait $c || true", (f"sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune --tasks"
                                       f" {' '.join(spec['tasks'])} --out {run}/tune --override fm.out_root={run}/features")]
-    return "\n".join(lines) + "\n"
+    return lines
 
 
-def collect(root: Path) -> None:
-    """<root>/results.csv: sweep.csv + per run the last logged SSL loss, the skill per task and its mean, the val Dice."""
+def collect(root: Path, sub: str = "") -> None:
+    """<root>/results.csv: sweep.csv + per run the last logged SSL loss, the skill per task and its mean, the val Dice
+    (`sub`: of the evaluation in <run>/<sub>, written to <root>/results_<sub>.csv)."""
     import pandas as pd
     rows = pd.read_csv(root / "sweep.csv").to_dict("records")
     for r in rows:
-        run = root / f"{r['i']:02d}"
+        run = root / f"{r['i']:02d}" / sub
         if h := sorted(run.glob("*/history.csv")):
             r |= pd.read_csv(h[0]).iloc[-1][["step", "loss"]].to_dict()
         if (t := run / "tune" / "tune.csv").exists():
@@ -90,9 +96,25 @@ def collect(root: Path) -> None:
         if dice:  # the best decoder input on val
             r |= {"val_dice": max(dice.values()), "decoder": max(dice, key=dice.get)}
     df = pd.DataFrame(rows)
-    df.to_csv(root / "results.csv", index=False)
+    df.to_csv(root / f"results{'_' + sub if sub else ''}.csv", index=False)
     show = [c for c in df if df[c].astype(str).nunique(dropna=False) > 1 or c in ("i", "loss", "skill", "tasks", "val_dice")]
     print(df[[c for c in show if c != "job" and not c.startswith("skill_")]].to_string(index=False, float_format="%.4g"))
+
+
+def reevaluate(spec: dict, root: Path, name: str) -> None:
+    """One job per run of the sweep: `evaluation` of its checkpoint (the run dir: its last), outputs in <run>/<name>."""
+    slurm = (spec.get("slurm") or {}) | {"time": "08:00:00"}
+    gpus = int(str(slurm.get("gres", "gpu:1")).split(":")[-1])
+    for i in range(len(spec.get("runs") or range(spec.get("n", 0)))):
+        run = root / f"{i:02d}"
+        out = run / name
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "job.sh").write_text("\n".join(["#!/bin/bash", f"# {name}: evaluation of {run}", "set -eo pipefail",
+                                               *evaluation(spec, run, out, gpus)]) + "\n")
+        cmd = [sys.executable, str(REPO / "slurm" / "submit.py"), "slurm/presets/1gpu.yaml", "--job-name",
+               f"{spec['name']}_{i:02d}_{name}", *[x for k, v in slurm.items() for x in ("--set", f"{k}={v}")], "--",
+               "bash", str(out / "job.sh")]
+        print(run, subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=REPO).stdout.strip(), flush=True)
 
 
 def main() -> None:
@@ -101,11 +123,15 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="print the configs and the first job script, submit nothing")
     ap.add_argument("--collect", action="store_true", help="gather the finished runs' results into results.csv")
     ap.add_argument("--after-job", metavar="JOB_ID", help="every run starts after JOB_ID ends (submit.py --after-job)")
+    ap.add_argument("--eval", metavar="NAME", help="evaluate the sweep's finished runs again (evaluation of now), outputs "
+                                                    "in <run>/NAME; with --collect: gather those")
     a = ap.parse_args()
     spec = yaml.safe_load(a.spec.read_text())
     rng, root = random.Random(spec.get("seed", 0)), Path(spec["root"]) / spec["name"]
     if a.collect:
-        return collect(root)
+        return collect(root, a.eval or "")
+    if a.eval:
+        return reevaluate(spec, root, a.eval)
     slurm = spec.get("slurm") or {}
     gpus = int(str(slurm.get("gres", "gpu:1")).split(":")[-1])
     sets = [x for k, v in slurm.items() for x in ("--set", f"{k}={v}")]
