@@ -451,11 +451,13 @@ def readings(m: str, d: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
     """The readings a model's tuning probe chooses from on val, together with head and L2 (user, 16/10: try them all,
     keep the best on val). Ours: the last block's foreground mean (`mean`), the intermediate blocks' (mean_b<k>), all
     of them concatenated (`blocks`), each with the per-channel std, with the covariance square root (`second_order`,
-    all patches or foreground only), and the same means over twice the readings (_tta: each curve also read from its
-    other end). Another model: its stored features."""
+    all patches or foreground only). Another model: its stored features."""
     ids, f = load_globals(d)
     if not m.startswith("sfc_gdn2"):
         return ids, f
+    w = f["mean"].shape[1] // 2
+    if torch.equal(f["mean"][:, :w], f["mean"][:, w:]):  # one-stream encoder: bi = h ++ h, keep h (half the fits)
+        f = {k: v[:, :w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
     so = second_order(d, ids)
     cov = so["covsqrt"]
 
@@ -473,12 +475,7 @@ def readings(m: str, d: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
             menu["blocks+std"] = cat(blocks, *(f["std" + b] for b in inter), f["std"])
     if "covsqrt_fg" in so:
         menu["mean+covsqrt_fg"] = cat(f["mean"], so["covsqrt_fg"])
-    if "mean_tta" in f:
-        menu |= {"mean_tta": f["mean_tta"], "mean_tta+std_tta": cat(f["mean_tta"], f["std_tta"]),
-                 "mean_tta+covsqrt": cat(f["mean_tta"], cov)}
-        if inter:
-            menu["blocks_tta"] = cat(*(f["mean_tta" + b] for b in inter), f["mean_tta"])
-    return ids, menu
+    return ids, menu  # the 2x-reading means (*_tta) were never chosen on p7 (17/10): dropped
 
 
 def _tune_one(m: str, d: Path, tname: str, cfg: dict, rows: pd.DataFrame, device: str) -> dict:

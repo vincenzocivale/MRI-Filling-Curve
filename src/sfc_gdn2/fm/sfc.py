@@ -226,7 +226,7 @@ class SFC(Wrapper):
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
                                               obj.get("fg_threshold", 0.05), crop=bool(self.args.get("crop")),
                                               embed_only=self.args.get("encoder") == "none",
-                                              reverse=self.args.get("tta", True))  # also the *_tta readings
+                                              reverse=bool(self.args.get("tta")))  # also the *_tta readings
         return self._extract
 
     @torch.no_grad()

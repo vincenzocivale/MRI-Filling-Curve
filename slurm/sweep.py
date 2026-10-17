@@ -42,9 +42,11 @@ def draw(space: dict, rng: random.Random) -> dict:
 
 
 SEGDEC = (("segdec", ""), ("segdec_taps2", "args.taps=2"), ("segdec_taps3", "args.taps=3"),
-          ("segdec_nb", "args.neighbors=true"), ("segdec_taps3_nb", "args.taps=3 args.neighbors=true"))
+          ("segdec_nb", "args.neighbors=true"), ("segdec_taps3_nb", "args.taps=3 args.neighbors=true"),
+          ("segdec_taps3_refine_image", "args.taps=3 args.refine=true args.image=true"))
 # the segdec pilots of every run (user, 16/10): decoder on the last block; + 2, 3 intermediate blocks; a 3^3 mixing of
-# each token with its neighbours (last block; + 3 intermediate blocks). Best val Dice wins: our official decoder.
+# each token with its neighbours (last block; + 3 intermediate blocks); 16 -> 8 mm along the Hilbert curve with the
+# voxels' KernelEmbed at 8 mm (p7: 0.657, best). Best val Dice wins: our official decoder.
 # Dropped on p7 (17/10): + the patch embedding, + the tile's mean token, + reversed readings (no gain).
 
 
