@@ -59,7 +59,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .curves import grid_coords, keys, symmetries, transform
 from .data.dataset import per_patch
-from .model import Encoder, KernelEmbed
+from .model import Encoder
 
 
 def gather_rows(x: torch.Tensor) -> torch.Tensor:
@@ -150,8 +150,8 @@ class LeJEPA(nn.Module):
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
         # child n (18/10, user): the pyramid also goes down. In the B view of each scan's first local group (at most
         # child_max patches) patches are read finer: n = 1, every patch as its 8 sub-blocks of patch_mm/2; n = 2,
-        # also 64 sub-blocks of patch_mm/4. Each sub-block is embedded by a KernelEmbed at its own size (the same native
-        # voxels, nothing resampled) and the view is read once by the encoder at mixed resolution along the Hilbert curve
+        # also 64 sub-blocks of patch_mm/4. Each sub-block is embedded from the same native
+        # voxels, nothing resampled; the patch kernel zoomed onto it) and the view is read once by the encoder at mixed resolution along the Hilbert curve
         # of the finest grid (a cell's sub-blocks are consecutive on it). A's masked token predicts, through a slot
         # query per sub-block, the tokens of its sub-blocks (invariance + SIGReg, as the cells). child_adaptive: only
         # the patches (then sub-blocks) with the highest learned score are refined, child_frac of them, child_explore
@@ -161,8 +161,9 @@ class LeJEPA(nn.Module):
         self.child_explore, self.child_max = child_explore, child_max
         if self.child:
             d2, pm = 2 * encoder.dim, encoder.patch_embed.patch_mm
-            self.child_embed = nn.ModuleDict({str(f): KernelEmbed(encoder.dim, pm / f, freq_decay=1.0)
-                                              for f in (2, 4)[: self.child]})
+            # one kernel for every scale: a sub-block is embedded by the patch kernel zoomed onto it (its voxels at f
+            # times their spacing span one patch), plus a learned vector per scale so the encoder knows which it reads
+            self.child_scale = nn.Parameter(torch.zeros(self.child, encoder.dim))
             self.child_slot = nn.ParameterList(nn.Parameter(torch.randn(f ** 3, d2) * 0.02) for f in (2, 4)[: self.child])
             self.child_head = Projector(d2, proj_hidden, proj_dim)
             self.child_score = nn.ModuleList(nn.Linear(d2, 1) for _ in (2, 4)[: self.child]) if child_adaptive else None
@@ -483,7 +484,7 @@ class LeJEPA(nn.Module):
                 out[k] = (r := torch.cat(r)).sum() / max(len(r), 1)
         score = sum(out[f"score_{n}"] for n in ch if f"score_{n}" in out)   # trains only the score heads
         if self.child:  # every child parameter in the graph each step (DDP; a 4 mm block may be absent in a batch)
-            score = score + 0 * sum(q.view(-1)[0] for q in [*self.child_embed.parameters(), *self.child_slot,
+            score = score + 0 * sum(q.view(-1)[0] for q in [self.child_scale, *self.child_slot,
                                                               *self.child_head.parameters(),
                                                               *(self.child_score.parameters() if self.child_score else [])])
         return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs) + self.rec_weight * out.get("rec", 0) + score
@@ -583,7 +584,7 @@ class LeJEPA(nn.Module):
                     continue
                 if f == 4 and sub4 is None:
                     continue
-                emb = self.child_embed[name]
+                emb, zs = self.encoder.patch_embed, self.child_scale[0 if f == 2 else 1]
                 parts = x.split(sizes[0], 1)
                 for ox in range(f):
                     py = parts[ox].split(sizes[1], 2)
@@ -594,8 +595,8 @@ class LeJEPA(nn.Module):
                             sel = lv[0] & (sub4[:, c8] if f == 4 else (~sub4[:, c8] if sub4 is not None else True))
                             if not bool(sel.any()):
                                 continue
-                            w = emb.weights(torch.tensor(sp, device=dev), [sizes[0][ox], sizes[1][oy], sizes[2][oz]])
-                            toks.append(emb(pz[oz][sel].flatten(1), w))
+                            w = emb.weights(torch.tensor(sp, device=dev) * f, [sizes[0][ox], sizes[1][oy], sizes[2][oz]])
+                            toks.append(emb(pz[oz][sel].flatten(1), w) + zs)
                             o = box.view(-1, 3)[sel] * F + torch.tensor([ox, oy, oz], device=dev) * (F // f)
                             origin.append(o); size.append(F // f); owner.append(sel.nonzero()[:, 0])
                             s8 = torch.full((int(sel.sum()),), c8, device=dev)
