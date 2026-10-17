@@ -41,10 +41,12 @@ def draw(space: dict, rng: random.Random) -> dict:
     return out
 
 
-SEGDEC = (("segdec", ""), ("segdec_taps3_refine_image", "args.taps=3 args.refine=true args.image=true"))
+SEGDEC = (("segdec", ""), ("segdec_taps3_refine_image", "args.taps=3 args.refine=true args.image=true"),
+          ("segdec_taps3_refine2_image", "args.taps=3 args.refine=2 args.image=true"))
 # the segdec pilots of every run (user, 17/10: D2 and little else): Primus' decoder on the last block (the plain
 # reference), and ours: + 3 intermediate blocks, 16 -> 8 mm along the Hilbert curve with the voxels' KernelEmbed at
-# 8 mm (p7: 0.657 vs 0.649 for Primus' decoder on the same blocks). Dropped on p7 (17/10): + 2 intermediate blocks,
+# 8 mm (p7: 0.657 vs 0.649 for Primus' decoder on the same blocks), and the same down to 4 mm (p7: 0.648 at 2500
+# iterations, still rising, lowest loss: the user expects it to win with more). Dropped on p7 (17/10): + 2 blocks,
 # neighbour mixing, the patch embedding, the tile's mean token, reversed readings.
 
 
