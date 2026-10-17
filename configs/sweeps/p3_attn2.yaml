@@ -1,0 +1,15 @@
+# Second seed of the hybrid (user, 17/10): p3_attn #0 (every 4th block attention) at seed 18, with its paired base at
+# seed 18 (the current recipe, mask_cells [1, 2]; no seed-18 base of this recipe existed). Seed 17: base 0.492 /
+# hybrid 0.517 skill, best Dice 0.430 / 0.437.
+name: p3_attn2
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144, objective.mask_cells: [1, 2], seed: 18}
+runs:
+  - {}
+  - {model.attn_every: 4}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "06:00:00"}

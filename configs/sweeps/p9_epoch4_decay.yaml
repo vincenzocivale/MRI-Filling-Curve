@@ -1,0 +1,15 @@
+# Decay branch of p9_epoch4 to four epochs (user, 17/10): from its plateau checkpoint at step 39800, 1-sqrt decay over
+# 1000 steps to step 40800 (~3.9M scans), queued after p9_epoch4 (afterany: resumes the rest of the plateau first if
+# that job stopped early). The one evaluation (probe menu, segdec decoders).
+name: p9_epoch4_decay
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 40800, train.decay_steps: 1000, train.warmup_steps: 300, train.warmup_from: 3000,
+        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p9_epoch4/00/lejepa-811cc9f03d/ckpt.pt,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0, objective.mask_cells: [1, 2]}
+runs:
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}

@@ -1,0 +1,13 @@
+# Fourth epoch (user, 17/10): from p8_epoch3's plateau checkpoint (step 29600, lr 4e-4), plateau to step 39800
+# (+10.2k steps = one more epoch), the same recipe (mask_cells [1, 2], 2 GPUs x 48 scans). p9_epoch4_decay
+# (39800 -> 40800, with the evaluation) queued after it.
+name: p9_epoch4
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 39800, train.decay_steps: 0, train.warmup_steps: 300, train.warmup_from: 3000,
+        train.save_every: 1000, train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p8_epoch3/00/lejepa-b74c69af96/ckpt.pt,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0, objective.mask_cells: [1, 2]}
+runs:
+  - {}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}
