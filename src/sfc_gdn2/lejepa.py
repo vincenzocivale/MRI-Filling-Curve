@@ -160,7 +160,7 @@ class LeJEPA(nn.Module):
         self.child, self.child_adaptive, self.child_frac = int(child), child_adaptive, tuple(child_frac)
         self.child_explore, self.child_max = child_explore, child_max
         if self.child:
-            d2, pm = 2 * encoder.dim, encoder.patch_embed.patch_mm
+            d2 = 2 * encoder.dim
             # one kernel for every scale: a sub-block is embedded by the patch kernel zoomed onto it (its voxels at f
             # times their spacing span one patch), plus a learned vector per scale so the encoder knows which it reads
             self.child_scale = nn.Parameter(torch.zeros(self.child, encoder.dim))

@@ -1,4 +1,4 @@
-# Downward pyramid (user, 18/10): sub-blocks of the patch read finer by a KernelEmbed at their own size (same native
+# Downward pyramid (user, 18/10): sub-blocks of the patch embedded by the patch kernel zoomed onto them (same native
 # voxels), the view read once at mixed resolution along Hilbert, A's masked token predicts its sub-blocks' tokens.
 # Paired with p3_cells #0 (mask_cells [1, 2], d=512, seed 17; evaluation of now in p3_cells/00/eval_full).
 # (a) child 1: every patch of one local B view per scan at 8 mm. (b) adaptive cascade 16 -> 8 -> 4 mm: only the top
