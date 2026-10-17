@@ -41,13 +41,11 @@ def draw(space: dict, rng: random.Random) -> dict:
     return out
 
 
-SEGDEC = (("segdec", ""), ("segdec_taps2", "args.taps=2"), ("segdec_taps3", "args.taps=3"),
-          ("segdec_nb", "args.neighbors=true"), ("segdec_taps3_nb", "args.taps=3 args.neighbors=true"),
-          ("segdec_taps3_refine_image", "args.taps=3 args.refine=true args.image=true"))
-# the segdec pilots of every run (user, 16/10): decoder on the last block; + 2, 3 intermediate blocks; a 3^3 mixing of
-# each token with its neighbours (last block; + 3 intermediate blocks); 16 -> 8 mm along the Hilbert curve with the
-# voxels' KernelEmbed at 8 mm (p7: 0.657, best). Best val Dice wins: our official decoder.
-# Dropped on p7 (17/10): + the patch embedding, + the tile's mean token, + reversed readings (no gain).
+SEGDEC = (("segdec", ""), ("segdec_taps3_refine_image", "args.taps=3 args.refine=true args.image=true"))
+# the segdec pilots of every run (user, 17/10: D2 and little else): Primus' decoder on the last block (the plain
+# reference), and ours: + 3 intermediate blocks, 16 -> 8 mm along the Hilbert curve with the voxels' KernelEmbed at
+# 8 mm (p7: 0.657 vs 0.649 for Primus' decoder on the same blocks). Dropped on p7 (17/10): + 2 intermediate blocks,
+# neighbour mixing, the patch embedding, the tile's mean token, reversed readings.
 
 
 def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
