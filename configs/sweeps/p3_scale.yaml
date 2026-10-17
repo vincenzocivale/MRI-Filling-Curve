@@ -1,0 +1,22 @@
+# Multi-scale pyramid (user, 18/10), as paired continuations to cut the noise of 760-step screens: every arm starts
+# from the same trained model (p3_cells #0: d=512, mask_cells [1, 2], 760 steps; weights only, train.init_from) and
+# runs 760 more steps on the same data stream and seed, so arm - control is the effect of the objective alone.
+# (0) control: the current objective. (1) down, fixed: one local B view per scan also at 8 mm. (2) down, adaptive
+# cascade 16 -> 8 -> 4 mm. (3) up: the first global B box also read at 32 mm, one more view of the volume level.
+# (4) both: (2) + (3). One kernel for every scale (the patch kernel zoomed) + a learned vector per scale.
+name: p3_scale
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        train.init_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p3_cells/00/lejepa-fe90690a70/model.pt,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144, objective.mask_cells: [1, 2]}
+runs:
+  - {}
+  - {objective.child: 1}
+  - {objective.child: 2, objective.child_adaptive: true}
+  - {objective.coarse_view: true}
+  - {objective.child: 2, objective.child_adaptive: true, objective.coarse_view: true}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "06:00:00"}

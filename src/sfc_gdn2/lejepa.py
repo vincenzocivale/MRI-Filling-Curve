@@ -126,7 +126,8 @@ class LeJEPA(nn.Module):
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
                  coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False,
                  volume_locals: bool = True, child: int = 0, child_adaptive: bool = False,
-                 child_frac: tuple = (0.25, 0.25), child_explore: float = 0.1, child_max: int = 216):
+                 child_frac: tuple = (0.25, 0.25), child_explore: float = 0.1, child_max: int = 216,
+                 coarse_view: bool = False):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -159,6 +160,11 @@ class LeJEPA(nn.Module):
         # where its prediction of the detail fails).
         self.child, self.child_adaptive, self.child_frac = int(child), child_adaptive, tuple(child_frac)
         self.child_explore, self.child_max = child_explore, child_max
+        # coarse_view (18/10, user): the pyramid's input also goes up. Each scan's first global B box is read once more
+        # at twice the patch (2^3 patches' voxels as one block, the patch kernel zoomed out onto it, plus a learned
+        # scale vector: ~8x fewer tokens) and its foreground mean joins the volume level as one more view
+        self.coarse_view = coarse_view
+        self.coarse_scale = nn.Parameter(torch.zeros(encoder.dim)) if coarse_view else None
         if self.child:
             d2 = 2 * encoder.dim
             # one kernel for every scale: a sub-block is embedded by the patch kernel zoomed onto it (its voxels at f
@@ -444,6 +450,8 @@ class LeJEPA(nn.Module):
             out[f"inv_cell{cs}"] = (p - q).square().mean(-1).sum() / max(len(p), 1) / 4
             out[f"sigreg_cell{cs}"] = sig(z[self._sample(vb, torch.ones_like(vb, dtype=torch.bool), b, gen)][None])
             out[f"pairs_cell{cs}"] = torch.tensor(float(len(p)), device=z.device)
+        if self.coarse_view:
+            tops.append(self.coarse_tops(vols, fg, corner, edge)[:, None])
         tops = torch.cat(tops, 1)                                                          # [B,V,2d], globals first
         groups = {"volume": torch.arange(b, device=grid.device),
                   "session": vols["session"].unique(return_inverse=True)[1]}
@@ -524,6 +532,33 @@ class LeJEPA(nn.Module):
         j = torch.where(pool > 0, (cnt.cumsum(0) - cnt)[:, None] + (r * pool).long().clamp_max(pool - 1),
                         (r * len(vol)).long().clamp_max(len(vol) - 1))
         return order[j.flatten()]
+
+    def coarse_tops(self, vols, fg, corner, edge):
+        """Each scan's first global B box at twice the patch (coarse_view) -> its foreground mean token [B,2d]."""
+        dev, seqs, fgs = corner.device, [], []
+        off = torch.stack(torch.meshgrid(*(torch.arange(2, device=dev),) * 3, indexing="ij"), -1).view(-1, 3)
+        for b in range(len(corner)):
+            c0, e0, g = corner[b, 0, 1], edge[b, 0, 1], vols["grid"][b]
+            k, sp = vols["k_list"][b], vols["spacing_list"][b]
+            ec = (e0 + 1) // 2
+            cc = torch.stack(torch.meshgrid(*(torch.arange(n, device=dev) for n in ec.tolist()), indexing="ij"), -1).view(-1, 3)
+            pc = c0 + cc[:, None] * 2 + off[None]                                            # [Nc,8,3] its patches
+            inside = ((pc < g) & (pc < c0 + e0)).all(-1)
+            pid = ((pc[..., 0] * g[1] + pc[..., 1]) * g[2] + pc[..., 2]).clamp(max=int(g.prod()) - 1)
+            blk = (vols["patches"][b][pid].float() * inside[..., None]).view(len(cc), 2, 2, 2, *k)
+            blk = blk.permute(0, 1, 4, 2, 5, 3, 6).reshape(len(cc), -1)                     # x-major voxels of the block
+            w = self.encoder.patch_embed.weights(torch.tensor(sp, device=dev) / 2, [2 * n for n in k])
+            t = self.encoder.patch_embed(blk, w) + self.coarse_scale
+            order = keys("hilbert", cc, ec, self.seed).argsort()
+            seqs.append(t[order])
+            fgs.append((fg[b][pid] & inside).any(1)[order])
+        lens = [len(q) for q in seqs]
+        cu = nn.functional.pad(torch.tensor(lens, device=dev).cumsum(0), (1, 0)).int()
+        tops = []
+        for h, m in zip(self.encoder.flat(torch.cat(seqs), cu, self.encoder.grad_checkpoint).split(lens), fgs):
+            h = h[m] if bool(m.any()) else h
+            tops.append(torch.cat([h.mean(0), h.mean(0)]))                                 # one stream: bi = h ++ h
+        return torch.stack(tops).float()
 
     def sub_blocks(self, vols, ws, bi, tv, pxyz, pa, corner, edge, vol, gen):
         """`child` levels (see __init__) for the locals part: A's masked paired rows `pa` ->

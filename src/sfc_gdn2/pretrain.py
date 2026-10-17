@@ -146,6 +146,9 @@ class Pretrainer:
         src = ckpt if ckpt.exists() else t.get("resume_from")
         if src:
             self._restore(Path(src))
+        elif t.get("init_from"):  # weights only (new modules keep their init); fresh optimizer and schedule from step 0
+            r = self.net.load_state_dict(torch.load(t["init_from"], map_location="cpu"), strict=False)
+            self.log(f"[lejepa] init from {t['init_from']}: new {r.missing_keys}, dropped {r.unexpected_keys}", flush=True)
 
     def _restore(self, path: Path) -> None:
         c = torch.load(path, map_location="cpu", weights_only=False)
