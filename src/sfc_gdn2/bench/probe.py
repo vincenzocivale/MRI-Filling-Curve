@@ -311,7 +311,8 @@ def run(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, spl
     """Every task x seed x model; only the volumes all `common` models (default `models`) have.
     `menu`: per model, the only stored features its probes may choose from (default: all of them).
     Writes `<out>/<task>/s<seed>/<model>.json`."""
-    loaded = {m: load_globals(d) for m, d in models.items()}
+    fit = set(vols.loc[vols["subject"].isin(tune_subjects(splits)), "id"])  # second order: PCA from these only
+    loaded = {m: readings(m, d, fit) for m, d in models.items()}
     for m, keep in (menu or {}).items():
         if m in loaded:
             ids, feats = loaded[m]
@@ -406,12 +407,13 @@ def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.T
             "subjects": len(subjects), "chosen": [{k: c[k] for k in ("head", "feature", "l2")} for c in (a, b)]}
 
 
-def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400) -> dict[str, torch.Tensor]:
+def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit: set | None = None) -> dict[str, torch.Tensor]:
     """{"covsqrt": [N, dim (dim + 1) / 2], and "covsqrt_fg" when the files hold `fg`}: per volume the square root of
     the covariance of its tokens (`map`: every patch; _fg: foreground patches only) projected on the first `dim`
     principal directions of 200 such tokens from each of `sample` random volumes (no label; iSQRT-COV normalisation,
     upper triangle): how the tokens vary together, which their mean drops (notes/loss_stato.md; age 0.374 -> 0.405
-    with the mean at two epochs). One pass over the files for both; cached in <d>/_second_order.pt."""
+    with the mean at two epochs). One pass over the files for both; cached in <d>/_second_order.pt. `fit`: the ids
+    the principal directions may come from (the benchmark: tune_subjects' volumes, no test subject of any seed)."""
     cache = d / "_second_order.pt"
     if cache.exists() and (c := torch.load(cache))["ids"] == ids:
         return c["feats"]
@@ -424,8 +426,9 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400) -> d
 
     g = torch.Generator().manual_seed(0)
     pool: dict[str, list] = {}
-    for k in torch.randperm(len(ids), generator=g)[:sample].tolist():
-        for name, t in tokens(ids[k]).items():
+    pool = [i for i in ids if fit is None or i in fit]
+    for k in torch.randperm(len(pool), generator=g)[:sample].tolist():
+        for name, t in tokens(pool[k]).items():
             pool.setdefault(name, []).append(t[torch.randperm(len(t), generator=g)[:200]])
     basis = {}
     for name, ts in pool.items():
@@ -447,7 +450,7 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400) -> d
     return feats
 
 
-def readings(m: str, d: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
+def readings(m: str, d: Path, fit: set | None = None) -> tuple[list[str], dict[str, torch.Tensor]]:
     """The readings a model's tuning probe chooses from on val, together with head and L2 (user, 16/10: try them all,
     keep the best on val). Ours: the last block's foreground mean (`mean`), the intermediate blocks' (mean_b<k>), all
     of them concatenated (`blocks`), each with the per-channel std, with the covariance square root (`second_order`,
@@ -458,7 +461,7 @@ def readings(m: str, d: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
     w = f["mean"].shape[1] // 2
     if torch.equal(f["mean"][:, :w], f["mean"][:, w:]):  # one-stream encoder: bi = h ++ h, keep h (half the fits)
         f = {k: v[:, :w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
-    so = second_order(d, ids)
+    so = second_order(d, ids, fit=fit)
     cov = so["covsqrt"]
 
     def cat(*xs):

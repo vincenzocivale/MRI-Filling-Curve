@@ -10,6 +10,8 @@ inputs_dir: /leonardo_scratch/large/userexternal/fcorrent/datasets/derivatives/b
 probe:
   tasks: configs/bench/probe_tasks.yaml
   out: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/probe_bench   # <out>/<task>/s<seed>/<model>.json, summary.csv
+  menu:   # ours (user, 17/10): a small menu like the others' menu B (more readings: noisy choice on small val sets)
+    sfc_gdn2: [mean, blocks+std, blocks+covsqrt]
 
 fm:
   out_root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/fm_bench   # <out_root>/<config stem>/<id>.pt
