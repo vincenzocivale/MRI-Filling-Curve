@@ -150,9 +150,9 @@ class LeJEPA(nn.Module):
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
         # child n (18/10, user): the pyramid also goes down. In the B view of each scan's first local group (at most
         # child_max patches) patches are read finer: n = 1, every patch as its 8 sub-blocks of patch_mm/2; n = 2,
-        # also 64 sub-blocks of patch_mm/4. Each sub-block is embedded from the same native
-        # voxels, nothing resampled; the patch kernel zoomed onto it) and the view is read once by the encoder at mixed resolution along the Hilbert curve
-        # of the finest grid (a cell's sub-blocks are consecutive on it). A's masked token predicts, through a slot
+        # also 64 sub-blocks of patch_mm/4. Each sub-block is embedded from the same native voxels (nothing resampled) by
+        # the patch kernel zoomed onto it, and the view is read once by the encoder at mixed resolution along the
+        # Hilbert curve of the finest grid (a cell's sub-blocks are consecutive on it). A's masked token predicts, through a slot
         # query per sub-block, the tokens of its sub-blocks (invariance + SIGReg, as the cells). child_adaptive: only
         # the patches (then sub-blocks) with the highest learned score are refined, child_frac of them, child_explore
         # of those at random; the score learns the sub-block error measured where it refined (the model goes finer
