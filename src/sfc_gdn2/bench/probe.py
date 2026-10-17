@@ -481,16 +481,17 @@ def readings(m: str, d: Path, fit: set | None = None) -> tuple[list[str], dict[s
     return ids, menu  # the 2x-reading means (*_tta) were never chosen on p7 (17/10): dropped
 
 
-def _tune_one(m: str, d: Path, tname: str, cfg: dict, rows: pd.DataFrame, device: str) -> dict:
+def _tune_one(m: str, d: Path, tname: str, cfg: dict, rows: pd.DataFrame, device: str, keep=None) -> dict:
     torch.set_num_threads(2)
     ids, feats = readings(m, d)
+    feats = {k: f for k, f in feats.items() if keep is None or k in keep}  # the official menu (bench.yaml probe.menu)
     r = tune_task(tname, cfg, rows, feats, {i: k for k, i in enumerate(ids)}, device)
     print(f"[tune] {m} {tname}: skill {r['skill']:.3f} ({r['subjects']} subjects)", flush=True)
     return {"model": m, **{k: r[k] for k in ("task", "skill", "subjects")}, "chosen": r["chosen"]}
 
 
 def tune(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, splits: pd.DataFrame, out_dir: Path,
-         device: str = "cuda") -> pd.DataFrame:
+         device: str = "cuda", menu: dict | None = None) -> pd.DataFrame:
     """tune_task for every model x non-seg task on the tune_subjects -> <out>/tune.csv (+ the mean skill per model).
     No test subject of any seed is read. The (model, task) pairs run in one process per visible GPU (the L-BFGS fits are
     launch-bound: processes sharing a GPU slow each other down); tune.csv is rewritten as each pair ends."""
@@ -504,7 +505,8 @@ def tune(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, sp
     gpus = torch.cuda.device_count() if device == "cuda" else 0
     out_dir.mkdir(parents=True, exist_ok=True)
     with ProcessPoolExecutor(min(max(gpus, 1), len(jobs)), mp_context=get_context("spawn")) as ex:
-        futs = [ex.submit(_tune_one, *j, f"cuda:{k % gpus}" if gpus else device) for k, j in enumerate(jobs)]
+        futs = [ex.submit(_tune_one, *j, f"cuda:{k % gpus}" if gpus else device, (menu or {}).get(j[0]))
+                for k, j in enumerate(jobs)]
         for f in as_completed(futs):
             try:
                 out.append(f.result())

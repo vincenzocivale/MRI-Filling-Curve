@@ -1,0 +1,17 @@
+# Attention on the same kernel embedding (user, 17/10), paired with p3_cells #0 (mask_cells [1, 2], d=512/8, seed 17;
+# re-evaluated with the evaluation of now: p3_cells/00/eval_full). (a) hybrid: every 4th block full softmax attention,
+# position-free (order from the GDN-2 blocks around it): global token-token interactions GDN-2's ~10-token memory
+# lacks (age stalls; the covariance reading helps). 31.3M vs 32.6M parameters. (b) attention only, rotary position on
+# the index along the curve (no coordinates): does the recurrence matter? Gated output (5 d^2 per mixer vs ~6.4 d^2).
+name: p3_attn
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144, objective.mask_cells: [1, 2]}
+runs:
+  - {model.attn_every: 4}
+  - {model.attn_every: 1, model.attn_rope: true}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "06:00:00"}

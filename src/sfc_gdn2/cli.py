@@ -97,7 +97,7 @@ def bench_probe(cfg: dict, args) -> None:
     vols = pd.read_csv(Path(cfg["out_dir"]) / "volumes.csv", low_memory=False, dtype={"session": str})
     splits = pd.read_csv(Path(cfg["out_dir"]) / "splits.csv")
     if args.tune:
-        bp.tune(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), args.device)
+        bp.tune(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), args.device, cfg["probe"].get("menu"))
         return
     seeds = [int(s) for s in args.seeds.split(",")]
     common = {m: root / m for m in args.common} if args.common else None

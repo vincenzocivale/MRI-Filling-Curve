@@ -94,6 +94,43 @@ class GDN2Block(nn.Module):
         return x + self.ffn(self.ffn_norm(x))
 
 
+class AttnBlock(nn.Module):
+    """Pre-norm full (non-causal) softmax attention over each packed sequence + MLP, the GDN2Block interface
+    (17/10 screens). Output-gated like GDN-2's mixer (sigmoid(W_g y) * attention: 5 d^2 against GDN-2's ~6.4 d^2).
+    rope: rotary position on the index along the curve (a pure attention stack has no other order); without it the
+    block is position-free and takes its order from the GDN-2 blocks around it (hybrid). `rev`/`both` do not apply."""
+
+    def __init__(self, d: int, head_dim: int, num_heads: int, rope: bool = False):
+        super().__init__()
+        self.h, self.hd, self.rope = num_heads, head_dim, rope
+        self.norm, self.ffn_norm = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.qkv, self.g, self.o = nn.Linear(d, 3 * d, bias=False), nn.Linear(d, d), nn.Linear(d, d, bias=False)
+        self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, rev=None, both=False) -> torch.Tensor:
+        from flash_attn import flash_attn_varlen_func
+
+        y = self.norm(x[0])                                                               # [T, d] (x: [1, T, d])
+        if torch.is_autocast_enabled(y.device.type):
+            y = y.to(torch.get_autocast_dtype(y.device.type))
+        T = len(y)
+        cu = cu_seqlens if cu_seqlens is not None else torch.tensor([0, T], device=y.device, dtype=torch.int32)
+        q, k, v = self.qkv(y).view(T, 3, self.h, self.hd).unbind(1)
+        if self.rope:  # position along the curve within each sequence
+            seq = torch.searchsorted(cu[1:].long(), torch.arange(T, device=y.device), right=True)
+            pos = (torch.arange(T, device=y.device) - cu.long()[seq]).float()
+            f = pos[:, None] * 10000 ** (-torch.arange(0, self.hd, 2, device=y.device) / self.hd)
+            cos, sin = f.cos()[:, None].to(q.dtype), f.sin()[:, None].to(q.dtype)
+
+            def rot(t):
+                a, b = t[..., ::2], t[..., 1::2]
+                return torch.stack([a * cos - b * sin, a * sin + b * cos], -1).flatten(-2)
+            q, k = rot(q), rot(k)
+        a = flash_attn_varlen_func(q, k, v, cu, cu, int((cu[1:] - cu[:-1]).max()), int((cu[1:] - cu[:-1]).max()))
+        x = x + self.o(torch.sigmoid(self.g(y)) * a.reshape(T, -1))[None]
+        return x + self.ffn(self.ffn_norm(x))
+
+
 def long_memory(mix: nn.Module, channels: int, half_life: tuple[float, float]) -> None:
     """Slow decay for the first `channels` key channels of every head of a GDN-2 mixer (notes/loss_stato.md, 14/10).
     The decay of key channel i (row i of each head's state S) is exp(-A_h softplus(f_i(x) + dt_bias_i)); at GDN-2's init
@@ -199,7 +236,7 @@ class Encoder(nn.Module):
 
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
                  grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, bidir: str = "late",
-                 long_mem: dict | None = None, **embed):
+                 long_mem: dict | None = None, attn_every: int = 0, attn_rope: bool = False, **embed):
         super().__init__()
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
@@ -207,8 +244,9 @@ class Encoder(nn.Module):
         self.patch_embed = KernelEmbed(d_model, patch_mm, **embed)
         self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
         self.pos = ViewPos(d_model) if view_pos else None
-        self.blocks = nn.ModuleList(GDN2Block(d_model, head_dim, num_heads, use_short_conv, i)
-                                    for i in range(depth))
+        # attn_every k > 0 (17/10 screens): every k-th block is an AttnBlock (1: all of them; attn_rope for those)
+        self.blocks = nn.ModuleList(AttnBlock(d_model, head_dim, num_heads, attn_rope) if attn_every and (i + 1) % attn_every == 0
+                                    else GDN2Block(d_model, head_dim, num_heads, use_short_conv, i) for i in range(depth))
         if long_mem:
             for b in self.blocks:
                 long_memory(b.mix, long_mem["channels"], long_mem["half_life"])
@@ -219,7 +257,8 @@ class Encoder(nn.Module):
         m = cfg["model"]
         return cls(m["d_model"], m["depth"], m["head_dim"], m["num_heads"], m.get("use_short_conv", True),
                    m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
-                   m.get("bidir", "late"), m.get("long_mem"), **m.get("embed", {}))
+                   m.get("bidir", "late"), m.get("long_mem"), m.get("attn_every", 0), m.get("attn_rope", False),
+                   **m.get("embed", {}))
 
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         """[...,N,d] tokens, masked ones replaced by the learned mask token."""
