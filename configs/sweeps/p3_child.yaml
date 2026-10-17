@@ -1,0 +1,17 @@
+# Downward pyramid (user, 18/10): sub-blocks of the patch read finer by a KernelEmbed at their own size (same native
+# voxels), the view read once at mixed resolution along Hilbert, A's masked token predicts its sub-blocks' tokens.
+# Paired with p3_cells #0 (mask_cells [1, 2], d=512, seed 17; evaluation of now in p3_cells/00/eval_full).
+# (a) child 1: every patch of one local B view per scan at 8 mm. (b) adaptive cascade 16 -> 8 -> 4 mm: only the top
+# 25 % patches by a learned score (the measured sub-block error), then the top 25 % of their 8 mm blocks to 4 mm.
+name: p3_child
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patches_per_batch: 196608, train.batch_size: 72, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        objective.max_packed_tokens: 262144, objective.mask_cells: [1, 2]}
+runs:
+  - {objective.child: 1}
+  - {objective.child: 2, objective.child_adaptive: true}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "06:00:00"}
