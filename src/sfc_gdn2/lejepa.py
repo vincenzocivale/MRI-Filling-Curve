@@ -409,7 +409,7 @@ class LeJEPA(nn.Module):
             pred.append(za)
             tgt.append(z_b[j_b[pair]])
             if self.child and part.start == self.gg:
-                child_out = self.children(vols, ws, bi, tv, pxyz, ia[pair], c, e, v, gen)
+                child_out = self.sub_blocks(vols, ws, bi, tv, pxyz, ia[pair], c, e, v, gen)
             ztok.append(z_b)
             tvol.append(v[tv[ib]])
             tfg.append(fgv[ib])
@@ -525,7 +525,7 @@ class LeJEPA(nn.Module):
                         (r * len(vol)).long().clamp_max(len(vol) - 1))
         return order[j.flatten()]
 
-    def children(self, vols, ws, bi, tv, pxyz, pa, corner, edge, vol, gen):
+    def sub_blocks(self, vols, ws, bi, tv, pxyz, pa, corner, edge, vol, gen):
         """`child` levels (see __init__) for the locals part: A's masked paired rows `pa` ->
         {name: (predicted [M,D], target [M,D], score loss or None)} for child8 (and child4)."""
         dev, gl = bi.device, self.gl
