@@ -426,9 +426,9 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit:
 
     g = torch.Generator().manual_seed(0)
     pool: dict[str, list] = {}
-    pool = [i for i in ids if fit is None or i in fit]
-    for k in torch.randperm(len(pool), generator=g)[:sample].tolist():
-        for name, t in tokens(pool[k]).items():
+    cand = [i for i in ids if fit is None or i in fit]
+    for k in torch.randperm(len(cand), generator=g)[:sample].tolist():
+        for name, t in tokens(cand[k]).items():
             pool.setdefault(name, []).append(t[torch.randperm(len(t), generator=g)[:200]])
     basis = {}
     for name, ts in pool.items():
