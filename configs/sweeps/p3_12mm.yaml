@@ -1,0 +1,17 @@
+# 12 mm tokens (user, 18/10): hybrid (every 4th block full attention: ~5.4k tokens per whole-brain view, still cheap)
+# and plain GDN-2, at d=512/8, 760 steps, seed 17, against the 16 mm runs of the same recipe (p3_cells #0 base,
+# p3_attn #0 hybrid). Same scans per step (144: 4 GPUs x 36) and the same geometry in mm: local views 48-132 mm, mask
+# cubes 12/36 mm (16/32 at 16 mm), cell levels 36/60 mm (32/64), view cap x2.4 (the patches per brain).
+name: p3_12mm
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 760, train.decay_steps: 150, train.warmup_steps: 150, train.save_every: 760,
+        data.patch_mm: 12.0, data.patches_per_batch: 233472, train.batch_size: 36, model.d_model: 512, model.depth: 8,
+        model.num_heads: 8, objective.max_packed_tokens: 262144, objective.mask_cells: [1, 3], objective.levels: [3, 5],
+        objective.local_edge: [4, 11], objective.max_view_tokens: 9700}
+runs:
+  - {model.attn_every: 4}
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:4", cpus_per_task: 32, mem: 480G, time: "08:00:00"}
