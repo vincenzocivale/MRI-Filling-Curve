@@ -107,6 +107,14 @@ class AttnBlock(nn.Module):
         self.qkv, self.g, self.o = nn.Linear(d, 3 * d, bias=False), nn.Linear(d, d), nn.Linear(d, d, bias=False)
         self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
 
+    def zero_out(self) -> AttnBlock:
+        """Both residual branches start at 0: the block is the identity (inserted into a trained stack)."""
+        for m in (self.o, self.ffn[2]):
+            nn.init.zeros_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        return self
+
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, rev=None, both=False) -> torch.Tensor:
         from flash_attn import flash_attn_varlen_func
 
@@ -236,7 +244,8 @@ class Encoder(nn.Module):
 
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
                  grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, bidir: str = "late",
-                 long_mem: dict | None = None, attn_every: int = 0, attn_rope: bool = False, **embed):
+                 long_mem: dict | None = None, attn_every: int = 0, attn_rope: bool = False, attn_insert: int = 0,
+                 **embed):
         super().__init__()
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
@@ -247,6 +256,17 @@ class Encoder(nn.Module):
         # attn_every k > 0 (17/10 screens): every k-th block is an AttnBlock (1: all of them; attn_rope for those)
         self.blocks = nn.ModuleList(AttnBlock(d_model, head_dim, num_heads, attn_rope) if attn_every and (i + 1) % attn_every == 0
                                     else GDN2Block(d_model, head_dim, num_heads, use_short_conv, i) for i in range(depth))
+        # backwards reading of `alternate`: every other GDN-2 block (attention reads no direction)
+        self.reads_back = [bool(i % 2) for i in range(depth)]
+        if attn_insert:  # attn_insert k (18/10, growth): `depth` GDN-2 blocks + an identity-initialised AttnBlock after
+            # every k-th; the GDN-2 blocks keep their order and direction, so a pure stack's weights load unchanged
+            # (pretrain: train.init_from maps their indices) and the grown model starts as the same function
+            grown, self.reads_back = [], []
+            for i, b in enumerate(self.blocks):
+                grown.append(b), self.reads_back.append(bool(i % 2))
+                if (i + 1) % attn_insert == 0:
+                    grown.append(AttnBlock(d_model, head_dim, num_heads, attn_rope).zero_out()), self.reads_back.append(False)
+            self.blocks = nn.ModuleList(grown)
         if long_mem:
             for b in self.blocks:
                 long_memory(b.mix, long_mem["channels"], long_mem["half_life"])
@@ -258,6 +278,7 @@ class Encoder(nn.Module):
         return cls(m["d_model"], m["depth"], m["head_dim"], m["num_heads"], m.get("use_short_conv", True),
                    m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
                    m.get("bidir", "late"), m.get("long_mem"), m.get("attn_every", 0), m.get("attn_rope", False),
+                   m.get("attn_insert", 0),
                    **m.get("embed", {}))
 
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -271,7 +292,7 @@ class Encoder(nn.Module):
         ckpt = self.grad_checkpoint if ckpt is None else ckpt
         taps = [x] * self.taps.count(-1)  # -1: the input tokens (patch embedding)
         for i, block in enumerate(self.blocks):
-            r = rev if self.bidir == "block" or i % 2 else None
+            r = rev if self.bidir == "block" or self.reads_back[i] else None
             x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", use_reentrant=False) if ckpt and self.training
                  else block(x, cu_seqlens, r, self.bidir == "block"))
             taps += [x] * self.taps.count(i)  # a repeated index: same input width, no new block (control)

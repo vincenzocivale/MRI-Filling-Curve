@@ -1,0 +1,13 @@
+# Memory and speed of the grown 12 mm encoder (18/10) before epoch 5: p8's weights (same stack as p9), 40 steps on
+# 4 GPUs x 16 scans (p9: 2 x 48 at 59 GB of 64; 12 mm = 2.4x tokens per scan, +4 attention blocks = 1.22x parameters).
+name: p10_memtest
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 40, train.decay_steps: 0, train.warmup_steps: 20, train.save_every: 1000, train.log_every: 10,
+        train.init_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p8_epoch3/00/lejepa-b74c69af96/model.pt,
+        data.patch_mm: 12.0, data.patches_per_batch: 163840, train.batch_size: 16, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        model.attn_insert: 4, objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0, objective.mask_cells: [1, 3],
+        objective.levels: [3, 5], objective.local_edge: [4, 11], objective.max_view_tokens: 9700}
+runs:
+  - {}
+slurm: {gres: "gpu:4", cpus_per_task: 32, mem: 480G, time: "00:30:00", qos: boost_qos_dbg}

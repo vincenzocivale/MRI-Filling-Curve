@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -147,7 +148,12 @@ class Pretrainer:
         if src:
             self._restore(Path(src))
         elif t.get("init_from"):  # weights only (new modules keep their init); fresh optimizer and schedule from step 0
-            r = self.net.load_state_dict(torch.load(t["init_from"], map_location="cpu"), strict=False)
+            sd = torch.load(t["init_from"], map_location="cpu", weights_only=False)
+            sd = sd.get("model", sd)  # a model.pt, or a ckpt.pt's weights (a plateau checkpoint)
+            if k := self.cfg["model"].get("attn_insert", 0):  # a pure stack grown: GDN-2 block j sits at j + j // k
+                sd = {re.sub(r"(encoder\.blocks\.)(\d+)\.", lambda m: f"{m[1]}{int(m[2]) + int(m[2]) // k}.", n): v
+                      for n, v in sd.items()}
+            r = self.net.load_state_dict(sd, strict=False)
             self.log(f"[lejepa] init from {t['init_from']}: new {r.missing_keys}, dropped {r.unexpected_keys}", flush=True)
 
     def _restore(self, path: Path) -> None:
