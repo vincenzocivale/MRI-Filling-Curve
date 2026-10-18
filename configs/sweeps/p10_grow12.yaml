@@ -1,0 +1,16 @@
+# Epoch 5 = the grown encoder at 12 mm (user, 18/10): p9's plateau weights (epoch 4) in a stack with an identity
+# AttnBlock after every 4th GDN-2 block (attn_insert 4, same function at step 0; 243.7M -> 298.2M), 12 mm tokens with
+# the 12 mm geometry of p3_12mm, 4 GPUs x 24 scans (96 per step, as p9), fresh optimizer. Stage a: 1000 steps of
+# plateau, then (after it) p10_grow12_decay (the check: 300 decay steps + the evaluation, against p10_ctrl) and
+# p10_grow12_rest (the rest of the epoch from stage a's checkpoint).
+name: p10_grow12
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 1000, train.decay_steps: 0, train.warmup_steps: 300, train.save_every: 500,
+        train.init_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p9_epoch4/00/lejepa-811cc9f03d/model.pt,
+        data.patch_mm: 12.0, data.patches_per_batch: 245760, train.batch_size: 24, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        model.attn_insert: 4, objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0, objective.mask_cells: [1, 3],
+        objective.levels: [3, 5], objective.local_edge: [4, 11], objective.max_view_tokens: 9700}
+runs:
+  - {}
+slurm: {gres: "gpu:4", cpus_per_task: 32, mem: 480G, time: "24:00:00"}

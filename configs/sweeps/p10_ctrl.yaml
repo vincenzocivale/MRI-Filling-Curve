@@ -1,0 +1,15 @@
+# Control of the epoch-5 check (user, 18/10): the current structure (16 mm, pure GDN-2, p9's recipe) from the same
+# plateau weights, fresh optimizer, the same scans (96 per step): 1000 plateau steps + 300 decay steps + the
+# evaluation, against p10_grow12_decay.
+name: p10_ctrl
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 1300, train.decay_steps: 300, train.warmup_steps: 300, train.save_every: 500,
+        train.init_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p9_epoch4/00/lejepa-811cc9f03d/model.pt,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0, objective.mask_cells: [1, 2]}
+runs:
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}
