@@ -85,13 +85,14 @@ class SegNet(nn.Module):
         T = tuple(x.shape[2:])
         ks = [patch_dims(s, self.patch_mm) for s in spacing.tolist()]
         grid = torch.stack([patch_grid(T, k) for k in ks]).to(x.device)
-        with torch.no_grad():
-            bi = self.extract({"patches": [patchify(x[b, 0].float(), k) for b, k in enumerate(ks)], "grid": grid,
-                               "k": torch.tensor(ks, device=x.device), "spacing": spacing.float()})["bi"]
+        with torch.no_grad():   # one tile at a time: coarse TotalSeg tiles hold ~3e4 tokens, two at once OOM (18/10)
+            bi = [self.extract({"patches": [patchify(x[b, 0].float(), k)], "grid": grid[b:b + 1],
+                                "k": torch.tensor([k], device=x.device), "spacing": spacing[b:b + 1].float()})["bi"][0]
+                  for b, k in enumerate(ks)]
         out = []
         for b, k in enumerate(ks):
             g = grid[b].tolist()
-            tok = bi[b, : int(grid[b].prod())]
+            tok = bi[b][: int(grid[b].prod())]
             if self.unique:
                 tok = tok[:, : tok.shape[1] // 2]
             if self.context:  # the tile's mean token beside each token: the decoder can centre it (token - mean)
