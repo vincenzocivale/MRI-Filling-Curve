@@ -31,6 +31,11 @@ from .base import Image, Wrapper
 
 SEG_PATCH = (160, 160, 160)   # voxels, as the Primus / nnFoundation ViT runs
 DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
+# refine blocks read their curve in segments of 8^4 tokens (cubes of 16 fine tokens on Hilbert): GDN-2's channel-wise
+# erase makes its state transition non-normal (|I - k (b*k)^T| can exceed 1), and one 64000-token sequence (4 mm level
+# of a 1 mm scan) grew the state past fp32 (stroke, 18/10; the exact recurrence too); the parent token already carries
+# the tile's context
+FINE_SEG = 4096
 
 
 class SegNet(nn.Module):
@@ -140,7 +145,8 @@ class SegNet(nn.Module):
         if self.image:
             e = self.fine[i][0].patch_embed
             t = t + e(patchify(vol.float(), kf), e.weights(sp.float(), kf))
-        cu = torch.tensor([0, len(t)], device=z.device, dtype=torch.int32)
+        # segments of FINE_SEG tokens along each curve: one sequence over a whole tile diverged (below)
+        cu = torch.tensor([*range(0, len(t), FINE_SEG), len(t)], device=z.device, dtype=torch.int32)
         for curve, enc in zip(self.fine_curves, self.fine[i]):
             order = keys(curve, xyz, gf, self.seed).argsort()
             with torch.autocast("cuda", dtype=torch.bfloat16):
