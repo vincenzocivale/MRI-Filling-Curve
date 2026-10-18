@@ -260,7 +260,10 @@ def train(job: dict) -> None:
 
     def load(it):
         r = torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)
-        return {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": r.get("ctx")}
+        ctx = r.get("ctx")
+        if ctx is not None and getattr(w, "seg_extent", False):   # + the scan's shape: the net can skip the padding
+            ctx = torch.cat([ctx.float(), torch.tensor(r["x"].shape[1:], dtype=torch.float)])
+        return {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx}
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
@@ -318,7 +321,6 @@ def train(job: dict) -> None:
                 m.eval()
 
         set_mode()
-        skipped = 0
         for it in range(start, iters + 1):
             x, y, c = data.sample(int(job["batch"]))
             with amp():
@@ -326,10 +328,12 @@ def train(job: dict) -> None:
             loss = loss_fn(logits, y.to(dev), k)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            if torch.isfinite(torch.nn.utils.clip_grad_norm_(params, 12)):   # a non-finite step would poison every
-                opt.step()                                                    # weight for good (stroke, decoder F, 18/10)
-            else:
-                skipped += 1
+            gn = torch.nn.utils.clip_grad_norm_(params, 12)
+            if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
+                raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "
+                                         f"{bool(torch.isfinite(logits).all())}, input finite {bool(torch.isfinite(x).all())}, "
+                                         f"context {None if c is None else c.tolist()}")
+            opt.step()
             sched.step()
             if it % every == 0 or it == iters:
                 net.eval()
@@ -337,7 +341,7 @@ def train(job: dict) -> None:
                               v["y"].to(dev), k) for v in val_v]
                 val = float(np.nanmean(ds))
                 curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
-                print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} skipped {skipped} ({(time.time() - t0) / 60:.1f} min)",
+                print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} ({(time.time() - t0) / 60:.1f} min)",
                       flush=True)
                 if "state" not in best or val > best["val"]:
                     best = {"val": val, "iter": it, "state": trained()}

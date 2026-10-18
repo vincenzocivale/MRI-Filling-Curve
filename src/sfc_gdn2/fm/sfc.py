@@ -79,19 +79,27 @@ class SegNet(nn.Module):
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
-        """x [B, 1, *T] native voxels, spacing [B, 3] mm -> logits [B, n_out, *T]."""
+        """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
+        -> logits [B, n_out, *T]. Only the scan's own voxels are read: segrun right-pads a tile up to SEG_PATCH voxels,
+        ~160 mm for resampled models but up to 1.2 m of zeros on our native grids (TotalSeg 64^3 at 7.5 mm: 5e5 tokens,
+        GPU OOM; SOOP 25 slices of 6 mm: 85 % of the tile), never seen in pretraining. The padding (label 255,
+        ignored) gets zero logits."""
         from ..data.volume import patch_dims, patch_grid, patchify
 
         T = tuple(x.shape[2:])
+        ext = spacing[:, 3:].long().tolist() if spacing.shape[1] > 3 else [T] * len(x)
+        spacing = spacing[:, :3]
+        V = [tuple(min(a, t) for a, t in zip(e, T)) for e in ext]                           # the scan's part of each tile
         ks = [patch_dims(s, self.patch_mm) for s in spacing.tolist()]
-        grid = torch.stack([patch_grid(T, k) for k in ks]).to(x.device)
-        with torch.no_grad():   # one tile at a time: coarse TotalSeg tiles hold ~3e4 tokens, two at once OOM (18/10)
-            bi = [self.extract({"patches": [patchify(x[b, 0].float(), k)], "grid": grid[b:b + 1],
+        grid = [patch_grid(v, k).to(x.device) for v, k in zip(V, ks)]
+        xs = [x[b, 0, : v[0], : v[1], : v[2]].float() for b, v in enumerate(V)]
+        with torch.no_grad():   # one tile at a time
+            bi = [self.extract({"patches": [patchify(xs[b], k)], "grid": grid[b][None],
                                 "k": torch.tensor([k], device=x.device), "spacing": spacing[b:b + 1].float()})["bi"][0]
                   for b, k in enumerate(ks)]
         out = []
         for b, k in enumerate(ks):
-            g = grid[b].tolist()
+            g, v = grid[b].tolist(), V[b]
             tok = bi[b][: int(grid[b].prod())]
             if self.unique:
                 tok = tok[:, : tok.shape[1] // 2]
@@ -102,9 +110,9 @@ class SegNet(nn.Module):
             if self.kernel:
                 emb, z = self.encoder.patch_embed, z[0].flatten(1).T                      # [N, c]
                 for i in range(self.refine):
-                    z, k, g = self.to_fine(z, x[b, 0], spacing[b], k, g, i)
+                    z, k, g = self.to_fine(z, xs[b], spacing[b], k, g, i)
                     emb = self.fine[i][0].patch_embed
-                out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : T[0], : T[1], : T[2]])
+                out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : v[0], : v[1], : v[2]])
                 continue
             # in slabs along the first axis: with coarse voxels a tile holds 10^4-10^5 tokens and 16^3 cells each
             s = max(1, (1 << 25) // (DECODE ** 3 * g[1] * g[2] * max(self.decode.decode[-1].out_channels, 1)))
@@ -113,8 +121,9 @@ class SegNet(nn.Module):
                 return F.interpolate(self.decode(zz), size=[zz.shape[2] * kk[0], gg[1] * kk[1], gg[2] * kk[2]],
                                      mode="trilinear", align_corners=False)
             m = torch.cat([checkpoint(slab, z[:, :, i:i + s], use_reentrant=False) for i in range(0, g[0], s)], 2)
-            out.append(m[0, :, : T[0], : T[1], : T[2]])
-        return torch.stack(out)
+            out.append(m[0, :, : v[0], : v[1], : v[2]])
+        return torch.stack([F.pad(o, [p for v, t in zip(reversed(o.shape[1:]), reversed(T)) for p in (0, t - v)])
+                            for o in out])
 
     def to_fine(self, z, vol, sp, k, g, i):
         """Tokens [N, c] on grid g -> [Nf, 128] on the grid of half the patch (parent token + the voxels' embedding),
@@ -206,6 +215,8 @@ class SFC(Wrapper):
     def seg_input(self, prepared: dict):
         a, c = prepared["value"]
         return (prepared["volume"].float() * a + c)[None], prepared["meta"]["source_to_input"].numpy()
+
+    seg_extent = True   # segrun appends the scan's shape to the context (SegNet reads no padding)
 
     def seg_context(self, prepared: dict) -> torch.Tensor:
         return prepared["spacing"]
