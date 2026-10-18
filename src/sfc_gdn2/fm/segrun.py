@@ -221,9 +221,12 @@ def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
     ce = F.cross_entropy(logits.float(), y, ignore_index=255)
     ok = (y != 255).unsqueeze(1).float()
     p = logits.float().softmax(1) * ok
-    t = F.one_hot(torch.where(y == 255, 0, y), k).permute(0, 4, 1, 2, 3).float() * ok
-    dims = (0, 2, 3, 4)
-    dice = (2 * (p * t).sum(dims)[1:] + 1e-5) / (p.sum(dims)[1:] + t.sum(dims)[1:] + 1e-5)
+    # soft Dice per class without a one-hot target (the same sums: with ~50 classes on a 160^3 batch of 2 the int64
+    # one-hot and its float copies took ~6 GB, GPU OOM for decoder F on TotalSeg, 18/10)
+    yc = torch.where(y == 255, 0, y)
+    inter = p.new_zeros(k).scatter_add(0, yc.flatten(), p.gather(1, yc.unsqueeze(1)).flatten())   # p is 0 off `ok`
+    tsum = p.new_zeros(k).scatter_add(0, yc.flatten(), ok.flatten())
+    dice = (2 * inter[1:] + 1e-5) / (p.sum((0, 2, 3, 4))[1:] + tsum[1:] + 1e-5)
     return ce + 1 - dice.mean()
 
 
