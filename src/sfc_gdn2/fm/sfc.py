@@ -55,7 +55,8 @@ class SegNet(nn.Module):
                  context: bool = False, tta: bool = False, neighbors: bool = False, kernel: bool = False,
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
-                 fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False):
+                 fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
+                 refine_frac: float = 1.0):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -111,6 +112,9 @@ class SegNet(nn.Module):
             # fine_encoder (18/10): each fine level also gets the frozen encoder itself run at that level's patch (a
             # model trained at several resolutions reads every scale: the same tokens), through the level-0 projection
             self.fine_tok = nn.ModuleList(nn.Linear(c, 128) for _ in range(self.refine)) if fine_encoder else None
+            # refine_frac < 1 (18/10, adaptive): the encoder re-reads only the children of that share of the parent cells
+            # that differ most from their neighbours (an edge, no label needed); the others keep the parent token
+            self.refine_frac, self.enc_curves = float(refine_frac), list(curves)
             c = 128
         if self.kernel:
             self.coef = nn.Sequential(nn.Linear(c, 64), nn.GELU(), nn.Linear(64, n_out * encoder.patch_embed.rank ** 3))
@@ -176,7 +180,7 @@ class SegNet(nn.Module):
         par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
         par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
         t = self.up[i](z)[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]]
-        if self.fine_tok is not None:   # the encoder at this level's patch (frozen; curves and taps as level 0)
+        if self.fine_tok is not None and self.refine_frac >= 1:   # the encoder at this level's patch (frozen; curves, taps as level 0)
             pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
             pe.patch_mm = self.fine_mm[i]
             with torch.no_grad():
@@ -185,6 +189,21 @@ class SegNet(nn.Module):
             pe.patch_mm = mm0
             bf = bf[:, : bf.shape[1] // 2] if self.unique else bf
             t = t + self.fine_tok[i](self.proj(bf))
+        elif self.fine_tok is not None:   # adaptive: only the children of the most edge-like parents, read as one sequence
+            zg = z.T.reshape(1, -1, *g)
+            edge = (zg - F.avg_pool3d(F.pad(zg, (1,) * 6, mode="replicate"), 3, 1)).norm(dim=1).flatten()   # [N parents]
+            top = edge >= edge.quantile(1 - self.refine_frac)
+            sel = top[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]].nonzero()[:, 0]
+            if len(sel):
+                pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
+                pe.patch_mm = self.fine_mm[i]
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    x = pe(patchify(vol.float(), kf)[sel], pe.weights(sp.float(), kf))
+                    cu1 = torch.tensor([0, len(sel)], device=z.device, dtype=torch.int32)
+                    bf = sum(self.encoder.flat(x[o], cu1).float()[o.argsort()]
+                             for o in (keys(c, xyz[sel], gf, self.seed).argsort() for c in self.enc_curves)) / len(self.enc_curves)
+                pe.patch_mm = mm0
+                t = t.index_add(0, sel, self.fine_tok[i](self.proj(bf)))
         if self.image and self.enc_img is not None:
             pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
             pe.patch_mm = self.fine_mm[i]
@@ -304,7 +323,8 @@ class SFC(Wrapper):
                      image=bool(self.args.get("image")), fine_curves=self.args.get("fine_curves"), rough=bool(self.args.get("rough")),
                      zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
                      erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"),
-                     image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")))
+                     image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")),
+                     refine_frac=float(self.args.get("refine_frac") or 1.0))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
