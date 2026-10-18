@@ -318,6 +318,7 @@ def train(job: dict) -> None:
                 m.eval()
 
         set_mode()
+        skipped = 0
         for it in range(start, iters + 1):
             x, y, c = data.sample(int(job["batch"]))
             with amp():
@@ -325,8 +326,10 @@ def train(job: dict) -> None:
             loss = loss_fn(logits, y.to(dev), k)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 12)
-            opt.step()
+            if torch.isfinite(torch.nn.utils.clip_grad_norm_(params, 12)):   # a non-finite step would poison every
+                opt.step()                                                    # weight for good (stroke, decoder F, 18/10)
+            else:
+                skipped += 1
             sched.step()
             if it % every == 0 or it == iters:
                 net.eval()
@@ -334,7 +337,7 @@ def train(job: dict) -> None:
                               v["y"].to(dev), k) for v in val_v]
                 val = float(np.nanmean(ds))
                 curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
-                print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} ({(time.time() - t0) / 60:.1f} min)",
+                print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} skipped {skipped} ({(time.time() - t0) / 60:.1f} min)",
                       flush=True)
                 if "state" not in best or val > best["val"]:
                     best = {"val": val, "iter": it, "state": trained()}
