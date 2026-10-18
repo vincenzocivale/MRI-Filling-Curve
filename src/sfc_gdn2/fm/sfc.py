@@ -31,11 +31,21 @@ from .base import Image, Wrapper
 
 SEG_PATCH = (160, 160, 160)   # voxels, as the Primus / nnFoundation ViT runs
 DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
-# refine blocks read their curve in segments of 8^4 tokens (cubes of 16 fine tokens on Hilbert): GDN-2's channel-wise
-# erase makes its state transition non-normal (|I - k (b*k)^T| can exceed 1), and one 64000-token sequence (4 mm level
-# of a 1 mm scan) grew the state past fp32 (stroke, 18/10; the exact recurrence too); the parent token already carries
-# the tile's context
-FINE_SEG = 4096
+
+
+class HeadErase(nn.Module):
+    """A GDN-2 mixer's b_proj with one erase gate per head (KDA's), broadcast over the head's key channels. GDN-2's
+    channel-wise erase makes the state transition I - k (b*k)^T non-normal: any direction off k is amplified, and on one
+    64000-token sequence (decoder F's 4 mm level, a 1 mm stroke scan, 18/10) the state grew past fp32, the exact
+    recurrence too. With b = beta * 1 and |k| = 1 (the kernel's l2norm) it is I - beta k k^T, eigenvalues in
+    [1 - beta, 1]: the state cannot grow, whatever the weights or the length. The write gate stays per channel."""
+
+    def __init__(self, mix: nn.Module):
+        super().__init__()
+        self.proj, self.dk = nn.Linear(mix.b_proj.in_features, mix.num_heads, bias=False), mix.head_k_dim
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.proj(h).repeat_interleave(self.dk, -1)
 
 
 class SegNet(nn.Module):
@@ -44,7 +54,7 @@ class SegNet(nn.Module):
     def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int, embed_only: bool = False,
                  context: bool = False, tta: bool = False, neighbors: bool = False, kernel: bool = False,
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
-                 zoom: bool = False):
+                 zoom: bool = False, fine_seg: int = 0, erase: str = "channel"):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -71,12 +81,17 @@ class SegNet(nn.Module):
         # each by a 2-block GDN-2 Encoder per curve of `fine_curves` (in turn), decoded in the last one's KernelEmbed basis;
         # image: + that KernelEmbed of the voxels at each scale (rough: without the 1/f gain, sharper edges).
         self.kernel, self.refine, self.image, self.seed = kernel or bool(refine), int(refine), image, seed
+        self.fine_seg = int(fine_seg)   # 0: one sequence per tile; n: segments of n tokens along the curve
         self.fine_curves = list(fine_curves or ["hilbert"])
         if self.refine:
             from ..model import Encoder
             self.fine = nn.ModuleList(nn.ModuleList(Encoder(128, 2, 64, 2, bidir="alternate", patch_mm=patch_mm / 2 ** i,
                                                             freq_decay=0.0 if rough else 1.0) for _ in self.fine_curves)
                                       for i in range(1, self.refine + 1))
+            if erase == "head":   # HeadErase: refine blocks whose state cannot diverge
+                for m in self.fine.modules():
+                    if hasattr(m, "b_proj") and hasattr(m, "head_k_dim"):
+                        m.b_proj = HeadErase(m)
             self.up = nn.ModuleList([nn.Linear(c, 128)] + [nn.Linear(128, 128) for _ in range(self.refine - 1)])
             # zoom: the image at each scale through the encoder's own (frozen) patch kernel, zoomed onto the cell (its
             # voxels at 2^i x their spacing fill one 16 mm patch: exact, nothing resampled), projected to 128
@@ -154,8 +169,7 @@ class SegNet(nn.Module):
         elif self.image:
             e = self.fine[i][0].patch_embed
             t = t + e(patchify(vol.float(), kf), e.weights(sp.float(), kf))
-        # segments of FINE_SEG tokens along each curve: one sequence over a whole tile diverged (below)
-        cu = torch.tensor([*range(0, len(t), FINE_SEG), len(t)], device=z.device, dtype=torch.int32)
+        cu = torch.tensor([*range(0, len(t), self.fine_seg or len(t)), len(t)], device=z.device, dtype=torch.int32)
         for curve, enc in zip(self.fine_curves, self.fine[i]):
             order = keys(curve, xyz, gf, self.seed).argsort()
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -255,7 +269,8 @@ class SFC(Wrapper):
                      tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")),
                      kernel=bool(self.args.get("kernel")), refine=int(self.args.get("refine") or 0),
                      image=bool(self.args.get("image")), fine_curves=self.args.get("fine_curves"), rough=bool(self.args.get("rough")),
-                     zoom=bool(self.args.get("zoom")))
+                     zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
+                     erase=self.args.get("erase") or "channel")
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
