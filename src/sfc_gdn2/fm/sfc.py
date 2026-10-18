@@ -55,7 +55,7 @@ class SegNet(nn.Module):
                  context: bool = False, tta: bool = False, neighbors: bool = False, kernel: bool = False,
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
-                 fine_mm: list | None = None):
+                 fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -100,6 +100,17 @@ class SegNet(nn.Module):
             # zoom: the image at each scale through the encoder's own (frozen) patch kernel, zoomed onto the cell (its
             # voxels at 2^i x their spacing fill one 16 mm patch: exact, nothing resampled), projected to 128
             self.zoom = nn.ModuleList(nn.Linear(encoder.dim, 128) for _ in range(self.refine)) if zoom else None
+            # image_kernel "encoder" (18/10): the image at each fine level through the encoder's own frozen kernel applied
+            # to the fine cell (its patch size set to the cell's: with basis bspline the exact refinement of the
+            # encoder's family, with fourier the same physical frequencies over a smaller window), projected to 128,
+            # instead of a kernel of the decoder's own
+            assert image_kernel in ("own", "encoder"), image_kernel
+            self.image_kernel = image_kernel
+            self.enc_img = nn.ModuleList(nn.Linear(encoder.dim, 128) for _ in range(self.refine)) \
+                if image and image_kernel == "encoder" else None
+            # fine_encoder (18/10): each fine level also gets the frozen encoder itself run at that level's patch (a
+            # model trained at several resolutions reads every scale: the same tokens), through the level-0 projection
+            self.fine_tok = nn.ModuleList(nn.Linear(c, 128) for _ in range(self.refine)) if fine_encoder else None
             c = 128
         if self.kernel:
             self.coef = nn.Sequential(nn.Linear(c, 64), nn.GELU(), nn.Linear(64, n_out * encoder.patch_embed.rank ** 3))
@@ -165,7 +176,23 @@ class SegNet(nn.Module):
         par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
         par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
         t = self.up[i](z)[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]]
-        if self.image and self.zoom is not None:
+        if self.fine_tok is not None:   # the encoder at this level's patch (frozen; curves and taps as level 0)
+            pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
+            pe.patch_mm = self.fine_mm[i]
+            with torch.no_grad():
+                bf = self.extract({"patches": [patchify(vol.float(), kf)], "grid": gf[None], "k": torch.tensor([kf], device=z.device),
+                                   "spacing": sp[None].float()})["bi"][0, : len(xyz)]
+            pe.patch_mm = mm0
+            bf = bf[:, : bf.shape[1] // 2] if self.unique else bf
+            t = t + self.fine_tok[i](self.proj(bf))
+        if self.image and self.enc_img is not None:
+            pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
+            pe.patch_mm = self.fine_mm[i]
+            with torch.no_grad():
+                im = pe(patchify(vol.float(), kf), pe.weights(sp.float(), kf))
+            pe.patch_mm = mm0
+            t = t + self.enc_img[i](im)
+        elif self.image and self.zoom is not None:
             e = self.encoder.patch_embed
             with torch.no_grad():
                 im = e(patchify(vol.float(), kf), e.weights(sp.float() * (self.patch_mm / self.fine_mm[i]), kf))
@@ -225,6 +252,8 @@ class SFC(Wrapper):
 
         self.ckpt = checkpoint_path(cfg["checkpoint"], self.args.get("step"))
         self.run_cfg = load_yaml(self.ckpt.parent / "config.yaml")
+        if self.args.get("patch_mm"):  # read at another patch size (18/10: a model trained at several resolutions)
+            self.run_cfg["data"]["patch_mm"] = float(self.args["patch_mm"])
         self.curves = list(self.args.get("curves") or self.run_cfg["objective"]["view_curves"])
         self._extract = None  # built on first use: preprocessing workers never load GDN-2
 
@@ -274,7 +303,8 @@ class SFC(Wrapper):
                      kernel=bool(self.args.get("kernel")), refine=int(self.args.get("refine") or 0),
                      image=bool(self.args.get("image")), fine_curves=self.args.get("fine_curves"), rough=bool(self.args.get("rough")),
                      zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
-                     erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"))
+                     erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"),
+                     image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

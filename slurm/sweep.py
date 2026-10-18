@@ -75,7 +75,8 @@ def evaluation(spec: dict, ckpt: Path, run: Path, gpus: int) -> list[str]:
         lines.append(f"python -c {shlex.quote(code)} & c=$!")
     if d := spec.get("dense"):
         seg = [f"sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --tasks {d['task']}"
-               f" --iters {d['iters']} --val-only {fm} {a} --override segdec.out={run}/{out}" for out, a in SEGDEC]
+               f" --iters {d['iters']} --val-only {fm} {a} --override segdec.out={run}/{out}"
+               for out, a in (*SEGDEC, *map(tuple, spec.get("segdec_extra", [])))]   # + the spec's own decoders
         lines += [f"CUDA_VISIBLE_DEVICES={g} bash -c {shlex.quote(' ; '.join(seg[g::gpus]))} & s{g}=$!" for g in range(gpus)]
         lines += [f"wait $s{g} || true" for g in range(gpus)]  # a failed pilot must not skip the probe
     if spec.get("tasks"):

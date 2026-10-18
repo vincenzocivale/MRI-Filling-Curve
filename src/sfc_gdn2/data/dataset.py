@@ -168,7 +168,8 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, sessions, seed: int 
     common = {"num_workers": workers, "pin_memory": True, "persistent_workers": workers > 0,
               "prefetch_factor": prefetch if workers else None}
     rows = rows.reset_index(drop=True)
-    sizes = [n_patch(tuple(map(int, s.split("x"))), tuple(map(float, z.split("x"))), data["patch_mm"])
+    budget_mm = data.get("budget_patch_mm") or data["patch_mm"]  # with patch_mm_choices: the smallest (most tokens)
+    sizes = [n_patch(tuple(map(int, s.split("x"))), tuple(map(float, z.split("x"))), budget_mm)
              for s, z in zip(rows["shape"], rows["spacing"])]
     weights = mix_weights(rows, data.get("mix_by", ["dataset", "modality"]), float(data.get("mix_alpha", 1.0)))
     ds = PatchDataset(rows, data["patch_mm"], sizes)

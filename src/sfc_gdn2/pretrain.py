@@ -32,6 +32,17 @@ def pretrain_rows(cfg: dict) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def repatch(batch: dict, mm: float) -> dict:
+    """The batch's scans cut into patches of `mm` (data.patch_mm_choices, 18/10: one model at every resolution).
+    The objective's geometry stays in tokens (views, masks, cell levels), so its physical size scales with the patch,
+    as FlexiViT's; the kernel takes the patch size (`KernelEmbed.patch_mm`) and, with basis bspline, the cell's own
+    coordinate."""
+    from .data.volume import patch_dims, patch_grid
+    k = [patch_dims(s, mm) for s in batch["spacing"].tolist()]
+    grid = torch.stack([patch_grid(tuple(v.shape[:3]), kk) for v, kk in zip(batch["volumes"], k)])
+    return batch | {"k": torch.tensor(k), "grid": grid}
+
+
 def lr_factor(step: int, t: dict) -> float:
     """Linear warmup, then `schedule`: cosine to 0 at `steps`, or wsd (warmup-stable-decay): constant until the
     last `decay_steps`, then 1 - sqrt to 0 (Hägele et al. 2024). WSD's decay can start from any checkpoint of
@@ -206,6 +217,10 @@ class Pretrainer:
             t_w = time.time()
             batch = next(batches)   # the previous step already synced (isfinite(gnorm)): this wait is a GPU stall
             wait += time.time() - t_w
+            if choices := self.cfg["data"].get("patch_mm_choices"):  # one patch size per step, the same on every rank
+                mm = float(choices[(self.seed * 1_000_003 + step) % len(choices)])
+                batch = repatch(batch, mm)
+                self.net.encoder.patch_embed.patch_mm = mm
             patches += int(batch["grid"].prod(1).sum())
             gen.manual_seed((self.seed * 1_000_003 + step) * 4096 + self.rank)  # resumable on any number of GPUs
             with torch.autocast("cuda", dtype=torch.bfloat16):

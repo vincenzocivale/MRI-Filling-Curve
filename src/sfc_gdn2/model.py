@@ -153,6 +153,23 @@ def long_memory(mix: nn.Module, channels: int, half_life: tuple[float, float]) -
         mix.dt_bias.view(mix.num_heads, mix.head_k_dim)[:, :channels] = dt + torch.log(-torch.expm1(-dt))  # softplus^-1
 
 
+def bspline_basis(u: torch.Tensor, m: int, p: int = 3) -> torch.Tensor:
+    """[n] points in [0, 1] -> [n, m] clamped B-splines of degree p on uniform knots (Cox-de Boor). Refinable: the
+    space on [0, 1] restricted to a half is inside the same family on that half (its knots are a subset), so a cell's
+    basis is an exact linear map of its children's (the two-scale relation of wavelets)."""
+    inner = torch.linspace(0, 1, m - p + 1, device=u.device)[1:-1]
+    t = torch.cat([u.new_zeros(p + 1), inner, u.new_ones(p + 1)])
+    u = u.clamp(0, 1 - 1e-6)
+    B = ((t[None, :-1] <= u[:, None]) & (u[:, None] < t[None, 1:])).float()          # degree 0: [n, len(t) - 1]
+    for q in range(1, p + 1):
+        lo, hi = t[: len(t) - q - 1], t[q: len(t) - 1]
+        left = torch.where(hi > lo, (u[:, None] - lo) / (hi - lo).clamp_min(1e-12), u.new_zeros(()))
+        lo2, hi2 = t[1: len(t) - q], t[q + 1:]
+        right = torch.where(hi2 > lo2, (hi2 - u[:, None]) / (hi2 - lo2).clamp_min(1e-12), u.new_zeros(()))
+        B = left * B[:, :-1] + right * B[:, 1:]
+    return B
+
+
 class KernelEmbed(nn.Module):
     """Patch embedding for native voxels of any spacing: a learned continuous kernel K: mm^3 -> R^d,
     integrated over each voxel's physical extent,
@@ -168,13 +185,16 @@ class KernelEmbed(nn.Module):
     `freq_decay` a: the Fourier feature at f is scaled by min(1, f0 / f)^a, f0 = one cycle per patch (a = 1: the 1/f
     amplitude of natural images). A fixed gain, not an init, so AdamW's steps cannot re-roughen the curves. With a = 0
     (all features equal, the runs before 14/10) the curves are rough down to 0.25 mm and the tokens of one patch
-    change with the voxel size (notes/kernel_trained.py, notes/kernel_init_check.py)."""
+    change with the voxel size (notes/kernel_trained.py, notes/kernel_init_check.py).
+    basis "bspline" (18/10): phi = rank fixed cubic B-splines per axis in the cell's own coordinate (0..1), no Fourier
+    features: one kernel for every cell size, refinable (`bspline_basis`); with G it is a learned combination of them."""
 
     def __init__(self, d: int, patch_mm: float = 16.0, rank: int = 16, freqs: int = 32, hidden: int = 128,
                  max_cycles_per_mm: float = 4.0, quad_mm: float = 0.02, freq_decay: float = 0.0,
-                 freq_patch_mm: float | None = None):
+                 freq_patch_mm: float | None = None, basis: str = "fourier"):
         super().__init__()
-        self.patch_mm, self.rank, self.quad_mm = patch_mm, rank, quad_mm
+        assert basis in ("fourier", "bspline"), basis
+        self.patch_mm, self.rank, self.quad_mm, self.basis = patch_mm, rank, quad_mm, basis
         # the Fourier grid and its 1/f gain (not saved: rebuilt from this) in mm, fixed by the patch the kernel was
         # trained at: a trained kernel moved to another patch (16 -> 12 mm, 18/10) keeps measuring the same physical
         # frequencies over a smaller window; rebuilt from the new patch, phi would get other inputs (another kernel)
@@ -187,6 +207,9 @@ class KernelEmbed(nn.Module):
         # `weights`, not in G: AdamW steps are ~lr in absolute size, so G at std ~16 learned ~250x slower than the
         # other matrices (renamed from G: an old checkpoint fails to load instead of embedding 1000x off)
         self.G_unit = nn.Parameter(torch.randn(d, rank, rank, rank) / rank ** 1.5)
+        if basis == "bspline":  # B-splines sum to 1 with integrals ~extent / rank: the same ~0.5 std at init
+            nn.init.normal_(self.G_unit, std=0.5 * rank ** 1.5 / 1000)
+            del self.phi
         self.bias = nn.Parameter(torch.zeros(d))
 
     def axis_integrals(self, spacing: torch.Tensor, k) -> list[torch.Tensor]:
@@ -195,8 +218,11 @@ class KernelEmbed(nn.Module):
         for a, (s, n) in enumerate(zip(spacing.tolist(), k)):
             q = max(1, math.ceil(s / self.quad_mm))
             t = (torch.arange(int(n) * q, device=self.freqs.device, dtype=torch.float32) + 0.5) * (s / q)
-            ft = t[:, None] * self.freqs
-            phi = self.phi(torch.cat([ft.sin(), ft.cos()], -1) * self.gain)[:, a * self.rank:(a + 1) * self.rank]
+            if self.basis == "bspline":   # the cell's own coordinate in [0, 1]: one family for every cell size
+                phi = bspline_basis(t / (int(n) * s), self.rank)
+            else:
+                ft = t[:, None] * self.freqs
+                phi = self.phi(torch.cat([ft.sin(), ft.cos()], -1) * self.gain)[:, a * self.rank:(a + 1) * self.rank]
             out.append(phi.view(int(n), q, self.rank).mean(1) * s)
         return out
 
