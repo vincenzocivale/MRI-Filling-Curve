@@ -54,7 +54,8 @@ class SegNet(nn.Module):
     def __init__(self, encoder, curves: list[str], seed: int, patch_mm: float, n_out: int, embed_only: bool = False,
                  context: bool = False, tta: bool = False, neighbors: bool = False, kernel: bool = False,
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
-                 zoom: bool = False, fine_seg: int = 0, erase: str = "channel"):
+                 zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
+                 fine_mm: list | None = None):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -82,12 +83,15 @@ class SegNet(nn.Module):
         # image: + that KernelEmbed of the voxels at each scale (rough: without the 1/f gain, sharper edges).
         self.kernel, self.refine, self.image, self.seed = kernel or bool(refine), int(refine), image, seed
         self.fine_seg = int(fine_seg)   # 0: one sequence per tile; n: segments of n tokens along the curve
+        # the refine levels' patch (mm): halvings of the encoder's patch, or fixed sizes (fine_mm, e.g. [8, 4] under
+        # 12 mm tokens: a parent/child ratio of 1.5 per axis, children found by position as for anisotropic voxels)
+        self.fine_mm = [float(m) for m in fine_mm] if fine_mm else [patch_mm / 2 ** i for i in range(1, int(refine) + 1)]
         self.fine_curves = list(fine_curves or ["hilbert"])
         if self.refine:
             from ..model import Encoder
-            self.fine = nn.ModuleList(nn.ModuleList(Encoder(128, 2, 64, 2, bidir="alternate", patch_mm=patch_mm / 2 ** i,
+            self.fine = nn.ModuleList(nn.ModuleList(Encoder(128, 2, 64, 2, bidir="alternate", patch_mm=self.fine_mm[i],
                                                             freq_decay=0.0 if rough else 1.0) for _ in self.fine_curves)
-                                      for i in range(1, self.refine + 1))
+                                      for i in range(self.refine))
             if erase == "head":   # HeadErase: refine blocks whose state cannot diverge
                 for m in self.fine.modules():
                     if hasattr(m, "b_proj") and hasattr(m, "head_k_dim"):
@@ -155,7 +159,7 @@ class SegNet(nn.Module):
         from ..curves import grid_coords, keys
         from ..data.volume import patch_dims, patch_grid, patchify
 
-        kf = patch_dims(sp.tolist(), self.patch_mm / 2 ** (i + 1))
+        kf = patch_dims(sp.tolist(), self.fine_mm[i])
         gf = patch_grid(vol.shape, kf).to(z.device)
         xyz = grid_coords(gf[None], int(gf.prod()))[0]                                    # [Nf, 3] raster
         par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
@@ -164,7 +168,7 @@ class SegNet(nn.Module):
         if self.image and self.zoom is not None:
             e = self.encoder.patch_embed
             with torch.no_grad():
-                im = e(patchify(vol.float(), kf), e.weights(sp.float() * 2 ** (i + 1), kf))
+                im = e(patchify(vol.float(), kf), e.weights(sp.float() * (self.patch_mm / self.fine_mm[i]), kf))
             t = t + self.zoom[i](im)
         elif self.image:
             e = self.fine[i][0].patch_embed
@@ -270,7 +274,7 @@ class SFC(Wrapper):
                      kernel=bool(self.args.get("kernel")), refine=int(self.args.get("refine") or 0),
                      image=bool(self.args.get("image")), fine_curves=self.args.get("fine_curves"), rough=bool(self.args.get("rough")),
                      zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
-                     erase=self.args.get("erase") or "channel")
+                     erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
