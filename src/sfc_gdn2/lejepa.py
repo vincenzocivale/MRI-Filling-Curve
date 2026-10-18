@@ -585,7 +585,7 @@ class LeJEPA(nn.Module):
             ok4 = min(k) >= 4
             # which patches (and sub-blocks) go finer: all of the paired ones, or the top scored (+ some at random)
             if self.child_adaptive:
-                s1 = self.child_score[0](bi[rows].detach()).squeeze(-1)    # from A's own token, no grad to the encoder
+                s1 = self.child_score[0](bi[rows].detach()).squeeze(-1).float()   # A's own token, no grad to the encoder
                 n1 = max(1, round(self.child_frac[0] * len(rows)))
                 r = torch.rand(len(rows), device=dev, generator=gen) < self.child_explore
                 top = (s1 + 1e4 * r).topk(min(n1, len(rows))).indices
@@ -598,7 +598,7 @@ class LeJEPA(nn.Module):
             if self.child == 2 and ok4:   # which 8 mm sub-blocks of the refined patches go to 4 mm
                 ref = lv[0].nonzero()[:, 0]
                 if self.child_adaptive:
-                    s2 = self.child_score[1](bi[rows].detach()[:, None] + self.child_slot[0].detach()[None])
+                    s2 = self.child_score[1](bi[rows].detach()[:, None] + self.child_slot[0].detach()[None]).float()
                     sc = torch.full((len(pc), 8), -1e9, device=dev)
                     sc[loc] = s2.squeeze(-1)
                     sc = sc[ref].flatten()
@@ -683,11 +683,11 @@ class LeJEPA(nn.Module):
                         torch.zeros(len(bi), device=dev).index_add_(0, ar, torch.ones_like(er)).clamp_min(1)
                     u = torch.unique(ar)
                     sb = bi[u].detach()
-                    score_loss = (self.child_score[0](sb).squeeze(-1) - per[u]).square().mean()
+                    score_loss = (self.child_score[0](sb).squeeze(-1).float() - per[u]).square().mean()
                 else:
                     sl = up8[torch.cat([s for _, s in err_at])]             # their 8 mm parent sub-block
                     sb = bi[ar].detach() + self.child_slot[0].detach()[sl]
-                    score_loss = (self.child_score[1](sb).squeeze(-1) - er).square().mean()
+                    score_loss = (self.child_score[1](sb).squeeze(-1).float() - er).square().mean()
             out[name] = (zp, zt, score_loss)
         return out
 
