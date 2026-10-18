@@ -66,7 +66,7 @@ def evaluation(spec: dict, ckpt: Path, run: Path, gpus: int) -> list[str]:
     tuning extraction split over the GPUs (--shard); on the CPU the probe's readings (`probe.readings`: means of the
     last and intermediate blocks, stds, covariance square roots, the 2x-reading means) while the GPUs share the SEGDEC
     pilots; then the probe over every reading on all GPUs. `collect` keeps the best val Dice."""
-    fm, lines = f"--fm-set checkpoint={ckpt}", []
+    fm, lines = f"--fm-set checkpoint={ckpt} {spec.get('eval_fm', '')}".rstrip(), []  # eval_fm: e.g. args.patch_mm=12
     if spec.get("tasks"):
         lines += [f"CUDA_VISIBLE_DEVICES={g} sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune {fm}"
                   f" --shard {g}/{gpus} --out {run}/features & x{g}=$!" for g in range(gpus)]
@@ -111,6 +111,8 @@ def reevaluate(spec: dict, root: Path, name: str) -> None:
     slurm = (spec.get("slurm") or {}) | {"time": "08:00:00"}
     gpus = int(str(slurm.get("gres", "gpu:1")).split(":")[-1])
     for i in range(len(spec.get("runs") or range(spec.get("n", 0)))):
+        if spec.get("eval_runs") is not None and i not in spec["eval_runs"]:
+            continue
         run = root / f"{i:02d}"
         out = run / name
         out.mkdir(parents=True, exist_ok=True)
