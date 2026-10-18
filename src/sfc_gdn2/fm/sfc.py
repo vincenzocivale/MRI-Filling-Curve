@@ -104,8 +104,10 @@ class SegNet(nn.Module):
                     emb = self.fine[i][0].patch_embed
                 out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : T[0], : T[1], : T[2]])
                 continue
-            m = self.decode(z)                                                            # [1, n_out, 16 g]
-            m = F.interpolate(m, size=[a * c for a, c in zip(k, g)], mode="trilinear", align_corners=False)
+            # in slabs along the first axis: with coarse voxels a tile holds 10^4-10^5 tokens and 16^3 cells each
+            s = max(1, (1 << 27) // (DECODE ** 3 * g[1] * g[2] * max(self.decode.decode[-1].out_channels, 1)))
+            m = torch.cat([F.interpolate(self.decode(z[:, :, i:i + s]), size=[min(s, g[0] - i) * k[0], g[1] * k[1], g[2] * k[2]],
+                                         mode="trilinear", align_corners=False) for i in range(0, g[0], s)], 2)
             out.append(m[0, :, : T[0], : T[1], : T[2]])
         return torch.stack(out)
 

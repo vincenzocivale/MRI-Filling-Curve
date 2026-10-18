@@ -545,12 +545,16 @@ class LeJEPA(nn.Module):
             pc = c0 + cc[:, None] * 2 + off[None]                                            # [Nc,8,3] its patches
             inside = ((pc < g) & (pc < c0 + e0)).all(-1)
             pid = ((pc[..., 0] * g[1] + pc[..., 1]) * g[2] + pc[..., 2]).clamp(max=int(g.prod()) - 1)
-            blk = (vols["patches"][b][pid].float() * inside[..., None]).view(len(cc), 2, 2, 2, *k)
-            blk = blk.permute(0, 1, 4, 2, 5, 3, 6).reshape(len(cc), -1)                     # x-major voxels of the block
             if (key := (*sp, *k)) not in memo:
                 memo[key] = self.encoder.patch_embed.weights(torch.tensor(sp, device=dev) / 2, [2 * n for n in k])
-            w = memo[key]
-            t = self.encoder.patch_embed(blk, w) + self.coarse_scale
+            w, x = memo[key], vols["patches"][b]
+
+            def emb(pid, inside, w=w, x=x, k=k):   # 2^3 patches' voxels as one x-major block -> its token
+                blk = (x[pid].float() * inside[..., None]).view(len(pid), 2, 2, 2, *k)
+                return self.encoder.patch_embed(blk.permute(0, 1, 4, 2, 5, 3, 6).reshape(len(pid), -1), w)
+            n = max(1, self.embed_chunk_voxels // w.shape[0])     # chunks recomputed in backward: memory ~ blocks
+            t = torch.cat([checkpoint(emb, pid[i:i + n], inside[i:i + n], use_reentrant=False)
+                           for i in range(0, len(pid), n)]) + self.coarse_scale
             order = keys("hilbert", cc, ec, self.seed).argsort()
             seqs.append(t[order])
             fgs.append((fg[b][pid] & inside).any(1)[order])
