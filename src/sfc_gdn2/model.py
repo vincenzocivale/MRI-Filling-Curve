@@ -171,12 +171,17 @@ class KernelEmbed(nn.Module):
     change with the voxel size (notes/kernel_trained.py, notes/kernel_init_check.py)."""
 
     def __init__(self, d: int, patch_mm: float = 16.0, rank: int = 16, freqs: int = 32, hidden: int = 128,
-                 max_cycles_per_mm: float = 4.0, quad_mm: float = 0.02, freq_decay: float = 0.0):
+                 max_cycles_per_mm: float = 4.0, quad_mm: float = 0.02, freq_decay: float = 0.0,
+                 freq_patch_mm: float | None = None):
         super().__init__()
         self.patch_mm, self.rank, self.quad_mm = patch_mm, rank, quad_mm
-        f = torch.logspace(math.log10(1 / (4 * patch_mm)), math.log10(max_cycles_per_mm), freqs)
+        # the Fourier grid and its 1/f gain (not saved: rebuilt from this) in mm, fixed by the patch the kernel was
+        # trained at: a trained kernel moved to another patch (16 -> 12 mm, 18/10) keeps measuring the same physical
+        # frequencies over a smaller window; rebuilt from the new patch, phi would get other inputs (another kernel)
+        fp = freq_patch_mm or patch_mm
+        f = torch.logspace(math.log10(1 / (4 * fp)), math.log10(max_cycles_per_mm), freqs)
         self.register_buffer("freqs", 2 * math.pi * f, persistent=False)
-        self.register_buffer("gain", ((1 / (patch_mm * f)).clamp(max=1) ** freq_decay).repeat(2), persistent=False)
+        self.register_buffer("gain", ((1 / (fp * f)).clamp(max=1) ** freq_decay).repeat(2), persistent=False)
         self.phi = nn.Sequential(nn.Linear(2 * freqs, hidden), nn.GELU(), nn.Linear(hidden, 3 * rank))
         # init: a constant patch of 1s gives tokens of std ~0.5 at every spacing. The 1000 is a constant in
         # `weights`, not in G: AdamW steps are ~lr in absolute size, so G at std ~16 learned ~250x slower than the
