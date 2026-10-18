@@ -535,7 +535,7 @@ class LeJEPA(nn.Module):
 
     def coarse_tops(self, vols, fg, corner, edge):
         """Each scan's first global B box at twice the patch (coarse_view) -> its foreground mean token [B,2d]."""
-        dev, seqs, fgs = corner.device, [], []
+        dev, seqs, fgs, memo = corner.device, [], [], {}
         off = torch.stack(torch.meshgrid(*(torch.arange(2, device=dev),) * 3, indexing="ij"), -1).view(-1, 3)
         for b in range(len(corner)):
             c0, e0, g = corner[b, 0, 1], edge[b, 0, 1], vols["grid"][b]
@@ -547,7 +547,9 @@ class LeJEPA(nn.Module):
             pid = ((pc[..., 0] * g[1] + pc[..., 1]) * g[2] + pc[..., 2]).clamp(max=int(g.prod()) - 1)
             blk = (vols["patches"][b][pid].float() * inside[..., None]).view(len(cc), 2, 2, 2, *k)
             blk = blk.permute(0, 1, 4, 2, 5, 3, 6).reshape(len(cc), -1)                     # x-major voxels of the block
-            w = self.encoder.patch_embed.weights(torch.tensor(sp, device=dev) / 2, [2 * n for n in k])
+            if (key := (*sp, *k)) not in memo:
+                memo[key] = self.encoder.patch_embed.weights(torch.tensor(sp, device=dev) / 2, [2 * n for n in k])
+            w = memo[key]
             t = self.encoder.patch_embed(blk, w) + self.coarse_scale
             order = keys("hilbert", cc, ec, self.seed).argsort()
             seqs.append(t[order])
@@ -568,6 +570,7 @@ class LeJEPA(nn.Module):
         first = pv % (2 * gl) == 1                                         # the first local group of its scan
         views = torch.unique(pv[first]).tolist()
         F = 2 ** self.child
+        memo = {}   # kernel weights per (spacing, scale, sub-block shape): few distinct, each einsum kept for backward
         up8 = torch.tensor([(a // 2) * 4 + (b2 // 2) * 2 + c // 2 for a in range(4) for b2 in range(4) for c in range(4)], device=dev)
         seqs, metas = [], []
         for j in views:
@@ -630,7 +633,10 @@ class LeJEPA(nn.Module):
                             sel = lv[0] & (sub4[:, c8] if f == 4 else (~sub4[:, c8] if sub4 is not None else True))
                             if not bool(sel.any()):
                                 continue
-                            w = emb.weights(torch.tensor(sp, device=dev) * f, [sizes[0][ox], sizes[1][oy], sizes[2][oz]])
+                            shp = (sizes[0][ox], sizes[1][oy], sizes[2][oz])
+                            if (key := (*sp, f, *shp)) not in memo:
+                                memo[key] = emb.weights(torch.tensor(sp, device=dev) * f, list(shp))
+                            w = memo[key]
                             toks.append(emb(pz[oz][sel].flatten(1), w) + zs)
                             o = box.view(-1, 3)[sel] * F + torch.tensor([ox, oy, oz], device=dev) * (F // f)
                             origin.append(o); size.append(F // f); owner.append(sel.nonzero()[:, 0])
