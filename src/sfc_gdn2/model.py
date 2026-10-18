@@ -317,7 +317,8 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
     crop: only the foreground's bounding box is read, as the training's global views (patches outside: bi 0);
     embed_only: no encoder, bi = the patch embedding twice (what the encoder adds to its input). The view position
     (`Encoder.pos`) is the coordinate inside the box read.
-    both also gives `std` (per channel over the same patches) and `fg` [B,N]. reverse (one-stream encoders): each curve
+    both also gives `std` (per channel over the same patches) and `fg` [B,N], and with several curves each curve's own
+    `mean@<curve>`, `std@<curve>` (the probe menu can read one curve instead of their average). reverse (one-stream encoders): each curve
     is also read from its other end (test-time augmentation, 2x the readings): patch -> `bi` over all of them; both ->
     `bi`, `mean`, `std` as without it plus `bi_tta`, `mean_tta`, `std_tta` over all of them."""
     from .data.dataset import per_patch
@@ -347,6 +348,13 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
         bi = torch.cat([t, t], -1) * inside[..., None] if embed_only else 0
         rv = reverse and not embed_only and encoder.bidir != "late"  # late already reads both ways
         bir = 0
+        w = (fg | (inside & ~fg.any(1, keepdim=True))).float()[..., None]
+
+        def stats(b):  # foreground mean and std per channel
+            m = (w * b).sum(1) / w.sum(1)
+            return m, ((w * (b - m[:, None]) ** 2).sum(1) / w.sum(1)).sqrt()
+
+        per_curve = {}
         for curve in [] if embed_only else curves:
             order = torch.stack([keys(curve, c, d, seed).masked_fill(~m, 1 << 62).argsort()
                                  for c, d, m in zip(local, dims, inside)])  # per volume: no batch-dependent curve
@@ -361,19 +369,16 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
                         hr = encoder.packed(s.gather(1, rev[..., None].expand_as(s)), valid).float()
                         fr = hr.gather(1, rev[..., None].expand(-1, -1, hr.shape[-1])).repeat(1, 1, 2)
             back = order.argsort(1)[..., None]                                 # curve position -> raster
-            bi = bi + fb.gather(1, back.expand(-1, -1, fb.shape[-1])) / len(curves)
+            fb = fb.gather(1, back.expand(-1, -1, fb.shape[-1]))
+            bi = bi + fb / len(curves)
+            if level != "patch" and len(curves) > 1:                           # each curve's own reading (probe menu)
+                per_curve |= dict(zip((f"mean@{curve}", f"std@{curve}"), stats(fb)))
             if rv:
                 bir = bir + fr.gather(1, back.expand(-1, -1, fr.shape[-1])) / len(curves)
         tta = (bi + bir) / 2 if rv else bi
         if level == "patch":
             return {"bi": tta if reverse else bi}
-        w = (fg | (inside & ~fg.any(1, keepdim=True))).float()[..., None]
-
-        def stats(b):  # foreground mean and std per channel
-            m = (w * b).sum(1) / w.sum(1)
-            return m, ((w * (b - m[:, None]) ** 2).sum(1) / w.sum(1)).sqrt()
-
-        (mean, std), out = stats(bi), {}
+        (mean, std), out = stats(bi), per_curve
         if reverse:
             out = dict(zip(("bi_tta", "mean_tta", "std_tta"), (tta, *stats(tta))))
         return {"bi": bi, "mean": mean, "std": std, "fg": fg} | out

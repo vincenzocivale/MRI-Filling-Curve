@@ -306,7 +306,8 @@ class SFC(Wrapper):
 
         bi, g = block(out["bi"][0, : len(x)], 0), grid.tolist()
         feats = {"map": bi.T.reshape(bi.shape[1], *g), "fg": out["fg"][0, : len(x)].view(*g)}  # last block's tokens
-        for stat in ("mean", "std", "mean_tta", "std_tta"):  # per block: last (no suffix), taps (_b<block>)
+        stats = ("mean", "std", "mean_tta", "std_tta", *(k for k in out if "@" in k))   # k@<curve>: one curve's
+        for stat in stats:  # per block: last (no suffix), taps (_b<block>)
             if stat in out:
                 feats |= {stat + ("" if j == 0 else f"_b{self._taps[j - 1] + 1}"): block(out[stat][0], j) for j in range(n)}
         return {"features": feats, "canonical": "mean", "derived": [],

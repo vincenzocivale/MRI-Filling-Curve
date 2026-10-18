@@ -478,6 +478,11 @@ def readings(m: str, d: Path, fit: set | None = None) -> tuple[list[str], dict[s
             menu["blocks+std"] = cat(blocks, *(f["std" + b] for b in inter), f["std"])
     if "covsqrt_fg" in so:
         menu["mean+covsqrt_fg"] = cat(f["mean"], so["covsqrt_fg"])
+    for c in sorted({k.split("@")[1].split("_b")[0] for k in f if k.startswith("mean@")}):  # one curve, not the average
+        menu[f"mean@{c}"] = f[f"mean@{c}"]
+        if inter and f"std@{c}" in f:
+            menu[f"blocks+std@{c}"] = cat(*(f[f"mean@{c}" + b] for b in inter), f[f"mean@{c}"],
+                                          *(f[f"std@{c}" + b] for b in inter), f[f"std@{c}"])
     return ids, menu  # the 2x-reading means (*_tta) were never chosen on p7 (17/10): dropped
 
 
