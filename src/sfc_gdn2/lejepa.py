@@ -450,8 +450,12 @@ class LeJEPA(nn.Module):
             out[f"inv_cell{cs}"] = (p - q).square().mean(-1).sum() / max(len(p), 1) / 4
             out[f"sigreg_cell{cs}"] = sig(z[self._sample(vb, torch.ones_like(vb, dtype=torch.bool), b, gen)][None])
             out[f"pairs_cell{cs}"] = torch.tensor(float(len(p)), device=z.device)
-        if self.coarse_view:
-            tops.append(self.coarse_tops(vols, fg, corner, edge)[:, None])
+        if self.coarse_view:   # scans too finely sampled for the coarse block keep their fine view (one more copy)
+            ct, big = self.coarse_tops(vols, fg, corner, edge)
+            fine = tops[0][:, 1].clone()
+            if ct is not None:
+                fine[[i for i in range(b) if i not in big]] = ct
+            tops.append(fine[:, None])
         tops = torch.cat(tops, 1)                                                          # [B,V,2d], globals first
         groups = {"volume": torch.arange(b, device=grid.device),
                   "session": vols["session"].unique(return_inverse=True)[1]}
@@ -537,9 +541,13 @@ class LeJEPA(nn.Module):
         """Each scan's first global B box at twice the patch (coarse_view) -> its foreground mean token [B,2d]."""
         dev, seqs, fgs, memo = corner.device, [], [], {}
         off = torch.stack(torch.meshgrid(*(torch.arange(2, device=dev),) * 3, indexing="ij"), -1).view(-1, 3)
+        big = []
         for b in range(len(corner)):
             c0, e0, g = corner[b, 0, 1], edge[b, 0, 1], vols["grid"][b]
             k, sp = vols["k_list"][b], vols["spacing_list"][b]
+            if 8 * k[0] * k[1] * k[2] > 1 << 18:   # a 2^3-patch block of > 64^3 voxels: its kernel matrix alone is GBs
+                big.append(b)
+                continue
             ec = (e0 + 1) // 2
             cc = torch.stack(torch.meshgrid(*(torch.arange(n, device=dev) for n in ec.tolist()), indexing="ij"), -1).view(-1, 3)
             pc = c0 + cc[:, None] * 2 + off[None]                                            # [Nc,8,3] its patches
@@ -559,12 +567,14 @@ class LeJEPA(nn.Module):
             seqs.append(t[order])
             fgs.append((fg[b][pid] & inside).any(1)[order])
         lens = [len(q) for q in seqs]
+        if not lens:
+            return None, big
         cu = nn.functional.pad(torch.tensor(lens, device=dev).cumsum(0), (1, 0)).int()
         tops = []
         for h, m in zip(self.encoder.flat(torch.cat(seqs), cu, self.encoder.grad_checkpoint).split(lens), fgs):
             h = h[m] if bool(m.any()) else h
             tops.append(torch.cat([h.mean(0), h.mean(0)]))                                 # one stream: bi = h ++ h
-        return torch.stack(tops).float()
+        return torch.stack(tops).float(), big
 
     def sub_blocks(self, vols, ws, bi, tv, pxyz, pa, corner, edge, vol, gen):
         """`child` levels (see __init__) for the locals part: A's masked paired rows `pa` ->

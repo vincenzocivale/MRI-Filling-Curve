@@ -161,9 +161,11 @@ class Pretrainer:
             g["lr"] = t["lr"] * lr_factor(self.step, t)
         self.step, self.consumed, self.skipped, self.seconds = c["step"], c["consumed"], c["skipped"], c["seconds"]
         self.loader.batch_sampler.start = self.consumed
-        if (path.parent / "history.csv").exists() and (path.parent / "history.csv").stat().st_size:
+        try:   # a job killed before its first log leaves no (or an empty) history
             h = pd.read_csv(path.parent / "history.csv")
             self.hist = h[h["step"] <= self.step].to_dict("records")
+        except (FileNotFoundError, pd.errors.EmptyDataError):
+            pass
         self.log(f"[lejepa] resumed {path} at step {self.step} ({c['world']} -> {self.world} GPUs)", flush=True)
 
     def _checkpoint(self) -> None:

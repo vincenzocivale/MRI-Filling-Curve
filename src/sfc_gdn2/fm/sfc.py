@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .base import Image, Wrapper
 
@@ -105,9 +106,12 @@ class SegNet(nn.Module):
                 out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : T[0], : T[1], : T[2]])
                 continue
             # in slabs along the first axis: with coarse voxels a tile holds 10^4-10^5 tokens and 16^3 cells each
-            s = max(1, (1 << 27) // (DECODE ** 3 * g[1] * g[2] * max(self.decode.decode[-1].out_channels, 1)))
-            m = torch.cat([F.interpolate(self.decode(z[:, :, i:i + s]), size=[min(s, g[0] - i) * k[0], g[1] * k[1], g[2] * k[2]],
-                                         mode="trilinear", align_corners=False) for i in range(0, g[0], s)], 2)
+            s = max(1, (1 << 25) // (DECODE ** 3 * g[1] * g[2] * max(self.decode.decode[-1].out_channels, 1)))
+
+            def slab(zz, kk=k, gg=g):   # recomputed in backward
+                return F.interpolate(self.decode(zz), size=[zz.shape[2] * kk[0], gg[1] * kk[1], gg[2] * kk[2]],
+                                     mode="trilinear", align_corners=False)
+            m = torch.cat([checkpoint(slab, z[:, :, i:i + s], use_reentrant=False) for i in range(0, g[0], s)], 2)
             out.append(m[0, :, : T[0], : T[1], : T[2]])
         return torch.stack(out)
 
@@ -140,7 +144,11 @@ class SegNet(nn.Module):
         # trained encoder's phi reach 1.3, unscaled every Adam step moved the logits by ~10 (no learning, 17/10)
         px, py, pz = (p / p.pow(2).mean(0, keepdim=True).sqrt().clamp_min(1e-6) for p in emb.axis_integrals(sp, k))
         r = emb.rank
-        m = torch.einsum("noabc,xa,yb,zc->noxyz", self.coef(z).view(len(z), -1, r, r, r), px, py, pz) / r ** 1.5
+
+        def dec(zz):   # in chunks recomputed in backward: the coefficients are tokens x classes x r^3
+            return torch.einsum("noabc,xa,yb,zc->noxyz", self.coef(zz).view(len(zz), -1, r, r, r), px, py, pz) / r ** 1.5
+        n = max(1, (1 << 25) // (self.coef[-1].out_features))
+        m = torch.cat([checkpoint(dec, z[i:i + n], use_reentrant=False) for i in range(0, len(z), n)])
         o = m.shape[1]
         return m.reshape(*g, o, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(o, *(a * c for a, c in zip(g, k)))
 
