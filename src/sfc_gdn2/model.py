@@ -258,6 +258,38 @@ class ViewPos(nn.Module):
         return self.proj(torch.cat([a.sin(), a.cos()], -1).flatten(-2))
 
 
+class HyperConnection(nn.Module):
+    """mHC (DeepSeek, arXiv 2512.24880) around one block: n residual streams x [..., n, d]; the block reads
+    u = H_pre x, writes its update F(u) - u to every stream through H_post, and the streams mix through H_res, doubly
+    stochastic (Sinkhorn-Knopp, 20 iterations: spectral norm <= 1 at any depth). The mappings are static biases plus
+    a dynamic part from RMSNorm(x) (gate alpha 0.01). At init H_pre averages, H_post = 1, H_res ~ I: with identical
+    streams the block is the plain residual one (a trained stack keeps its function)."""
+
+    def __init__(self, block: nn.Module, d: int, n: int = 4):
+        super().__init__()
+        self.block, self.n = block, n
+        self.norm = nn.RMSNorm(n * d)
+        self.phi = nn.Linear(n * d, 2 * n + n * n, bias=False)
+        nn.init.normal_(self.phi.weight, std=0.02)
+        self.alpha = nn.Parameter(torch.full((3,), 0.01))
+        self.b_pre = nn.Parameter(torch.full((n,), math.log(1 / (n - 1))))     # sigmoid = 1/n
+        self.b_post = nn.Parameter(torch.zeros(n))                               # 2 sigmoid = 1
+        self.b_res = nn.Parameter(torch.eye(n) * 6.0)                            # Sinkhorn(exp) ~ I
+
+    def forward(self, x: torch.Tensor, *a) -> torch.Tensor:
+        n = self.n
+        h = self.phi(self.norm(x.flatten(-2)))
+        pre = torch.sigmoid(self.alpha[0] * h[..., :n] + self.b_pre)
+        post = 2 * torch.sigmoid(self.alpha[1] * h[..., n:2 * n] + self.b_post)
+        m = torch.exp((self.alpha[2] * h[..., 2 * n:].unflatten(-1, (n, n)) + self.b_res).float())
+        for _ in range(20):                                                      # Sinkhorn-Knopp
+            m = m / m.sum(-1, keepdim=True)
+            m = m / m.sum(-2, keepdim=True)
+        u = (pre.unsqueeze(-1) * x).sum(-2)
+        out = self.block(u, *a) - u
+        return (m.to(x.dtype) @ x) + post.unsqueeze(-1) * out.unsqueeze(-2)
+
+
 class Encoder(nn.Module):
     """Causal GDN-2 over curve-ordered patch tokens.
 
@@ -276,7 +308,7 @@ class Encoder(nn.Module):
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
                  grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, bidir: str = "late",
                  long_mem: dict | None = None, attn_every: int = 0, attn_rope: bool = False, attn_insert: int = 0,
-                 **embed):
+                 norm: str = "layer", hc: int = 0, **embed):
         super().__init__()
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
@@ -301,7 +333,14 @@ class Encoder(nn.Module):
         if long_mem:
             for b in self.blocks:
                 long_memory(b.mix, long_mem["channels"], long_mem["half_life"])
-        self.norm = nn.LayerNorm(d_model)
+        # norm "rms" (19/10): RMSNorm instead of LayerNorm in every block and at the end; hc n: mHC around every block
+        if norm == "rms":
+            for b in self.blocks:
+                b.norm, b.ffn_norm = nn.RMSNorm(d_model), nn.RMSNorm(d_model)
+        self.hc = int(hc)
+        if self.hc:
+            self.blocks = nn.ModuleList(HyperConnection(b, d_model, self.hc) for b in self.blocks)
+        self.norm = nn.RMSNorm(d_model) if norm == "rms" else nn.LayerNorm(d_model)
 
     @classmethod
     def from_config(cls, cfg: dict) -> Encoder:
@@ -309,7 +348,7 @@ class Encoder(nn.Module):
         return cls(m["d_model"], m["depth"], m["head_dim"], m["num_heads"], m.get("use_short_conv", True),
                    m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
                    m.get("bidir", "late"), m.get("long_mem"), m.get("attn_every", 0), m.get("attn_rope", False),
-                   m.get("attn_insert", 0),
+                   m.get("attn_insert", 0), m.get("norm", "layer"), m.get("hc", 0),
                    **m.get("embed", {}))
 
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -322,11 +361,14 @@ class Encoder(nn.Module):
         (int32 [n+1] offsets), x is [1,T,d]: n sequences packed back to back, no padding. rev: see `bidir`."""
         ckpt = self.grad_checkpoint if ckpt is None else ckpt
         taps = [x] * self.taps.count(-1)  # -1: the input tokens (patch embedding)
+        if self.hc:                                       # n identical residual streams (mHC); read out as their mean
+            x = x.unsqueeze(-2).expand(*x.shape[:-1], self.hc, x.shape[-1]).contiguous()
         for i, block in enumerate(self.blocks):
             r = rev if self.bidir == "block" or self.reads_back[i] else None
             x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", use_reentrant=False) if ckpt and self.training
                  else block(x, cu_seqlens, r, self.bidir == "block"))
-            taps += [x] * self.taps.count(i)  # a repeated index: same input width, no new block (control)
+            taps += [x.mean(-2) if self.hc else x] * self.taps.count(i)  # a repeated index: same width, no new block
+        x = x.mean(-2) if self.hc else x
         return torch.cat([x, *taps], -1) if taps else x
 
     def packed(self, x: torch.Tensor, valid: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:

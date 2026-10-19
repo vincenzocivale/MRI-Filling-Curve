@@ -1,0 +1,15 @@
+# RMSNorm and mHC (user, 19/10), fast paired check: continuations of p11_res #1 (B-spline, 16 mm, 760 steps) by 300
+# steps (100 of decay), same seed and data stream: 00 control, 01 RMSNorm + mHC n=4 (starts as the same function,
+# cos 0.9992). Quick evaluation after (multiscale/quick_eval.sh): F + encoder at the fine levels, 1250 iterations;
+# probes on age / IDH / mRS with [mean, blocks+std].
+name: p12_mhc
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 300, train.decay_steps: 100, train.warmup_steps: 50, train.save_every: 300,
+        train.init_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p11_res/01/lejepa-ceb553d47a/model.pt,
+        train.batch_size: 36, data.patches_per_batch: 98304, model.d_model: 512, model.depth: 8, model.num_heads: 8,
+        model.embed.basis: bspline, objective.max_packed_tokens: 262144, objective.mask_cells: [1, 2]}
+runs:
+  - {}
+  - {model.norm: rms, model.hc: 4}
+slurm: {gres: "gpu:4", cpus_per_task: 32, mem: 480G, time: "02:00:00"}

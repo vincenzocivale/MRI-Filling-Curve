@@ -161,6 +161,8 @@ class Pretrainer:
         elif t.get("init_from"):  # weights only (new modules keep their init); fresh optimizer and schedule from step 0
             sd = torch.load(t["init_from"], map_location="cpu", weights_only=False)
             sd = sd.get("model", sd)  # a model.pt, or a ckpt.pt's weights (a plateau checkpoint)
+            if self.cfg["model"].get("hc"):  # a plain stack under mHC: block j is blocks.j.block
+                sd = {re.sub(r"(encoder\.blocks\.\d+\.)", r"\1block.", n): v for n, v in sd.items()}
             if k := self.cfg["model"].get("attn_insert", 0):  # a pure stack grown: GDN-2 block j sits at j + j // k
                 sd = {re.sub(r"(encoder\.blocks\.)(\d+)\.", lambda m: f"{m[1]}{int(m[2]) + int(m[2]) // k}.", n): v
                       for n, v in sd.items()}
