@@ -1,0 +1,12 @@
+# Memory and speed of the new model (user, 19/10) before its first epoch: the epochs' recipe (2 GPUs x 48 scans,
+# d=1024/16, 16 mm) with the B-spline kernel and every 4th block attention. 40 steps from scratch, debug QOS.
+name: p13_memtest
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 40, train.decay_steps: 0, train.warmup_steps: 20, train.save_every: 1000, train.log_every: 10,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        model.attn_every: 4, model.embed.basis: bspline, objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0,
+        objective.mask_cells: [1, 2]}
+runs:
+  - {}
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "00:30:00", qos: boost_qos_dbg}

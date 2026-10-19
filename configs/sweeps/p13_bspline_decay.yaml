@@ -1,0 +1,18 @@
+# Decay branch of the new model's first epoch (user, 19/10): from p13_bspline's plateau checkpoint (step 9200), 1-sqrt
+# decay over 1000 steps to 10200, then the evaluation, with one more pilot: decoder F fed by the frozen encoder at its
+# 8 / 4 mm levels (the B-spline gain).
+name: p13_bspline_decay
+root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
+config: configs/pretrain_lejepa.yaml
+fixed: {train.lr: 4.0e-4, train.steps: 10200, train.decay_steps: 1000, train.warmup_steps: 300, train.save_every: 1000,
+        train.resume_from: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p13_bspline/00/lejepa-021ea89bbd/ckpt.pt,
+        data.patches_per_batch: 131072, train.batch_size: 48, model.d_model: 1024, model.depth: 16, model.num_heads: 16,
+        model.attn_every: 4, model.embed.basis: bspline, objective.max_packed_tokens: 262144, objective.checkpoint_tokens: 0,
+        objective.mask_cells: [1, 2]}
+runs:
+  - {}
+tasks: [age, sex, idh, grade, survival, mrs90, sequence]
+dense: {task: tumor_ucsf, iters: 2500}
+segdec_extra:
+  - [segdec_f_fineenc, "args.taps=3 args.refine=2 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true"]
+slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}
