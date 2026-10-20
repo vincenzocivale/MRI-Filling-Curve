@@ -142,6 +142,8 @@ class Pretrainer:
         ses = session_ids(rows)  # the objective's session level (scans of one session batched together)
         self.loader = loader(rows, cfg["data"], t["batch_size"], ses, seed=self.seed, rank=self.rank, world=world)
         self.net = LeJEPA.from_config(cfg).to(self.device)
+        if t.get("sync_bn") and world > 1:   # the projector's BatchNorm on the global batch (as SIGReg), whatever the
+            self.net = nn.SyncBatchNorm.convert_sync_batchnorm(self.net)   # GPUs: same parameters, same state dict
         self.session = torch.tensor(ses)
         self.model = DistributedDataParallel(self.net, device_ids=[self.device.index]) if world > 1 else self.net
         muon = t.get("optimizer", "adamw") == "muon"
