@@ -403,7 +403,8 @@ Extractor = Callable[[dict], dict[str, torch.Tensor]]
 
 
 def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int, fg_threshold: float,
-                      crop: bool = False, embed_only: bool = False, reverse: bool = False) -> Extractor:
+                      crop: bool = False, embed_only: bool = False, reverse: bool = False,
+                      per_curve_stats: bool = True) -> Extractor:
     """Each volume read along each of `curves` over its whole patch grid (untransformed view), forwards and
     backwards; `bi` = forward ++ backward output per patch, averaged over the curves (test-time augmentation).
     patch: `bi` per patch (raster order). both: `bi` and `mean`, bi averaged over the foreground patches (the top of
@@ -444,9 +445,11 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
         bir = 0
         w = (fg | (inside & ~fg.any(1, keepdim=True))).float()[..., None]
 
-        def stats(b):  # foreground mean and std per channel
-            m = (w * b).sum(1) / w.sum(1)
-            return m, ((w * (b - m[:, None]) ** 2).sum(1) / w.sum(1)).sqrt()
+        def stats(b):  # foreground mean and std per channel, in chunks of tokens (no full-size temporaries: 8 mm
+            n = w.sum(1)   # whole-body volumes hold ~10^6 tokens x 6144 channels)
+            m = sum((w[:, i:i + 65536] * b[:, i:i + 65536]).sum(1) for i in range(0, b.shape[1], 65536)) / n
+            v = sum((w[:, i:i + 65536] * (b[:, i:i + 65536] - m[:, None]) ** 2).sum(1) for i in range(0, b.shape[1], 65536))
+            return m, (v / n).sqrt()
 
         per_curve = {}
         for curve in [] if embed_only else curves:
@@ -465,7 +468,7 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
             back = order.argsort(1)[..., None]                                 # curve position -> raster
             fb = fb.gather(1, back.expand(-1, -1, fb.shape[-1]))
             bi = bi + fb / len(curves)
-            if level != "patch" and len(curves) > 1:                           # each curve's own reading (probe menu)
+            if level != "patch" and len(curves) > 1 and per_curve_stats:      # each curve's own reading (probe menu)
                 per_curve |= dict(zip((f"mean@{curve}", f"std@{curve}"), stats(fb)))
             if rv:
                 bir = bir + fr.gather(1, back.expand(-1, -1, fr.shape[-1])) / len(curves)

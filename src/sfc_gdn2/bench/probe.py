@@ -456,6 +456,10 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit:
     cache = d / "_second_order.pt"
     if cache.exists() and (c := torch.load(cache))["ids"] == ids:
         return c["feats"]
+    g0 = load_globals(d)
+    if "covsqrt" in g0[1]:  # computed at extraction (args.cov_basis): nothing to fit or read again
+        pos = {i: k for k, i in enumerate(g0[0])}
+        return {k: g0[1][k][[pos[i] for i in ids]] for k in ("covsqrt", "covsqrt_fg") if k in g0[1]}
 
     def tokens(i):  # {"covsqrt": all tokens, "covsqrt_fg": foreground tokens}
         f = torch.load(d / f"{i}.pt", map_location="cpu", weights_only=False)["features"]
@@ -525,8 +529,12 @@ def readings(m: str, d: Path, fit: set | None = None, extra: dict | None = None)
         g = {k: v[[pos[i] for i in ids]] for k, v in g.items()}
         g = {k: v[:, :w] if k.startswith(("mean", "std")) and v.shape[1] == 2 * w else v for k, v in g.items()}
         menu[f"mean@{mm}mm"] = g["mean"]
+        if "covsqrt" in g:
+            menu[f"mean+covsqrt@{mm}mm"] = cat(g["mean"], g["covsqrt"])
         if inter and "std" in g:
             menu[f"blocks+std@{mm}mm"] = cat(*(g["mean" + b] for b in inter), g["mean"], *(g["std" + b] for b in inter), g["std"])
+            if "covsqrt" in g:
+                menu[f"blocks+covsqrt@{mm}mm"] = cat(*(g["mean" + b] for b in inter), g["mean"], g["covsqrt"])
     return ids, menu  # the 2x-reading means (*_tta) were never chosen on p7 (17/10): dropped
 
 

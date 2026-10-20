@@ -216,6 +216,42 @@ class Patches:
         return torch.stack(xs), torch.stack(ys), None if cs[0] is None else torch.stack(cs)
 
 
+def batch_sums(logits: torch.Tensor, y: torch.Tensor, k: int) -> tuple:
+    """(sum of the cross-entropy, labelled voxels, per class: soft intersection, predicted sum, target sum)."""
+    y = y.long()
+    ce = F.cross_entropy(logits.float(), y, ignore_index=255, reduction="sum")
+    ok = (y != 255).unsqueeze(1).float()
+    p = logits.float().softmax(1) * ok
+    yc = torch.where(y == 255, 0, y)
+    inter = p.new_zeros(k).scatter_add(0, yc.flatten(), p.gather(1, yc.unsqueeze(1)).flatten())
+    return ce, ok.sum(), inter, p.sum((0, 2, 3, 4)), p.new_zeros(k).scatter_add(0, yc.flatten(), ok.flatten())
+
+
+def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
+    """The gradient of loss_fn on the whole batch, one scan at a time (wrappers with `seg_microbatch`, many classes:
+    decoder F on TotalSeg did not fit with 2 tiles). The soft Dice sums over the batch before dividing, so a first
+    pass without gradient gives the batch's sums; then each scan backpropagates a loss linear in its own sums with
+    the batch's derivatives as coefficients: the same gradient as the batch of 2, one more forward pass."""
+    parts = [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
+    sums = []
+    for xi, yi, ci in parts:
+        with torch.no_grad(), amp():
+            sums.append(batch_sums(call(net, xi.to(dev).float(), ci), yi.to(dev), k))
+    n = sum(s[1] for s in sums)
+    inter, psum, tsum = (sum(s[j] for s in sums) for j in (2, 3, 4))
+    den = psum + tsum + 1e-5
+    a = -2 / den / (k - 1)
+    b = (2 * inter + 1e-5) / den ** 2 / (k - 1)
+    a[0] = b[0] = 0
+    for xi, yi, ci in parts:
+        with amp():
+            logits = call(net, xi.to(dev).float(), ci)
+        ce, _, i_, p_, _ = batch_sums(logits, yi.to(dev), k)
+        (ce / n + (a * i_).sum() + (b * p_).sum()).backward()
+    dice = (2 * inter[1:] + 1e-5) / den[1:]
+    return sum(s[0] for s in sums) / n + 1 - dice.mean()
+
+
 def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
     y = y.long()
     ce = F.cross_entropy(logits.float(), y, ignore_index=255)
@@ -326,11 +362,15 @@ def train(job: dict) -> None:
         set_mode()
         for it in range(start, iters + 1):
             x, y, c = data.sample(int(job["batch"]))
-            with amp():
-                logits = call(net, x.to(dev, non_blocking=True).float(), c)
-            loss = loss_fn(logits, y.to(dev), k)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            if getattr(w, "seg_microbatch", False) and k > 10:
+                loss = micro_step(net, x, y, c, k, amp, dev)
+                logits = torch.zeros(1, device=dev)
+            else:
+                with amp():
+                    logits = call(net, x.to(dev, non_blocking=True).float(), c)
+                loss = loss_fn(logits, y.to(dev), k)
+                loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
             if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
                 raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "

@@ -283,6 +283,7 @@ class SFC(Wrapper):
             self.run_cfg["data"]["patch_mm"] = float(self.args["patch_mm"])
         self.curves = list(self.args.get("curves") or self.run_cfg["objective"]["view_curves"])
         self._extract = None  # built on first use: preprocessing workers never load GDN-2
+        self._cov = None      # args.cov_basis: {basis: {name: (mu, P)}, dim} of probe.second_order
 
     def preprocess(self, image: Image) -> dict:
         if not isinstance(image, str):
@@ -291,12 +292,18 @@ class SFC(Wrapper):
 
         img = open_image(image)
         arr, spacing, (a, c) = decode(img)
-        k = patch_dims(spacing, self.run_cfg["data"]["patch_mm"])
+        mm = self.run_cfg["data"]["patch_mm"]
+        k = patch_dims(spacing, mm)
+        # args.max_tokens / args.fallback_mm (20/10): a volume whose grid would exceed max_tokens is read at fallback_mm
+        # (8 mm whole-body scans: ~10^6 tokens, ~80 GB for the encoder alone)
+        if self.args.get("max_tokens") and np.prod(patch_grid(arr.shape, k).tolist()) > int(self.args["max_tokens"]):
+            mm = float(self.args["fallback_mm"])
+            k = patch_dims(spacing, mm)
         ornt = nio.io_orientation(img.affine)
         src = np.linalg.inv(nio.inv_ornt_aff(ornt, img.shape[:3]))  # source voxel -> canonical voxel
         meta = {"source_affine": torch.from_numpy(img.affine.copy()), "source_shape": tuple(img.shape[:3]),
                 "source_to_input": torch.from_numpy(src), "input_shape": tuple(arr.shape),
-                "spacing": tuple(spacing)}
+                "spacing": tuple(spacing), "patch_mm": mm}
         return {"volume": torch.from_numpy(np.ascontiguousarray(arr)), "value": (a, c), "k": torch.tensor(k),
                 "grid": patch_grid(arr.shape, k), "spacing": torch.tensor(spacing, dtype=torch.float32), "meta": meta}
 
@@ -306,6 +313,7 @@ class SFC(Wrapper):
         return (prepared["volume"].float() * a + c)[None], prepared["meta"]["source_to_input"].numpy()
 
     seg_extent = True   # segrun appends the scan's shape to the context (SegNet reads no padding)
+    seg_microbatch = True   # many classes: segrun.micro_step (the batch's gradient, one scan at a time)
 
     def seg_context(self, prepared: dict) -> torch.Tensor:
         return prepared["spacing"]
@@ -348,7 +356,9 @@ class SFC(Wrapper):
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
                                               obj.get("fg_threshold", 0.05), crop=bool(self.args.get("crop")),
                                               embed_only=self.args.get("encoder") == "none",
-                                              reverse=bool(self.args.get("tta")))  # also the *_tta readings
+                                              reverse=bool(self.args.get("tta")),  # also the *_tta readings
+                                              per_curve_stats=self.args.get("per_curve", True))
+            self._extract_enc = enc
         return self._extract
 
     @torch.no_grad()
@@ -356,6 +366,9 @@ class SFC(Wrapper):
         from ..data.volume import patchify
 
         dev = torch.device(self.device)
+        self.extractor()   # built (and the encoder) before its kernel takes this volume's patch size
+        pe = self._extract_enc.patch_embed
+        pe.patch_mm = prepared["meta"].get("patch_mm", pe.patch_mm)
         a, c = prepared["value"]
         k, grid = prepared["k"], prepared["grid"]
         x = patchify(prepared["volume"].to(dev).float() * a + c, k.tolist())
@@ -372,6 +385,18 @@ class SFC(Wrapper):
         for stat in stats:  # per block: last (no suffix), taps (_b<block>)
             if stat in out:
                 feats |= {stat + ("" if j == 0 else f"_b{self._taps[j - 1] + 1}"): block(out[stat][0], j) for j in range(n)}
+        if self.args.get("cov_basis"):  # the second-order reading computed here, without storing the token map (20/10)
+            if self._cov is None:
+                self._cov = torch.load(self.args["cov_basis"], map_location=dev)
+            t, dim = bi.float(), self._cov["dim"]
+            keep = t.norm(dim=1) > 0
+            iu = torch.triu_indices(dim, dim, device=dev)
+            for name, sel in (("covsqrt", keep), ("covsqrt_fg", keep & out["fg"][0, : len(x)])):
+                mu, pr = self._cov["basis"][name]
+                z = (t[sel] - mu) @ pr
+                z = z - z.mean(0)
+                e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dim, device=dev))
+                feats[name] = ((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half()
         return {"features": feats, "canonical": "mean", "derived": [],
                 "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt)}}
 
