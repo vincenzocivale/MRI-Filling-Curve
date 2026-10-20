@@ -56,7 +56,7 @@ class SegNet(nn.Module):
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
-                 refine_frac: float = 1.0):
+                 refine_frac: float = 1.0, token_cache: str | None = None):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -115,11 +115,16 @@ class SegNet(nn.Module):
             # refine_frac < 1 (18/10, adaptive): the encoder re-reads only the children of that share of the parent cells
             # that differ most from their neighbours (an edge, no label needed); the others keep the parent token
             self.refine_frac, self.enc_curves = float(refine_frac), list(curves)
+            # token_cache (20/10, fm/token_cache.py): the encoder's tokens of the whole scan, read once at 16 / 8 / 4 mm
+            # on nested grids; tiles start on the 16 mm grid (segrun aligns them), the decoder takes the cached tokens
+            # (16 mm and the finer levels: last block ++ taps through proj) instead of running the encoder
             c = 128
         if self.kernel:
             self.coef = nn.Sequential(nn.Linear(c, 64), nn.GELU(), nn.Linear(64, n_out * encoder.patch_embed.rank ** 3))
             del self.decode
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
+        from .token_cache import TokenCache  # every decoder can read the cached whole-scan tokens (20/10)
+        self.cache, self._cur, self.width = (TokenCache(token_cache) if token_cache else None), None, width
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
@@ -130,21 +135,33 @@ class SegNet(nn.Module):
         from ..data.volume import patch_dims, patch_grid, patchify
 
         T = tuple(x.shape[2:])
-        ext = spacing[:, 3:].long().tolist() if spacing.shape[1] > 3 else [T] * len(x)
+        cached = getattr(self, "cache", None) is not None and spacing.shape[1] >= 10   # spacing, shape, volume, corner
+        if cached:
+            vids, corners = spacing[:, 6].long().tolist(), spacing[:, 7:10].long().tolist()
+        ext = spacing[:, 3:6].long().tolist() if spacing.shape[1] > 3 else [T] * len(x)
         spacing = spacing[:, :3]
         V = [tuple(min(a, t) for a, t in zip(e, T)) for e in ext]                           # the scan's part of each tile
-        ks = [patch_dims(s, self.patch_mm) for s in spacing.tolist()]
-        grid = [patch_grid(v, k).to(x.device) for v, k in zip(V, ks)]
         xs = [x[b, 0, : v[0], : v[1], : v[2]].float() for b, v in enumerate(V)]
-        with torch.no_grad():   # one tile at a time
-            bi = [self.extract({"patches": [patchify(xs[b], k)], "grid": grid[b][None],
-                                "k": torch.tensor([k], device=x.device), "spacing": spacing[b:b + 1].float()})["bi"][0]
-                  for b, k in enumerate(ks)]
+        if cached:
+            ids = [self.cache.ids[v] for v in vids]
+            k4s = [self.cache.meta(i)["k4"] for i in ids]
+            ks = [[4 * a for a in k4] for k4 in k4s]
+            grid = [patch_grid(v, k).to(x.device) for v, k in zip(V, ks)]
+            w16 = self.width // (2 if self.context else 1)   # this decoder's blocks: the cache holds last ++ taps
+            bi = [self.cache.tokens(i, 16.0, c, grid[b].tolist(), k)[:, :w16].to(x.device).float()
+                  for b, (i, c, k) in enumerate(zip(ids, corners, ks))]
+        else:
+            ks = [patch_dims(s, self.patch_mm) for s in spacing.tolist()]
+            grid = [patch_grid(v, k).to(x.device) for v, k in zip(V, ks)]
+            with torch.no_grad():   # one tile at a time
+                bi = [self.extract({"patches": [patchify(xs[b], k)], "grid": grid[b][None],
+                                    "k": torch.tensor([k], device=x.device), "spacing": spacing[b:b + 1].float()})["bi"][0]
+                      for b, k in enumerate(ks)]
         out = []
         for b, k in enumerate(ks):
             g, v = grid[b].tolist(), V[b]
             tok = bi[b][: int(grid[b].prod())]
-            if self.unique:
+            if self.unique and not cached:   # the cache holds h once
                 tok = tok[:, : tok.shape[1] // 2]
             if self.context:  # the tile's mean token beside each token: the decoder can centre it (token - mean)
                 tok = torch.cat([tok, tok.mean(0, keepdim=True).expand_as(tok)], -1)
@@ -152,6 +169,7 @@ class SegNet(nn.Module):
             z = z if self.mix is None else z + self.mix(z)
             if self.kernel:
                 emb, z = self.encoder.patch_embed, z[0].flatten(1).T                      # [N, c]
+                self._cur = (ids[b], corners[b], k4s[b]) if cached else None
                 for i in range(self.refine):
                     z, k, g = self.to_fine(z, xs[b], spacing[b], k, g, i)
                     emb = self.fine[i][0].patch_embed
@@ -174,13 +192,17 @@ class SegNet(nn.Module):
         from ..curves import grid_coords, keys
         from ..data.volume import patch_dims, patch_grid, patchify
 
-        kf = patch_dims(sp.tolist(), self.fine_mm[i])
+        kf = [a * 2 ** (1 - i) for a in self._cur[2]] if self._cur else patch_dims(sp.tolist(), self.fine_mm[i])
         gf = patch_grid(vol.shape, kf).to(z.device)
         xyz = grid_coords(gf[None], int(gf.prod()))[0]                                    # [Nf, 3] raster
         par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
         par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
         t = self.up[i](z)[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]]
-        if self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
+        if self._cur is not None and self.fine_tok is not None:   # fine_encoder from the cache: the whole-scan reading
+            ci, corner, _ = self._cur                                 # of this level, last block ++ taps as at 16 mm
+            tf = self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float()
+            t = t + self.fine_tok[i](self.proj(tf))
+        elif self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
             if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
                 sel = torch.arange(len(xyz), device=z.device)   # TotalSeg's 4 mm level, ~2e5 tokens, did not fit)
             else:   # adaptive: only the children of the most edge-like parents
@@ -334,7 +356,7 @@ class SFC(Wrapper):
                      zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
                      erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"),
                      image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")),
-                     refine_frac=float(self.args.get("refine_frac") or 1.0))
+                     refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

@@ -117,14 +117,21 @@ def call(net, x: torch.Tensor, ctx):
 
 
 @torch.no_grad()
-def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Tensor:
-    """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch)."""
+def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) -> torch.Tensor:
+    """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
+    on that grid (token cache), the volume padded so that the last tile ends on it."""
     S = tuple(x.shape[1:])
     patch = S if patch is None else tuple(patch)
-    xp, _ = pad_to(x, None, patch)
+    if align is not None:
+        tgt = [p + -(-max(s - p, 0) // a) * a for s, p, a in zip(S, patch, align)]
+        xp, _ = pad_to(x, None, tgt)
+    else:
+        xp, _ = pad_to(x, None, patch)
     P = tuple(xp.shape[1:])
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
               for s, p in zip(P, patch)]
+    if align is not None:
+        starts = [np.unique(np.append(st // a * a, s - p)) for st, a, s, p in zip(starts, align, P, patch)]
     g = gaussian(patch, x.device)
     # fp16 accumulator on the device if it takes <= 1/4 of the free memory, else on the CPU (nnU-Net's predictor does
     # both; "fits at all" left the tiles' forward no room: nnF CNN OOM on whole-body TotalSeg grids)
@@ -134,7 +141,8 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     for a, b, c in product(*starts):
         sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
         with amp():
-            logits = call(net, xp[(slice(None), *sl)][None], None if ctx is None else ctx[None])
+            cx = ctx if align is None else torch.cat([ctx, torch.tensor([a, b, c], dtype=ctx.dtype)])
+            logits = call(net, xp[(slice(None), *sl)][None], None if cx is None else cx[None])
         out[(slice(None), *sl)] += (logits[0].float().softmax(0) * g).to(out)
         wsum[sl] += g
     wsum = wsum.to(out.device)
@@ -185,10 +193,11 @@ class Patches:
     """Random training patches from volumes held in RAM; 1/3 centred on a voxel of a random present class."""
 
     def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator):
-        self.vols, self.ctx, self.patch, self.rng = [], [], patch, rng
+        self.vols, self.ctx, self.patch, self.rng, self.align = [], [], patch, rng, []
         for v in vols:
             x, y = pad_to(v["x"], v["y"], patch) if patch else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
+            self.align.append(v.get("align"))
             fg = {}
             for c in range(1, k):
                 idx = (y == c).nonzero()
@@ -210,6 +219,9 @@ class Patches:
                 start = np.clip(c - P // 2, 0, S - P)
             else:
                 start = np.array([self.rng.integers(s - p + 1) for s, p in zip(S, P)])
+            if self.align[j] is not None:   # on the volume's 16 mm grid (token cache)
+                start = (start // np.array(self.align[j])) * np.array(self.align[j])
+                cs[-1] = torch.cat([cs[-1], torch.tensor(start, dtype=torch.float)])
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
             ys.append(y[sl])
@@ -284,6 +296,11 @@ def train(job: dict) -> None:
           f"{len(frozen_names - loaded)} frozen but not loaded {sorted(frozen_names - loaded)[:4]}, "
           f"{len(loaded - {n for n in names if is_frozen(n)})} loaded outside the prefixes (frozen too)", flush=True)
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
+    # token cache (SegNet args.token_cache): tiles start on each volume's 16 mm grid and pass (volume, corner) in ctx
+    tcache = getattr(net, "cache", None)
+    vid = {it["id"]: n for n, it in enumerate(job["items"])}
+    if tcache is not None:
+        tcache.ids = [it["id"] for it in job["items"]]
     del ref, pre, ref_p
     n_frozen = n_train = 0
     for n, p in net.named_parameters():
@@ -302,7 +319,10 @@ def train(job: dict) -> None:
         ctx = r.get("ctx")
         if ctx is not None and getattr(w, "seg_extent", False):   # + the scan's shape: the net can skip the padding
             ctx = torch.cat([ctx.float(), torch.tensor(r["x"].shape[1:], dtype=torch.float)])
-        return {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx}
+        if tcache is not None:   # + the volume's index in the token cache; tiles append their corner
+            ctx = torch.cat([ctx, torch.tensor([float(vid[it["id"]])])])
+        return {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx,
+                "align": None if tcache is None else [4 * a for a in tcache.meta(it["id"])["k4"]]}
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
@@ -380,7 +400,7 @@ def train(job: dict) -> None:
             sched.step()
             if it % every == 0 or it == iters:
                 net.eval()
-                ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).argmax(0).to(dev),
+                ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).argmax(0).to(dev),
                               v["y"].to(dev), k) for v in val_v]
                 val = float(np.nanmean(ds))
                 curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
@@ -415,7 +435,7 @@ def train(job: dict) -> None:
             continue
         t1 = time.time()
         v = load(it)
-        probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])
+        probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"])
         lab, _, _ = gt_labels(it["seg"])
         d, per = dice_full_res(probs, v["grid_from_gt"], lab, k, dev)
         res["per_volume"].append(d)
