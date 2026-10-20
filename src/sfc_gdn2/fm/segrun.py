@@ -148,13 +148,20 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) 
     fits = x.is_cuda and n_out * math.prod(P) * 2 <= torch.cuda.mem_get_info(x.device)[0] / 4
     out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device if fits else "cpu")
     wsum = torch.zeros(P, device=x.device)
-    for a, b, c in product(*starts):
-        sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
+    corners = list(product(*starts))
+    # token-cache decoders take a batch of tiles at once (their refine levels pack the tiles' sequences): up to 8, at
+    # most ~JOINT_MAX voxels x classes; the others one tile at a time, as before
+    nb = 1 if align is None else max(1, min(8, int(JOINT_MAX // (n_out * math.prod(patch)))))
+    for j in range(0, len(corners), nb):
+        cs = corners[j: j + nb]
+        sls = [(slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2])) for a, b, c in cs]
         with amp():
-            cx = ctx if align is None else torch.cat([ctx, torch.tensor([a, b, c], dtype=ctx.dtype)])
-            logits = call(net, xp[(slice(None), *sl)][None], None if cx is None else cx[None])
-        out[(slice(None), *sl)] += (logits[0].float().softmax(0) * g).to(out)
-        wsum[sl] += g
+            cx = None if ctx is None else torch.stack([ctx if align is None else
+                                                       torch.cat([ctx, torch.tensor(co, dtype=ctx.dtype)]) for co in cs])
+            logits = call(net, torch.stack([xp[(slice(None), *sl)] for sl in sls]), cx)
+        for lg, sl in zip(logits, sls):
+            out[(slice(None), *sl)] += (lg.float().softmax(0) * g).to(out)
+            wsum[sl] += g
     wsum = wsum.to(out.device)
     for c in range(n_out):  # one class at a time: dividing the whole fp16 accumulator by an fp32 tensor made an fp32
         out[c].div_(wsum)   # copy of it (whole-body nnF grids: 60 GB accumulator, RAM OOM at 240 GB)

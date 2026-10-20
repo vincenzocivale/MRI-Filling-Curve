@@ -165,7 +165,7 @@ class SegNet(nn.Module):
                 bi = [self.extract({"patches": [patchify(xs[b], k)], "grid": grid[b][None],
                                     "k": torch.tensor([k], device=x.device), "spacing": spacing[b:b + 1].float()})["bi"][0]
                       for b, k in enumerate(ks)]
-        out = []
+        out, st = [], []
         for b, k in enumerate(ks):
             g, v = grid[b].tolist(), V[b]
             tok = bi[b][: int(grid[b].prod())]
@@ -175,15 +175,8 @@ class SegNet(nn.Module):
                 tok = torch.cat([tok, tok.mean(0, keepdim=True).expand_as(tok)], -1)
             z = self.proj(tok).T.reshape(1, -1, *g)
             z = z if self.mix is None else z + self.mix(z)
-            if self.kernel:
-                emb, z = self.encoder.patch_embed, z[0].flatten(1).T                      # [N, c]
-                self._cur = (ids[b], corners[b], k4s[b]) if cached else None
-                for i in range(self.refine):   # the finer levels only while their cells hold >= 8 voxels
-                    if i and not fine_ok(self.fine_dims(spacing[b], i)):
-                        break
-                    z, k, g = self.to_fine(z, xs[b], spacing[b], k, g, i)
-                    emb = self.fine[i][0].patch_embed
-                out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : v[0], : v[1], : v[2]])
+            if self.kernel:   # the tiles' levels together below (fine_mix packs their sequences)
+                st.append([z[0].flatten(1).T, k, g, self.encoder.patch_embed, (ids[b], corners[b], k4s[b]) if cached else None])
                 continue
             # in slabs along the first axis: with coarse voxels a tile holds 10^4-10^5 tokens and 16^3 cells each
             s = max(1, (1 << 25) // (DECODE ** 3 * g[1] * g[2] * max(self.decode.decode[-1].out_channels, 1)))
@@ -193,6 +186,22 @@ class SegNet(nn.Module):
                                      mode="trilinear", align_corners=False)
             m = torch.cat([checkpoint(slab, z[:, :, i:i + s], use_reentrant=False) for i in range(0, g[0], s)], 2)
             out.append(m[0, :, : v[0], : v[1], : v[2]])
+        if self.kernel:
+            for i in range(self.refine):   # the finer levels only while their cells hold >= 8 voxels
+                act, inp = [], []
+                for b, (z, k, g, _, cur) in enumerate(st):
+                    self._cur = cur
+                    if i and (st[b][3] is not self.fine[i - 1][0].patch_embed or not fine_ok(self.fine_dims(spacing[b], i))):
+                        continue
+                    act.append(b)
+                    inp.append(self.to_fine(z, xs[b], spacing[b], k, g, i))
+                if not act:
+                    break
+                ts = self.fine_mix([a[0] for a in inp], [a[1] for a in inp], [a[2] for a in inp], i)
+                for b, t, (_, _, gf, kf) in zip(act, ts, inp):
+                    st[b] = [t, kf, gf.tolist(), self.fine[i][0].patch_embed, st[b][4]]
+            out = [self.kernel_decode(z, emb, spacing[b], k, g)[:, : V[b][0], : V[b][1], : V[b][2]]
+                   for b, (z, k, g, emb, _) in enumerate(st)]
         return torch.stack([F.pad(o, [p for v, t in zip(reversed(o.shape[1:]), reversed(T)) for p in (0, t - v)])
                             for o in out])
 
@@ -202,8 +211,8 @@ class SegNet(nn.Module):
         return [a * 2 ** (1 - i) for a in self._cur[2]] if self._cur else patch_dims(sp.tolist(), self.fine_mm[i])
 
     def to_fine(self, z, vol, sp, k, g, i):
-        """Tokens [N, c] on grid g -> [Nf, 128] on the grid of half the patch (parent token + the voxels' embedding),
-        mixed along each curve in turn; returns them with the fine patch dims and grid."""
+        """Tokens [N, c] on grid g -> the fine level's inputs [Nf, 128] on the grid of half the patch (parent token +
+        the voxels' embedding), their coordinates, grid and patch dims; fine_mix mixes them along each curve."""
         from ..curves import grid_coords, keys
         from ..data.volume import patch_grid, patchify
 
@@ -250,12 +259,24 @@ class SegNet(nn.Module):
         elif self.image:
             e = self.fine[i][0].patch_embed
             t = t + e(patchify(vol.float(), kf), e.weights(sp.float(), kf))
-        cu = torch.tensor([*range(0, len(t), self.fine_seg or len(t)), len(t)], device=z.device, dtype=torch.int32)
+        return t, xyz, gf, kf
+
+    def fine_mix(self, ts: list, xyzs: list, gfs: list, i: int) -> list:
+        """Level i's refine blocks along each curve of fine_curves in turn, the tiles' sequences packed in one call
+        (cu_seqlens): a batch of sliding-window tiles costs one GDN-2 call per curve, not one per tile."""
+        from ..curves import keys
+
         for curve, enc in zip(self.fine_curves, self.fine[i]):
-            order = keys(curve, xyz, gf, self.seed).argsort()
+            orders = [keys(curve, xyz, gf, self.seed).argsort() for xyz, gf in zip(xyzs, gfs)]
+            cu, o = [0], 0
+            for t in ts:
+                cu += [o + j for j in range(self.fine_seg or len(t), len(t), self.fine_seg or len(t))] + [o + len(t)]
+                o += len(t)
+            cu = torch.tensor(cu, device=ts[0].device, dtype=torch.int32)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                t = enc.flat(t[order], cu).float()[order.argsort()]
-        return t, kf, gf.tolist()
+                h = enc.flat(torch.cat([t[od] for t, od in zip(ts, orders)]), cu).float()
+            ts = [hh[od.argsort()] for hh, od in zip(h.split([len(t) for t in ts]), orders)]
+        return ts
 
     def kernel_decode(self, z, emb, sp, k, g):
         """Tokens [N, c] on grid g -> logits [n_out, *(g k)] at the native voxels: per token coefficients in the
