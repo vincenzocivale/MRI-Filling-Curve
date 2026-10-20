@@ -347,7 +347,10 @@ def train(job: dict) -> None:
     out_p = Path(job["out"])
     ckpt, last, part = (out_p.with_suffix(s) for s in (".best.pt", ".last.pt", ".test.json"))
     out_p.parent.mkdir(parents=True, exist_ok=True)
-    key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])}
+    # + the wrapper's whole config and the tile rule: a run of another decoder in the same folder is never resumed
+    # (20/10: the token-cache runs resumed the cancelled tile runs' states, same iters / lr / seed)
+    key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
+        {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
     iters, every = int(job["iters"]), int(job["val_every"])
 
