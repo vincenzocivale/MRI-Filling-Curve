@@ -180,20 +180,14 @@ class SegNet(nn.Module):
         par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
         par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
         t = self.up[i](z)[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]]
-        if self.fine_tok is not None and self.refine_frac >= 1:   # the encoder at this level's patch (frozen; curves, taps as level 0)
-            pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
-            pe.patch_mm = self.fine_mm[i]
-            with torch.no_grad():
-                bf = self.extract({"patches": [patchify(vol.float(), kf)], "grid": gf[None], "k": torch.tensor([kf], device=z.device),
-                                   "spacing": sp[None].float()})["bi"][0, : len(xyz)]
-            pe.patch_mm = mm0
-            bf = bf[:, : bf.shape[1] // 2] if self.unique else bf
-            t = t + self.fine_tok[i](self.proj(bf))
-        elif self.fine_tok is not None:   # adaptive: only the children of the most edge-like parents, read as one sequence
-            zg = z.T.reshape(1, -1, *g)
-            edge = (zg - F.avg_pool3d(F.pad(zg, (1,) * 6, mode="replicate"), 3, 1)).norm(dim=1).flatten()   # [N parents]
-            top = edge >= edge.quantile(1 - self.refine_frac)
-            sel = top[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]].nonzero()[:, 0]
+        if self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
+            if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
+                sel = torch.arange(len(xyz), device=z.device)   # TotalSeg's 4 mm level, ~2e5 tokens, did not fit)
+            else:   # adaptive: only the children of the most edge-like parents
+                zg = z.T.reshape(1, -1, *g)
+                edge = (zg - F.avg_pool3d(F.pad(zg, (1,) * 6, mode="replicate"), 3, 1)).norm(dim=1).flatten()
+                top = edge >= edge.quantile(1 - self.refine_frac)
+                sel = top[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]].nonzero()[:, 0]
             if len(sel):
                 pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
                 pe.patch_mm = self.fine_mm[i]
