@@ -57,7 +57,7 @@ class SegNet(nn.Module):
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
-                 refine_frac: float = 1.0, token_cache: str | None = None):
+                 refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -128,6 +128,9 @@ class SegNet(nn.Module):
         self.cache, self._cur, self.width = (TokenCache(token_cache) if token_cache else None), None, width
         if self.cache is not None and getattr(self, "fine_tok", None) is not None:
             self.cache.levels = (16.0, 8.0, 4.0)
+            if fine_pca:   # the fine levels' tokens on token_cache.project's PCA basis: fine_tok reads them directly
+                self.cache.pca = int(fine_pca)
+                self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) for _ in range(self.refine))
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
@@ -213,7 +216,7 @@ class SegNet(nn.Module):
         if self._cur is not None and self.fine_tok is not None:   # fine_encoder from the cache: the whole-scan reading
             ci, corner, _ = self._cur                                 # of this level, last block ++ taps as at 16 mm
             tf = self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float()
-            t = t + self.fine_tok[i](self.proj(tf))
+            t = t + self.fine_tok[i](tf if self.cache.pca else self.proj(tf))
         elif self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
             if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
                 sel = torch.arange(len(xyz), device=z.device)   # TotalSeg's 4 mm level, ~2e5 tokens, did not fit)
@@ -368,7 +371,8 @@ class SFC(Wrapper):
                      zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
                      erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"),
                      image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")),
-                     refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"))
+                     refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"),
+                     fine_pca=int(self.args.get("fine_pca") or 0))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

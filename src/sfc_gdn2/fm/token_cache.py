@@ -9,6 +9,7 @@ whose grid holds more than `nmax` tokens is read in windows of `block` cells per
 on every side, keeping each window's centre (TotalSeg whole-body at 4 mm: ~5e6 tokens); the 4 mm level only where
 fine_ok. Stored as <out>/<id>.<mm>.npy [gx, gy, gz, C] fp16 + <out>/<id>.json {k4, spacing, shape}.
 
+    python -m sfc_gdn2.fm.token_cache project <job.json>   (the fine levels on a PCA basis: project())
     python -m sfc_gdn2.fm.token_cache <job.json>   {inputs, ids, out, checkpoint, args, shard, nmax, block, margin,
                                                     random: the seeded random encoder, for the random-encoder baseline}
 """
@@ -40,21 +41,22 @@ class TokenCache:
         from concurrent.futures import ThreadPoolExecutor
         self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(16)
         self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(4), {}, (16.0,), {}, 0
+        self.pca = None   # SegNet fine_pca: the 8 / 4 mm levels from <id>.<mm>.p<pca>.npy (project())
 
     def meta(self, i: str) -> dict:
         if i not in self._meta:
             self._meta[i] = json.loads((self.root / f"{i}.json").read_text())
         return self._meta[i]
 
-    def _open(self, i: str, mm: float):
-        key = (i, mm)
+    def _open(self, i: str, mm: float, pca: int | None = None):
+        key, name = (i, mm, pca), f"{i}.{int(mm)}{f'.p{pca}' if pca else ''}.npy"
         if key not in self._fd:
-            with open(self.root / f"{i}.{int(mm)}.npy", "rb") as f:
+            with open(self.root / name, "rb") as f:
                 major, _ = np.lib.format.read_magic(f)
                 read = np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0
                 shape, _, dtype = read(f)
                 off = f.tell()
-            self._fd[key] = (os.open(self.root / f"{i}.{int(mm)}.npy", os.O_RDONLY), shape, np.dtype(dtype), off)
+            self._fd[key] = (os.open(self.root / name, os.O_RDONLY), shape, np.dtype(dtype), off)
         return self._fd[key]
 
     def next_batch(self) -> None:
@@ -83,7 +85,7 @@ class TokenCache:
         return f[1].result() if f is not None else self._read(i, mm, corner, n, k)
 
     def _read(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
-        fd, shape, dt, off = self._open(i, mm)
+        fd, shape, dt, off = self._open(i, mm, self.pca if mm < 16 else None)
         C = shape[-1]
         c0 = [int(c) // int(kk) for c, kk in zip(corner, k)]
         c1 = [min(c + m, s) for c, m, s in zip(c0, n, shape[:3])]
@@ -173,5 +175,74 @@ def main(path: str) -> None:
         print(f"[cache] {c + 1}/{len(ids)} {i} k4 {list(k4)}", flush=True)
 
 
+def _read_rows(path: Path, n_sample: int, rng) -> np.ndarray:
+    """n_sample tokens of a level file in 8 contiguous runs (explicit reads), the empty (zero) ones dropped."""
+    with open(path, "rb") as f:
+        major, _ = np.lib.format.read_magic(f)
+        shape, _, _ = (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
+        off, C, N, run = f.tell(), shape[-1], int(np.prod(shape[:-1])), max(1, n_sample // 8)
+        out = []
+        for s in rng.choice(max(1, N - run), min(8, max(1, N - run)), replace=False):
+            f.seek(off + int(s) * C * 2)
+            out.append(np.frombuffer(f.read(run * C * 2), np.float16).reshape(-1, C))
+    t = np.concatenate(out).astype(np.float32)
+    return t[np.abs(t).sum(1) > 0]
+
+
+def project(path: str) -> None:
+    """The 8 and 4 mm levels on a fixed PCA basis (20/10): the decoder reads them only through a linear map
+    (fine_tok . proj, 4096 -> 128), so the leading `dim` components keep what any such map can take, minus the
+    variance dropped (512: 97-98 % of it for the pretrained encoder), at 4096 / dim the reads (Lustre-bound: 4 s per
+    iteration at 4096 channels). job {cache, dim, fit: ids (train volumes only), shard "i/n"}: shard 0/n fits
+    <cache>/pca<dim>.pt {mm: (mean, basis)} first (the other shards wait for it); every shard writes
+    <id>.<mm>.p<dim>.npy fp16."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    job = json.loads(Path(path).read_text())
+    root, dim = Path(job["cache"]), int(job["dim"])
+    i0, n = (int(v) for v in job.get("shard", "0/1").split("/"))
+    bfile = root / f"pca{dim}.pt"
+    if i0 == 0 and not bfile.exists():
+        rng, basis = np.random.default_rng(0), {}
+        for mm in (8, 4):
+            files = [root / f"{i}.{mm}.npy" for i in sorted(job["fit"]) if (root / f"{i}.{mm}.npy").exists()]
+            pick = [files[j] for j in rng.choice(len(files), min(len(files), 96), replace=False)]
+            with ThreadPoolExecutor(16) as ex:
+                x = torch.from_numpy(np.concatenate(list(ex.map(lambda q: _read_rows(q, 3200, rng), pick)))).cuda().double()
+            mu = x.mean(0)
+            ev, V = torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))
+            basis[mm] = (mu.float().cpu(), V[:, -dim:].flip(1).float().cpu())
+            print(f"[pca] {mm} mm: {len(x)} tokens of {len(pick)} train volumes, variance kept "
+                  f"{float(ev[-dim:].sum() / ev.sum()):.4f}", flush=True)
+        torch.save(basis, bfile.with_suffix(".tmp"))
+        os.replace(bfile.with_suffix(".tmp"), bfile)
+    while not bfile.exists():
+        time.sleep(30)
+    basis = {mm: (m.cuda(), V.cuda()) for mm, (m, V) in torch.load(bfile).items()}
+    ids = sorted(p.name.split(".")[0] for p in root.glob("*.json"))[i0::n]
+    for c, i in enumerate(ids):
+        for mm, (mu, V) in basis.items():
+            src, dst = root / f"{i}.{mm}.npy", root / f"{i}.{mm}.p{dim}.npy"
+            if not src.exists() or dst.exists():
+                continue
+            step, tmp = 1 << 16, dst.with_suffix(".tmp")
+            # sequential reads and writes of row blocks (a memmap on Lustre faults page by page)
+            with open(src, "rb") as f, open(tmp, "wb") as g:
+                major, _ = np.lib.format.read_magic(f)
+                shape, _, _ = (np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0)(f)
+                np.lib.format.write_array_header_1_0(g, {"descr": "<f2", "fortran_order": False,
+                                                         "shape": (*shape[:3], dim)})
+                N, C = int(np.prod(shape[:3])), shape[-1]
+                for r in range(0, N, step):
+                    m = min(step, N - r)
+                    t = torch.from_numpy(np.frombuffer(f.read(m * C * 2), np.float16).reshape(m, C)).cuda().float()
+                    keep = (t.abs().sum(1, keepdim=True) > 0).float()   # past the scan: stays zero
+                    g.write((((t - mu) @ V) * keep).half().cpu().numpy().tobytes())
+            os.replace(tmp, dst)
+        if c % 20 == 0:
+            print(f"[pca] {c + 1}/{len(ids)} {i}", flush=True)
+
+
 if __name__ == "__main__":
-    main(sys.argv[1])
+    project(sys.argv[2]) if sys.argv[1] == "project" else main(sys.argv[1])
