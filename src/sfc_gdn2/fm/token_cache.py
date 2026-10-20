@@ -15,6 +15,7 @@ fine_ok. Stored as <out>/<id>.<mm>.npy [gx, gy, gz, C] fp16 + <out>/<id>.json {k
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,24 +32,77 @@ def fine_ok(k) -> bool:
 
 
 class TokenCache:
-    """Crops of the cached tokens: tokens(id, level, corner voxel, cells per axis) -> [n, C] (zeros past the scan)."""
+    """Crops of the cached tokens: tokens(id, level, corner voxel, cells per axis) -> [n, C] (zeros past the scan).
+    Read with explicit contiguous reads (whole rows along the last axes), not a memmap: on Lustre a memmap faults its
+    pages in one by one, ~80 s per tile of 4 mm tokens (20/10)."""
 
     def __init__(self, root: str | Path):
-        self.root, self.ids, self._mm = Path(root), [], {}
+        from concurrent.futures import ThreadPoolExecutor
+        self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(16)
+        self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(1), {}, (16.0,), {}, 0
 
     def meta(self, i: str) -> dict:
-        return json.loads((self.root / f"{i}.json").read_text())
+        if i not in self._meta:
+            self._meta[i] = json.loads((self.root / f"{i}.json").read_text())
+        return self._meta[i]
+
+    def _open(self, i: str, mm: float):
+        key = (i, mm)
+        if key not in self._fd:
+            with open(self.root / f"{i}.{int(mm)}.npy", "rb") as f:
+                major, _ = np.lib.format.read_magic(f)
+                read = np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0
+                shape, _, dtype = read(f)
+                off = f.tell()
+            self._fd[key] = (os.open(self.root / f"{i}.{int(mm)}.npy", os.O_RDONLY), shape, np.dtype(dtype), off)
+        return self._fd[key]
+
+    def next_batch(self) -> None:
+        """A new batch is being prefetched: drop what the batch before the current one read."""
+        self._gen += 1
+        self._ahead = {k: v for k, v in self._ahead.items() if v[0] >= self._gen - 1}
+
+    def prefetch(self, ctx: torch.Tensor, T) -> None:
+        """Start reading the tokens a batch of tiles will ask for (ctx rows as SegNet takes them, tiles of T voxels)
+        while the current batch trains: the levels in `self.levels` (set by SegNet)."""
+        for r in ctx.tolist():
+            i, corner = self.ids[int(r[6])], [int(v) for v in r[7:10]]
+            V = [max(1, min(int(e) - c, t)) for e, c, t in zip(r[3:6], corner, T)]
+            k4 = self.meta(i)["k4"]
+            for mm in self.levels:
+                k = [a * int(mm // 4) for a in k4]
+                if mm < 8 and not fine_ok(k):
+                    continue
+                n = [-(-v // kk) for v, kk in zip(V, k)]
+                key = (i, mm, tuple(corner), tuple(n))
+                if key not in self._ahead:
+                    self._ahead[key] = (self._gen, self._io.submit(self._read, i, mm, corner, n, k))
 
     def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
-        key = (i, mm)
-        if key not in self._mm:
-            self._mm[key] = np.load(self.root / f"{i}.{int(mm)}.npy", mmap_mode="r")
-        a = self._mm[key]
+        f = self._ahead.get((i, mm, tuple(int(c) for c in corner), tuple(n)))   # kept: micro_step reads twice
+        return f[1].result() if f is not None else self._read(i, mm, corner, n, k)
+
+    def _read(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
+        fd, shape, dt, off = self._open(i, mm)
+        C = shape[-1]
         c0 = [int(c) // int(kk) for c, kk in zip(corner, k)]
-        out = np.zeros((*n, a.shape[-1]), np.float16)
-        src = tuple(slice(c, min(c + m, s)) for c, m, s in zip(c0, n, a.shape[:3]))
-        out[tuple(slice(0, s.stop - s.start) for s in src)] = a[src]
-        return torch.from_numpy(out.reshape(-1, a.shape[-1]))
+        c1 = [min(c + m, s) for c, m, s in zip(c0, n, shape[:3])]
+        out = np.zeros((*n, C), dt)
+        if all(b > a for a, b in zip(c0, c1)):
+            row, cell = shape[2] * C * dt.itemsize, C * dt.itemsize   # one (x, y) row of every z; one token
+            ny, nz = c1[1] - c0[1], c1[2] - c0[2]
+
+            def plane(x):   # Lustre serves parallel reads in parallel: one thread per x plane
+                base = off + (x * shape[1] + c0[1]) * row
+                if 2 * nz >= shape[2]:   # the crop spans most of z: the plane's y range in one read
+                    a = np.frombuffer(os.pread(fd, ny * row, base), dt).reshape(ny, shape[2], C)
+                    out[x - c0[0], :ny, :nz] = a[:, c0[2]: c1[2]]
+                else:                    # long z (whole-body scans): each row's z range
+                    for y in range(ny):
+                        out[x - c0[0], y, :nz] = np.frombuffer(os.pread(fd, nz * cell, base + y * row + c0[2] * cell),
+                                                               dt).reshape(nz, C)
+            list(self._pool.map(plane, range(c0[0], c1[0])))
+        return torch.from_numpy(out.reshape(-1, C))
 
 
 @torch.no_grad()

@@ -399,8 +399,15 @@ def train(job: dict) -> None:
                 m.eval()
 
         set_mode()
+        nxt = data.sample(int(job["batch"]))
         for it in range(start, iters + 1):
-            x, y, c = data.sample(int(job["batch"]))
+            x, y, c = nxt
+            if it < iters:   # the next batch drawn now, its cached tokens read while this one trains
+                nxt = data.sample(int(job["batch"]))
+                if tcache is not None:
+                    tcache.next_batch()
+                    for xi, ci in (zip(nxt[0], nxt[2]) if isinstance(nxt[0], list) else [(nxt[0], nxt[2])]):
+                        tcache.prefetch(ci, tuple(xi.shape[2:]))
             opt.zero_grad(set_to_none=True)
             if isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
                 loss = micro_step(net, x, y, c, k, amp, dev)

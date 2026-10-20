@@ -126,6 +126,8 @@ class SegNet(nn.Module):
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
         # every decoder can read the cached whole-scan tokens (20/10)
         self.cache, self._cur, self.width = (TokenCache(token_cache) if token_cache else None), None, width
+        if self.cache is not None and getattr(self, "fine_tok", None) is not None:
+            self.cache.levels = (16.0, 8.0, 4.0)
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
