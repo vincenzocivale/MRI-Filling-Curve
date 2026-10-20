@@ -52,6 +52,7 @@ from .worker import build, fail, prepared
 # token-cache runs (20/10): tiles of TILE_CELLS 16 mm cells per axis (16 cm, as the resampled models' 160 voxels at
 # ~1 mm) instead of 160 native voxels (67 cm of TotalSeg's 4.2 mm voxels, 7 cm of SOOP's 0.45 mm)
 TILE_CELLS = 10
+JOINT_MAX = 2e8   # voxels x classes of a batch that joint_step keeps in graphs (~5 GB of fp32 logits and softmax)
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
 
@@ -427,7 +428,10 @@ def train(job: dict) -> None:
                     for xi, ci in (zip(nxt[0], nxt[2]) if isinstance(nxt[0], list) else [(nxt[0], nxt[2])]):
                         tcache.prefetch(ci, tuple(xi.shape[2:]))
             opt.zero_grad(set_to_none=True)
-            if tcache is not None and (isinstance(x, list) or k > 10):   # small cm tiles: both graphs fit (20/10)
+            # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
+            # of ~1e7 voxels x 50 classes: then micro_step (the two graphs of joint_step went OOM)
+            vox = sum(t.numel() for t in x) if isinstance(x, list) else x.numel()
+            if tcache is not None and (isinstance(x, list) or k > 10) and vox * k <= JOINT_MAX:
                 loss = joint_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             elif isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
