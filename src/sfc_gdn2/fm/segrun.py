@@ -280,6 +280,24 @@ def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
     return sum(s[0] for s in sums) / n + 1 - dice.mean()
 
 
+def joint_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
+    """micro_step's loss and gradient with every scan's graph kept: one forward per scan and one backward (tiles of
+    several shapes that fit together: the token-cache runs' 16 cm tiles; micro_step's no-grad pass doubled the work)."""
+    parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
+        [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
+    sums = []
+    for xi, yi, ci in parts:
+        with amp():
+            logits = call(net, xi.to(dev).float(), ci)
+        sums.append(batch_sums(logits, yi.to(dev), k))
+    n = sum(s[1] for s in sums)
+    inter, psum, tsum = (sum(s[j] for s in sums) for j in (2, 3, 4))
+    dice = (2 * inter[1:] + 1e-5) / (psum[1:] + tsum[1:] + 1e-5)
+    loss = sum(s[0] for s in sums) / n + 1 - dice.mean()
+    loss.backward()
+    return loss.detach()
+
+
 def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
     y = y.long()
     ce = F.cross_entropy(logits.float(), y, ignore_index=255)
@@ -409,7 +427,10 @@ def train(job: dict) -> None:
                     for xi, ci in (zip(nxt[0], nxt[2]) if isinstance(nxt[0], list) else [(nxt[0], nxt[2])]):
                         tcache.prefetch(ci, tuple(xi.shape[2:]))
             opt.zero_grad(set_to_none=True)
-            if isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
+            if tcache is not None and (isinstance(x, list) or k > 10):   # small cm tiles: both graphs fit (20/10)
+                loss = joint_step(net, x, y, c, k, amp, dev)
+                logits = torch.zeros(1, device=dev)
+            elif isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
                 loss = micro_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             else:
