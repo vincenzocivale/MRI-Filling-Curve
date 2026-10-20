@@ -39,7 +39,7 @@ class TokenCache:
     def __init__(self, root: str | Path):
         from concurrent.futures import ThreadPoolExecutor
         self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(16)
-        self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(1), {}, (16.0,), {}, 0
+        self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(4), {}, (16.0,), {}, 0
 
     def meta(self, i: str) -> dict:
         if i not in self._meta:
