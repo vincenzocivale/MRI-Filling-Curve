@@ -100,7 +100,10 @@ def bench_probe(cfg: dict, args) -> None:
         bp.tune(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), args.device, cfg["probe"].get("menu"))
         return
     seeds = [int(s) for s in args.seeds.split(",")]
-    common = {m: root / m for m in args.common} if args.common else None
+    croot = Path(cfg["fm"].get("common_root") or root)   # the reference models' features (fm.out_root may hold one model)
+    common = {m: croot / m for m in args.common} if args.common else None
+    missing = [str(d) for d in (common or {}).values() if not d.is_dir()]
+    assert not missing, f"--common: no features in {missing} (set fm.common_root)"
     bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device, common,
            cfg["probe"].get("menu"), cfg["probe"].get("extra"))
 
