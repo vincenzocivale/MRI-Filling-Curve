@@ -54,7 +54,9 @@ def _pmap(fn, items, initargs=()):
         return
     # results come back as numpy (pickled through the pipe): torch tensors travel as shared-memory fds, and on the
     # serial partition mapping them failed (ENOMEM) in the pool's result thread, which hangs the pool (20/10)
-    with mp.get_context("fork").Pool(w, initializer=_init_basis if initargs else None, initargs=initargs) as pool:
+    # spawn, not fork: a pool forked after the parent ran torch's OpenMP threads hung in its first parallel op (the
+    # 12 mm readings after the 16 mm second-order pass, 20/10: every worker asleep at 0 % CPU)
+    with mp.get_context("spawn").Pool(w, initializer=_init_basis if initargs else None, initargs=initargs) as pool:
         for r in pool.imap(functools.partial(_as_np, fn), items, chunksize=8):
             yield _as_torch(r)
 
