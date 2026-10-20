@@ -231,12 +231,20 @@ class SegNet(nn.Module):
         basis of `emb` (KernelEmbed), each voxel the mean of that function over its extent (same 1D integrals)."""
         # each basis function at RMS 1 over the patch's voxels (any spacing), the sum of r^3 terms over r^1.5: the
         # trained encoder's phi reach 1.3, unscaled every Adam step moved the logits by ~10 (no learning, 17/10)
-        px, py, pz = (p / p.pow(2).mean(0, keepdim=True).sqrt().clamp_min(1e-6) for p in emb.axis_integrals(sp, k))
         r = emb.rank
+        # rank per axis = the cell's voxels on that axis (at most r, 20/10): more functions than voxels are redundant,
+        # and with ~50 classes the r^3 coefficients per token made decoder F unusable on TotalSeg (~57 s per iteration)
+        R = [min(r, int(a)) for a in k]
+        px, py, pz = (p[:, :q] / p[:, :q].pow(2).mean(0, keepdim=True).sqrt().clamp_min(1e-6)
+                      for p, q in zip(emb.axis_integrals(sp, k), R))
+        lin = self.coef[-1]
+        w = lin.weight.view(-1, r, r, r, lin.in_features)[:, : R[0], : R[1], : R[2]].reshape(-1, lin.in_features)
+        b = lin.bias.view(-1, r, r, r)[:, : R[0], : R[1], : R[2]].reshape(-1)
 
-        def dec(zz):   # in chunks recomputed in backward: the coefficients are tokens x classes x r^3
-            return torch.einsum("noabc,xa,yb,zc->noxyz", self.coef(zz).view(len(zz), -1, r, r, r), px, py, pz) / r ** 1.5
-        n = max(1, (1 << 25) // (self.coef[-1].out_features))
+        def dec(zz):   # in chunks recomputed in backward: the coefficients are tokens x classes x R0 R1 R2
+            c = nn.functional.linear(self.coef[:-1](zz), w, b).view(len(zz), -1, *R)
+            return torch.einsum("noabc,xa,yb,zc->noxyz", c, px, py, pz) / (R[0] * R[1] * R[2]) ** 0.5
+        n = max(1, (1 << 25) // max(len(b), 1))
         m = torch.cat([checkpoint(dec, z[i:i + n], use_reentrant=False) for i in range(0, len(z), n)])
         o = m.shape[1]
         return m.reshape(*g, o, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(o, *(a * c for a, c in zip(g, k)))

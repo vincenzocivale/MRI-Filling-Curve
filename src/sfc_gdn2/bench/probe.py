@@ -339,10 +339,13 @@ def run(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, spl
         for seed in seeds:
             rows = task_rows(vols, splits, cfg, seed)
             for m, (ids, feats) in loaded.items():
-                res = run_task(tname, cfg, rows, feats, {i: k for k, i in enumerate(ids)}, device)
                 dst = out_dir / tname / f"s{seed}" / f"{m}.json"
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_text(json.dumps(res | {"model": m, "seed": seed}, indent=1))
+                if dst.exists():  # a chained job resumes: the seeds already written are not fitted again
+                    res = json.loads(dst.read_text())
+                else:
+                    res = run_task(tname, cfg, rows, feats, {i: k for k, i in enumerate(ids)}, device)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(json.dumps(res | {"model": m, "seed": seed}, indent=1))
                 key = res["metric"]
                 for variant in HIDDEN:
                     r = res[variant]
