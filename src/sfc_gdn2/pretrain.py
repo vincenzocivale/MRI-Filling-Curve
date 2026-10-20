@@ -43,6 +43,13 @@ def repatch(batch: dict, mm: float) -> dict:
     return batch | {"k": torch.tensor(k), "grid": grid}
 
 
+def fp32_forward(f):
+    def g(x):
+        with torch.autocast("cuda", enabled=False):
+            return f(x.float())
+    return g
+
+
 def lr_factor(step: int, t: dict) -> float:
     """Linear warmup, then `schedule`: cosine to 0 at `steps`, or wsd (warmup-stable-decay): constant until the
     last `decay_steps`, then 1 - sqrt to 0 (Hägele et al. 2024). WSD's decay can start from any checkpoint of
@@ -144,6 +151,9 @@ class Pretrainer:
         self.net = LeJEPA.from_config(cfg).to(self.device)
         if t.get("sync_bn") and world > 1:   # the projector's BatchNorm on the global batch (as SIGReg), whatever the
             self.net = nn.SyncBatchNorm.convert_sync_batchnorm(self.net)   # GPUs: same parameters, same state dict
+            for m in self.net.modules():   # in fp32: under bf16 autocast SyncBatchNorm's kernel failed ("Expected
+                if isinstance(m, nn.SyncBatchNorm):   # counts to have type BFloat16 but got Float", 21/10)
+                    m.forward = fp32_forward(m.forward)
         self.session = torch.tensor(ses)
         self.model = DistributedDataParallel(self.net, device_ids=[self.device.index]) if world > 1 else self.net
         muon = t.get("optimizer", "adamw") == "muon"
