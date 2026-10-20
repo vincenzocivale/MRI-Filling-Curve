@@ -102,7 +102,7 @@ def bench_probe(cfg: dict, args) -> None:
     seeds = [int(s) for s in args.seeds.split(",")]
     common = {m: root / m for m in args.common} if args.common else None
     bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device, common,
-           cfg["probe"].get("menu"))
+           cfg["probe"].get("menu"), cfg["probe"].get("extra"))
 
 
 def bench_segdec(cfg: dict, args) -> None:
