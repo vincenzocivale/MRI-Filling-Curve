@@ -28,6 +28,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .base import Image, Wrapper
+from .token_cache import TokenCache, fine_ok
 
 SEG_PATCH = (160, 160, 160)   # voxels, as the Primus / nnFoundation ViT runs
 DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
@@ -123,7 +124,7 @@ class SegNet(nn.Module):
             self.coef = nn.Sequential(nn.Linear(c, 64), nn.GELU(), nn.Linear(64, n_out * encoder.patch_embed.rank ** 3))
             del self.decode
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
-        from .token_cache import TokenCache  # every decoder can read the cached whole-scan tokens (20/10)
+        # every decoder can read the cached whole-scan tokens (20/10)
         self.cache, self._cur, self.width = (TokenCache(token_cache) if token_cache else None), None, width
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
@@ -141,6 +142,8 @@ class SegNet(nn.Module):
         ext = spacing[:, 3:6].long().tolist() if spacing.shape[1] > 3 else [T] * len(x)
         spacing = spacing[:, :3]
         V = [tuple(min(a, t) for a, t in zip(e, T)) for e in ext]                           # the scan's part of each tile
+        if cached:   # tiles anywhere on the scan (segrun pads the volume so the last one ends on the 16 mm grid)
+            V = [tuple(max(1, min(a - c, t)) for a, c, t in zip(e, co, T)) for e, co in zip(ext, corners)]
         xs = [x[b, 0, : v[0], : v[1], : v[2]].float() for b, v in enumerate(V)]
         if cached:
             ids = [self.cache.ids[v] for v in vids]
@@ -170,7 +173,9 @@ class SegNet(nn.Module):
             if self.kernel:
                 emb, z = self.encoder.patch_embed, z[0].flatten(1).T                      # [N, c]
                 self._cur = (ids[b], corners[b], k4s[b]) if cached else None
-                for i in range(self.refine):
+                for i in range(self.refine):   # the finer levels only while their cells hold >= 8 voxels
+                    if i and not fine_ok(self.fine_dims(spacing[b], i)):
+                        break
                     z, k, g = self.to_fine(z, xs[b], spacing[b], k, g, i)
                     emb = self.fine[i][0].patch_embed
                 out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : v[0], : v[1], : v[2]])
@@ -186,13 +191,18 @@ class SegNet(nn.Module):
         return torch.stack([F.pad(o, [p for v, t in zip(reversed(o.shape[1:]), reversed(T)) for p in (0, t - v)])
                             for o in out])
 
+    def fine_dims(self, sp, i) -> list:
+        """Voxels per axis of a level-i fine cell: the cache's nested grids (k4 x 2^(1-i)), else the level's patch."""
+        from ..data.volume import patch_dims
+        return [a * 2 ** (1 - i) for a in self._cur[2]] if self._cur else patch_dims(sp.tolist(), self.fine_mm[i])
+
     def to_fine(self, z, vol, sp, k, g, i):
         """Tokens [N, c] on grid g -> [Nf, 128] on the grid of half the patch (parent token + the voxels' embedding),
         mixed along each curve in turn; returns them with the fine patch dims and grid."""
         from ..curves import grid_coords, keys
-        from ..data.volume import patch_dims, patch_grid, patchify
+        from ..data.volume import patch_grid, patchify
 
-        kf = [a * 2 ** (1 - i) for a in self._cur[2]] if self._cur else patch_dims(sp.tolist(), self.fine_mm[i])
+        kf = self.fine_dims(sp, i)
         gf = patch_grid(vol.shape, kf).to(z.device)
         xyz = grid_coords(gf[None], int(gf.prod()))[0]                                    # [Nf, 3] raster
         par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()

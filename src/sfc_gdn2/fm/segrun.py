@@ -49,6 +49,9 @@ import torch.nn.functional as F
 from ..bench.geom import gt_labels
 from .worker import build, fail, prepared
 
+# token-cache runs (20/10): tiles of TILE_CELLS 16 mm cells per axis (16 cm, as the resampled models' 160 voxels at
+# ~1 mm) instead of 160 native voxels (67 cm of TotalSeg's 4.2 mm voxels, 7 cm of SOOP's 0.45 mm)
+TILE_CELLS = 10
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
 
@@ -116,11 +119,17 @@ def call(net, x: torch.Tensor, ctx):
     return net(x) if ctx is None else net(x, ctx.to(x.device))
 
 
+def tile_of(patch, align):
+    """The tile in voxels: the wrapper's patch, or under the token cache TILE_CELLS cells of 16 mm per axis (`align`)."""
+    return patch if align is None else [TILE_CELLS * a for a in align]
+
+
 @torch.no_grad()
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
     on that grid (token cache), the volume padded so that the last tile ends on it."""
     S = tuple(x.shape[1:])
+    patch = tile_of(patch, align)
     patch = S if patch is None else tuple(patch)
     if align is not None:
         tgt = [p + -(-max(s - p, 0) // a) * a for s, p, a in zip(S, patch, align)]
@@ -131,7 +140,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) 
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
               for s, p in zip(P, patch)]
     if align is not None:
-        starts = [np.unique(np.append(st // a * a, s - p)) for st, a, s, p in zip(starts, align, P, patch)]
+        starts = [np.unique(np.append(np.asarray(st) // a * a, s - p)) for st, a, s, p in zip(starts, align, P, patch)]
     g = gaussian(patch, x.device)
     # fp16 accumulator on the device if it takes <= 1/4 of the free memory, else on the CPU (nnU-Net's predictor does
     # both; "fits at all" left the tiles' forward no room: nnF CNN OOM on whole-body TotalSeg grids)
@@ -193,11 +202,13 @@ class Patches:
     """Random training patches from volumes held in RAM; 1/3 centred on a voxel of a random present class."""
 
     def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator):
-        self.vols, self.ctx, self.patch, self.rng, self.align = [], [], patch, rng, []
+        self.vols, self.ctx, self.patch, self.rng, self.align = [], [], [], rng, []
         for v in vols:
-            x, y = pad_to(v["x"], v["y"], patch) if patch else (v["x"], v["y"])
+            pv = tile_of(patch, v.get("align"))
+            x, y = pad_to(v["x"], v["y"], pv) if pv else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
             self.align.append(v.get("align"))
+            self.patch.append(pv)
             fg = {}
             for c in range(1, k):
                 idx = (y == c).nonzero()
@@ -205,14 +216,16 @@ class Patches:
                     fg[c] = idx[torch.from_numpy(rng.choice(len(idx), min(len(idx), 2000), replace=False))]
             self.vols.append((x, y, fg))
 
-    def sample(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def sample(self, n: int) -> tuple:
+        """Batches of n patches; tiles of different shapes (cm-sized tiles of scans with different spacings) come as
+        lists of [1, ...] tensors."""
         xs, ys, cs = [], [], []
         for _ in range(n):
             j = self.rng.integers(len(self.vols))
             x, y, fg = self.vols[j]
             cs.append(self.ctx[j])
             S = np.array(y.shape)
-            P = S if self.patch is None else np.array(self.patch)
+            P = S if self.patch[j] is None else np.array(self.patch[j])
             if fg and self.rng.random() < 1 / 3:
                 vox = fg[list(fg)[self.rng.integers(len(fg))]]
                 c = vox[self.rng.integers(len(vox))].numpy()
@@ -225,6 +238,8 @@ class Patches:
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
             ys.append(y[sl])
+        if len({t.shape for t in xs}) > 1:
+            return [t[None] for t in xs], [t[None] for t in ys], None if cs[0] is None else [t[None] for t in cs]
         return torch.stack(xs), torch.stack(ys), None if cs[0] is None else torch.stack(cs)
 
 
@@ -244,7 +259,8 @@ def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
     decoder F on TotalSeg did not fit with 2 tiles). The soft Dice sums over the batch before dividing, so a first
     pass without gradient gives the batch's sums; then each scan backpropagates a loss linear in its own sums with
     the batch's derivatives as coefficients: the same gradient as the batch of 2, one more forward pass."""
-    parts = [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
+    parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
+        [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
     sums = []
     for xi, yi, ci in parts:
         with torch.no_grad(), amp():
@@ -383,7 +399,7 @@ def train(job: dict) -> None:
         for it in range(start, iters + 1):
             x, y, c = data.sample(int(job["batch"]))
             opt.zero_grad(set_to_none=True)
-            if getattr(w, "seg_microbatch", False) and k > 10:
+            if isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
                 loss = micro_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             else:
@@ -394,8 +410,9 @@ def train(job: dict) -> None:
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
             if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
                 raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "
-                                         f"{bool(torch.isfinite(logits).all())}, input finite {bool(torch.isfinite(x).all())}, "
-                                         f"context {None if c is None else c.tolist()}")
+                                         f"{bool(torch.isfinite(logits).all())}, input finite "
+                                         f"{all(bool(torch.isfinite(t).all()) for t in (x if isinstance(x, list) else [x]))}, "
+                                         f"context {None if c is None else [t.tolist() for t in c]}")
             opt.step()
             sched.step()
             if it % every == 0 or it == iters:

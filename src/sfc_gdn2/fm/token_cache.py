@@ -6,8 +6,8 @@ voxels per axis at 4 mm, 2 k4 at 8 mm, 4 k4 at 16 mm, so a tile whose corner sit
 cells of every level. Each token is the encoder's reading along each curve of the run (averaged), as SegNet's: at
 every level as last block ++ the decoder's taps (the width SegNet.proj takes; each decoder keeps its channels). A scan
 whose grid holds more than `nmax` tokens is read in windows of `block` cells per axis with `margin` cells of context
-on every side, keeping each window's centre (TotalSeg whole-body at 4 mm: ~5e6 tokens). Stored as
-<out>/<id>.<mm>.npy [gx, gy, gz, C] fp16 + <out>/<id>.json {k4, spacing, shape}.
+on every side, keeping each window's centre (TotalSeg whole-body at 4 mm: ~5e6 tokens); the 4 mm level only where
+fine_ok. Stored as <out>/<id>.<mm>.npy [gx, gy, gz, C] fp16 + <out>/<id>.json {k4, spacing, shape}.
 
     python -m sfc_gdn2.fm.token_cache <job.json>   {inputs, ids, out, checkpoint, args, shard, nmax, block, margin,
                                                     random: the seeded random encoder, for the random-encoder baseline}
@@ -22,6 +22,12 @@ import numpy as np
 import torch
 
 LEVELS = ((16.0, 4), (8.0, 2), (4.0, 1))   # (mm, cells of 4 mm per axis)
+
+
+def fine_ok(k) -> bool:
+    """A fine level is read only where its cell holds >= 2 voxels per axis on average (>= 8 voxels): finer cells of
+    coarse scans are single voxels (TotalSeg 4.2 x 4.2 x 2 mm at 4 mm: [1, 1, 2]), nothing left to refine (20/10)."""
+    return int(np.prod(k)) >= 8
 
 
 class TokenCache:
@@ -104,11 +110,13 @@ def main(path: str) -> None:
         x, sp = r["x"].cuda(), r["ctx"].float().cuda()
         k4 = patch_dims(sp.tolist(), 4.0)
         for mm, m in LEVELS:
+            if mm < 8 and not fine_ok([kk * m for kk in k4]):
+                continue
             a = read(enc, curves, seed, x, sp, [kk * m for kk in k4], mm, job.get("nmax", 200_000),
-                     job.get("block", 40), job.get("margin", 8), taps=True)
+                     job.get("block", 64), job.get("margin", 8), taps=True)
             np.save(out / f"{i}.{int(mm)}.npy", a)
         (out / f"{i}.json").write_text(json.dumps({"k4": list(k4), "spacing": sp.tolist(), "shape": list(x.shape[1:])}))
-        print(f"[cache] {c + 1}/{len(ids)} {i} grid4 {np.load(out / f'{i}.4.npy', mmap_mode='r').shape[:3]}", flush=True)
+        print(f"[cache] {c + 1}/{len(ids)} {i} k4 {list(k4)}", flush=True)
 
 
 if __name__ == "__main__":
