@@ -20,6 +20,7 @@ out-of-fold predictions, a cross-fitted choice of head; one `skill` per task (0 
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 from pathlib import Path
@@ -51,8 +52,21 @@ def _pmap(fn, items, initargs=()):
             _init_basis(*initargs)
         yield from map(fn, items)
         return
+    # results come back as numpy (pickled through the pipe): torch tensors travel as shared-memory fds, and on the
+    # serial partition mapping them failed (ENOMEM) in the pool's result thread, which hangs the pool (20/10)
     with mp.get_context("fork").Pool(w, initializer=_init_basis if initargs else None, initargs=initargs) as pool:
-        yield from pool.imap(fn, items, chunksize=8)
+        for r in pool.imap(functools.partial(_as_np, fn), items, chunksize=8):
+            yield _as_torch(r)
+
+
+def _as_np(fn, item):
+    r = fn(item)
+    return {k: (v.float() if v.dtype == torch.bfloat16 else v).numpy() if torch.is_tensor(v) else v
+            for k, v in r.items()} if isinstance(r, dict) else r
+
+
+def _as_torch(r):
+    return {k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k, v in r.items()} if isinstance(r, dict) else r
 
 
 def _globals_one(path: Path) -> dict:
