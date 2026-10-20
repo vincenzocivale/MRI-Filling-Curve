@@ -52,6 +52,7 @@ from .worker import build, fail, prepared
 # token-cache runs (20/10): tiles of TILE_CELLS 16 mm cells per axis (16 cm, as the resampled models' 160 voxels at
 # ~1 mm) instead of 160 native voxels (67 cm of TotalSeg's 4.2 mm voxels, 7 cm of SOOP's 0.45 mm)
 TILE_CELLS = 10
+TILE_MAX = 1e9   # voxels x classes of one tile
 JOINT_MAX = 2e8   # voxels x classes of a batch that joint_step keeps in graphs (~5 GB of fp32 logits and softmax)
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
@@ -120,9 +121,16 @@ def call(net, x: torch.Tensor, ctx):
     return net(x) if ctx is None else net(x, ctx.to(x.device))
 
 
-def tile_of(patch, align):
-    """The tile in voxels: the wrapper's patch, or under the token cache TILE_CELLS cells of 16 mm per axis (`align`)."""
-    return patch if align is None else [TILE_CELLS * a for a in align]
+def tile_of(patch, align, k: int = 2):
+    """The tile in voxels: the wrapper's patch, or under the token cache TILE_CELLS cells of 16 mm per axis (`align`),
+    fewer where voxels x classes would pass TILE_MAX (TotalSeg's 0.25 mm scans: 640 x 640 x 200 voxels x 50 classes,
+    16 GB for one softmax, OOM even one scan at a time; never with 2 classes)."""
+    if align is None:
+        return patch
+    n = TILE_CELLS
+    while n > 1 and math.prod(n * a for a in align) * k > TILE_MAX:
+        n -= 1
+    return [n * a for a in align]
 
 
 @torch.no_grad()
@@ -130,7 +138,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) 
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
     on that grid (token cache), the volume padded so that the last tile ends on it."""
     S = tuple(x.shape[1:])
-    patch = tile_of(patch, align)
+    patch = tile_of(patch, align, n_out)
     patch = S if patch is None else tuple(patch)
     if align is not None:
         tgt = [p + -(-max(s - p, 0) // a) * a for s, p, a in zip(S, patch, align)]
@@ -212,7 +220,7 @@ class Patches:
     def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator):
         self.vols, self.ctx, self.patch, self.rng, self.align = [], [], [], rng, []
         for v in vols:
-            pv = tile_of(patch, v.get("align"))
+            pv = tile_of(patch, v.get("align"), k)
             x, y = pad_to(v["x"], v["y"], pv) if pv else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
             self.align.append(v.get("align"))
