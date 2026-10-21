@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import os
 from pathlib import Path
 
@@ -505,14 +506,84 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit:
     return feats
 
 
+def _map_keys(d: Path, ids: list[str]) -> list[str]:
+    """A model's stored spatial features: maps [C, *spatial] and token sets [T, C] (not the global vectors)."""
+    f = torch.load(d / f"{ids[0]}.pt", map_location="cpu", weights_only=False)["features"]
+    return sorted(k for k, v in f.items() if isinstance(v, torch.Tensor) and v.is_floating_point() and v.ndim >= 2
+                  and math.prod(v.shape[1:] if v.ndim > 2 else v.shape[:1]) > 1)
+
+
+def _tokens(v: torch.Tensor) -> torch.Tensor:
+    v = v.float()
+    return v if v.ndim == 2 else v.flatten(1).T   # tokens [T, C] / map [C, *spatial] -> [N, C]
+
+
+def _ext_one(path: Path) -> dict:
+    """One file of another model -> per stored map: the per-channel std and the covariance square root (in that map's
+    basis) of its tokens (the readings ours had alone, 21/10)."""
+    basis, _ = _BASIS
+    f = torch.load(path, map_location="cpu", weights_only=False)["features"]
+    out = {}
+    for k, (mu, p) in basis.items():
+        t = _tokens(f[k])
+        out[f"std:{k}"] = t.std(0).half() if len(t) > 1 else torch.zeros(t.shape[1]).half()
+        z = (t - mu) @ p
+        z = z - z.mean(0)
+        dk = p.shape[1]
+        e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dk))
+        iu = torch.triu_indices(dk, dk)
+        out[f"cov:{k}"] = ((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half()
+    return out
+
+
+def second_order_ext(d: Path, ids: list[str], keys: list[str], dim: int = 64, sample: int = 400,
+                     fit: set | None = None) -> dict:
+    """Another model's second-order readings, as second_order for ours (user, 21/10: the same readings for every
+    model): for each stored map, the per-channel std of its tokens and the covariance square root on the first `dim`
+    principal directions (fit on `sample` tune volumes, 200 tokens each). One pass; cached in <d>/_second_order_ext.pt."""
+    cache = d / "_second_order_ext.pt"
+    if cache.exists() and (c := torch.load(cache))["ids"] == ids:
+        return c["feats"]
+    g = torch.Generator().manual_seed(0)
+    pool: dict[str, list] = {}
+    cand = [i for i in ids if fit is None or i in fit]
+    for k in torch.randperm(len(cand), generator=g)[:sample].tolist():
+        f = torch.load(d / f"{cand[k]}.pt", map_location="cpu", weights_only=False)["features"]
+        for key in keys:
+            t = _tokens(f[key])
+            pool.setdefault(key, []).append(t[torch.randperm(len(t), generator=g)[:200]])
+    basis = {}
+    for key, ts in pool.items():
+        x = torch.cat(ts)
+        mu = x.mean(0)
+        basis[key] = mu, torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))[1][:, -min(dim, x.shape[1]):]
+    out: dict[str, list] = {}
+    for n, r in enumerate(_pmap(_ext_one, [d / f"{i}.pt" for i in ids], (basis, dim))):
+        for name, c in r.items():
+            out.setdefault(name, []).append(c)
+        if n % 1000 == 0:
+            print(f"[probe] second order (ext) {d.name} {n}/{len(ids)}", flush=True)
+    feats = {name: torch.stack(v) for name, v in out.items()}
+    torch.save({"ids": ids, "feats": feats}, cache)
+    return feats
+
+
 def readings(m: str, d: Path, fit: set | None = None, extra: dict | None = None) -> tuple[list[str], dict[str, torch.Tensor]]:
     """The readings a model's tuning probe chooses from on val, together with head and L2 (user, 16/10: try them all,
     keep the best on val). Ours: the last block's foreground mean (`mean`), the intermediate blocks' (mean_b<k>), all
     of them concatenated (`blocks`), each with the per-channel std, with the covariance square root (`second_order`,
     all patches or foreground only). Another model: its stored features."""
     ids, f = load_globals(d)
-    if not m.startswith("sfc_gdn2"):
-        return ids, f
+    if not m.startswith("sfc_gdn2"):   # its stored features, plus each map's std / covariance (as ours, 21/10)
+        keys = [k for k in _map_keys(d, ids) if k in f]   # the maps every volume holds (load_globals' intersection)
+        so = second_order_ext(d, ids, keys, fit=fit)
+        menu = dict(f)
+        for k in keys:
+            menu[f"{k}+std"] = torch.cat([f[k], so[f"std:{k}"].float()], 1)
+            menu[f"{k}+covsqrt"] = torch.cat([f[k], so[f"cov:{k}"].float()], 1)
+        if len(keys) > 1:
+            menu["maps+std"] = torch.cat([f[k] for k in keys] + [so[f"std:{k}"].float() for k in keys], 1)
+        return ids, menu
     w = f["mean"].shape[1] // 2
     if torch.equal(f["mean"][:, :w], f["mean"][:, w:]):  # one-stream encoder: bi = h ++ h, keep h (half the fits)
         f = {k: v[:, :w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
