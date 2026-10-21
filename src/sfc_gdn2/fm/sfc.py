@@ -332,6 +332,13 @@ class SegNet(nn.Module):
     def _dilate(sel: torch.Tensor, g) -> torch.Tensor:
         return F.max_pool3d(sel.float().view(1, 1, *g), 3, 1, 1).flatten().bool()
 
+    @staticmethod
+    def _pred_edge(cl: torch.Tensor, g) -> torch.Tensor:
+        """Cells whose predicted class differs from one of their 26 neighbours' (the predicted boundary): decoded at
+        every voxel whatever the head's confidence (21/10: a head sure everywhere decoded nothing, blocks of 4 mm)."""
+        a = cl.argmax(1).float().view(1, 1, *g)
+        return (F.max_pool3d(a, 3, 1, 1) != -F.max_pool3d(-a, 3, 1, 1)).flatten()
+
     def _cell_sums(self, cl: torch.Tensor, hist: torch.Tensor) -> list:
         """Cells predicted by one logit vector each ([M, n_out]) and their voxels' label counts [M, n_out] -> the exact
         voxel sums of sums() (every voxel of a cell shares the cell's probabilities)."""
@@ -360,7 +367,8 @@ class SegNet(nn.Module):
             # the edge cells (at most `edges` of all cells) per step, the rest of them through the cell head as at test
             edge = (hist > 0).sum(1) > 1
             r = torch.rand(len(u), device=z.device)
-            sel = (edge & (r < edges * len(u) / max(int(edge.sum()), 1))) | (u >= u.quantile(1 - unsure)) | (r > 1 - rand)
+            sel = (edge & (r < edges * len(u) / max(int(edge.sum()), 1))) | (u >= u.quantile(1 - unsure)) | (r > 1 - rand) \
+                | self._pred_edge(cl.detach(), g)   # as at test
             f = self._cell_sums(cl[~sel], hist[~sel])
             if sel.any():
                 lg = self.kernel_decode(z[sel], emb, sp[b], k, None).flatten(2).transpose(1, 2)   # [Ns, P, n_out]
@@ -380,7 +388,7 @@ class SegNet(nn.Module):
         st, _, sp = self(x[None].float(), c[None], levels=True)
         z, k, g, emb, _ = st[0]
         p = self.cellhead(z).float().softmax(1)
-        sel = self._dilate(p.max(1).values < self.tau, g)
+        sel = self._dilate(p.max(1).values < self.tau, g) | self._pred_edge(p, g)
         P = math.prod(k)
         fits = n_out * len(p) * P * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
         pr = p.half().to(dev if fits else "cpu")[:, :, None].expand(-1, -1, P).contiguous()       # [N, n_out, P]
