@@ -338,10 +338,14 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
                         o = fit(xk[tr], y_all[tr].to(device), kind, l2, hidden)(xk[te])
                         oof = o.new_zeros((len(sel["fit"]), *o.shape[1:])) if oof is None else oof
                         oof[torch.from_numpy(np.flatnonzero(fold == k)).to(device)] = o
+                    o = oof
                     val = kind.metrics(kind.predict(oof), y["fit"], rows.iloc[sel["fit"]])
                 else:
                     head = fit(xs["train"], y["train"], kind, l2, hidden)
-                    val = kind.metrics(kind.predict(head(xs["val"])), y["val"], rows.iloc[sel["val"]])
+                    o = head(xs["val"])
+                    val = kind.metrics(kind.predict(o), y["val"], rows.iloc[sel["val"]])
+                if not torch.isfinite(o).all():   # a diverged L-BFGS fit (21/10: NaN scores ranked as ties gave the
+                    continue                      # same fake AUROC 0.714 to six models): never a candidate
                 cands[fname] = max(cands.get(fname, -float("inf")), val[kind.key])   # best val per feature
                 if best is None or val[kind.key] > best["val"][kind.key]:
                     best = {"feature": fname, "l2": l2, "val": val, "xs": xs, "oof": oof if cv else None}
