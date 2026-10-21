@@ -47,9 +47,20 @@ def brainfm_input_affine(source_affine, source_shape, crop_start) -> np.ndarray:
     return r
 
 
-def gt_labels(path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """(labels 0..K, affine, class names): a mask file (any > 0 = 1) or a directory of one mask per class."""
+def gt_labels(path: str, classes: list | None = None, ignore: list | None = None) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """(labels 0..K, affine, class names): a mask file (any > 0 = 1) or a directory of one mask per class. `classes`
+    (21/10, the new tasks' multi-label files): the raw values of a label map, class i + 1 each (any other value 0);
+    `ignore`: raw values set to 255 (not scored, e.g. WMH 2017's "other pathology")."""
     p = Path(path)
+    if classes:
+        img = nib.load(p)
+        raw = np.asarray(img.dataobj)
+        lab = np.zeros(raw.shape, dtype=np.uint8)
+        for k, c in enumerate(classes, 1):
+            lab[raw == c] = k
+        for c in ignore or ():
+            lab[raw == c] = 255
+        return lab, img.affine, [str(c) for c in classes]
     if p.is_dir():
         files = sorted(p.glob("*.nii*"))
         ref = nib.load(files[0])

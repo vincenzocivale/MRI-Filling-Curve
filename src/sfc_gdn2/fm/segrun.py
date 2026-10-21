@@ -91,7 +91,7 @@ def prep(job: dict) -> None:
             t0 = time.time()
             xin, m = w.seg_input(x)
             ctx = w.seg_context(x) if hasattr(w, "seg_context") else None
-            lab, gt_aff, names = gt_labels(it["seg"])
+            lab, gt_aff, names = gt_labels(it["seg"], it.get("classes"), it.get("ignore"))
             grid_from_gt = np.asarray(m, dtype=np.float64) @ np.linalg.inv(nib.load(it["image"]).affine) @ gt_aff
             y = pull_labels(lab, grid_from_gt, tuple(xin.shape[1:]), job["device"])
             dst = cache / f"{it['id']}.pt"
@@ -214,6 +214,8 @@ def dice_full_res(probs: torch.Tensor, grid_from_gt: np.ndarray, lab: np.ndarray
         pred = F.grid_sample(sub[None], g, mode="bilinear", padding_mode="border", align_corners=False)[0, :, 0, 0]
         pred = pred.argmax(0)
         t = L[i].reshape(-1).long()
+        keep = t != 255   # ignored voxels (geom.gt_labels `ignore`): neither scored nor counted as predictions
+        pred, t = pred[keep], t[keep]
         tp += torch.bincount(t[pred == t], minlength=k)[:k].float()
         np_ += torch.bincount(pred, minlength=k)[:k].float()
         nt += torch.bincount(t, minlength=k)[:k].float()
@@ -556,8 +558,13 @@ def train(job: dict) -> None:
         t1 = time.time()
         v = load(it)
         probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"])
-        lab, _, _ = gt_labels(it["seg"])
+        lab, _, _ = gt_labels(it["seg"], it.get("classes"), it.get("ignore"))
         d, per = dice_full_res(probs, v["grid_from_gt"], lab, k, dev)
+        if job.get("save_pred"):   # the argmax on the model grid + the GT mapping (LFC landmark error, CMB lesion F1)
+            pd_ = out_p.with_suffix(".pred")
+            pd_.mkdir(exist_ok=True)
+            np.savez_compressed(pd_ / f"{it['id']}.npz", pred=probs.argmax(0).to(torch.uint8).cpu().numpy(),
+                                grid_from_gt=np.asarray(v["grid_from_gt"]))
         res["per_volume"].append(d)
         res["per_class"].append(per)
         res["test_ids"].append(it["id"])
