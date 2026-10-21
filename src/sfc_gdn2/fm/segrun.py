@@ -138,7 +138,10 @@ def tile_of(patch, align, k: int = 2):
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
     on that grid (token cache), the volume padded so that the last tile ends on it."""
-    if getattr(net, "adaptive", False) and ctx is not None:   # the whole scan in one pass (no tiles)
+    if getattr(net, "matryoshka", False) and ctx is not None:   # the whole scan in one pass (no tiles)
+        with amp():
+            return net.matryoshka_predict(x, ctx.to(x.device), n_out)
+    if getattr(net, "adaptive", False) and ctx is not None:
         with amp():
             return net.adaptive_predict(x, ctx.to(x.device), n_out)
     S = tuple(x.shape[1:])
@@ -324,6 +327,20 @@ def sums_loss(t: list) -> torch.Tensor:
     return ce / n.clamp_min(1) + 1 - ((2 * inter[1:] + 1e-5) / (psum[1:] + tsum[1:] + 1e-5)).mean()
 
 
+def matryoshka_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
+    """Decoder F matryoshka (21/10): the final prediction's loss plus each cell head's (16, 8, 4 mm), one backward."""
+    parts = [(t, u, v) for t, u, v in zip(x, y, c)] if isinstance(x, list) else [(x, y, c)]
+    fin, aux = None, None
+    for xi, yi, ci in parts:
+        with amp():
+            f, a = net.matryoshka_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), k)
+        fin = f if fin is None else [u + v for u, v in zip(fin, f)]
+        aux = a if aux is None else [[u + v for u, v in zip(p, q)] for p, q in zip(aux, a)] + (aux[len(a):] or a[len(aux):])
+    loss = sums_loss(fin) + sum(sums_loss(a) for a in aux)
+    loss.backward()
+    return loss.detach()
+
+
 def adaptive_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
     """Decoder F adaptive (21/10): the batch's sums (final prediction, cell head) in one pass (a list of tiles of
     several shapes: one pass each), one backward of both losses."""
@@ -476,7 +493,10 @@ def train(job: dict) -> None:
             # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
             # of ~1e7 voxels x 50 classes: then micro_step (the two graphs of joint_step went OOM)
             vox = sum(t.numel() for t in x) if isinstance(x, list) else x.numel()
-            if getattr(net, "adaptive", False):
+            if getattr(net, "matryoshka", False):
+                loss = matryoshka_step(net, x, y, c, k, amp, dev)
+                logits = torch.zeros(1, device=dev)
+            elif getattr(net, "adaptive", False):
                 loss = adaptive_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             elif tcache is not None and (isinstance(x, list) or k > 10) and vox * k <= JOINT_MAX:

@@ -60,7 +60,7 @@ class SegNet(nn.Module):
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
                  refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
-                 adaptive: bool = False, refine_tau: float = 0.9):
+                 adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -132,6 +132,14 @@ class SegNet(nn.Module):
         # adaptive (21/10, notes/adaptive_decoding.md): a per-cell head on the whole scan's 16 mm tokens, the finer
         # levels only on the cells it is unsure of (+ GT edges and a random share in training), loss on points
         self.adaptive, self.tau = bool(adaptive), float(refine_tau)
+        # matryoshka (21/10, notes/adaptive_decoding.md): a cell head at 16, 8 and 4 mm, each trained as a prediction of
+        # its own (exact loss from the cells' label counts, summed: any depth is a valid stop); 16 -> 8 mm dense, the
+        # 4 mm level only in the `quota` of 8 mm cells whose voxel intensities vary most (label-free, decided before
+        # reading them), the native-voxel decoding only in its boundary / unsure cells
+        self.matryoshka, self.quota = bool(matryoshka), float(quota)
+        if self.matryoshka:
+            assert self.cache is not None and self.kernel and self.refine == 2, "matryoshka decoding: token cache, F, refine 2"
+            self.head16, self.head8, self.head4 = nn.Linear(encoder.dim, n_out), nn.Linear(128, n_out), nn.Linear(128, n_out)
         if self.adaptive:
             assert self.cache is not None and self.kernel and self.refine, "adaptive decoding: token cache and decoder F"
             self.cellhead = nn.Linear(128, n_out)   # one prediction per cell of the finest level
@@ -141,7 +149,7 @@ class SegNet(nn.Module):
                 self.cache.pca = int(fine_pca)
                 self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) for _ in range(self.refine))
 
-    def forward(self, x: torch.Tensor, spacing: torch.Tensor, levels: bool = False):
+    def forward(self, x: torch.Tensor, spacing: torch.Tensor, levels: bool = False, stop: int | None = None):
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
         -> logits [B, n_out, *T]. Only the scan's own voxels are read: segrun right-pads a tile up to SEG_PATCH voxels,
         ~160 mm for resampled models but up to 1.2 m of zeros on our native grids (TotalSeg 64^3 at 7.5 mm: 5e5 tokens,
@@ -196,7 +204,8 @@ class SegNet(nn.Module):
             m = torch.cat([checkpoint(slab, z[:, :, i:i + s], use_reentrant=False) for i in range(0, g[0], s)], 2)
             out.append(m[0, :, : v[0], : v[1], : v[2]])
         if self.kernel:
-            for i in range(self.refine):   # the finer levels only while their cells hold >= 8 voxels
+            self._z16 = [(a[0], a[1], a[2]) for a in st]   # the 16 mm tokens (matryoshka decoding's coarse head)
+            for i in range(self.refine if stop is None else stop):   # the finer levels while their cells hold >= 8 voxels
                 act, inp = [], []
                 for b, (z, k, g, _, cur) in enumerate(st):
                     self._cur = cur
@@ -418,6 +427,147 @@ class SegNet(nn.Module):
         out = pr.view(*g, n_out, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(g, k)))
         return out[:, : S[0], : S[1], : S[2]]
 
+    # --------------------------------------------------------------------------------- matryoshka decoding (21/10)
+    def _hist(self, lab, val, n_out):
+        return torch.zeros(len(lab), n_out, device=lab.device).scatter_add_(1, lab, val.float())
+
+    def _sparse4(self, z8, vol, sp, k8, g8, sel8):
+        """The 4 mm level on the children of the selected 8 mm cells only -> their tokens, dims, grid, dense indices."""
+        from ..curves import grid_coords
+        dev = z8.device
+        idx = sel8.nonzero()[:, 0]
+        rows = torch.full((len(z8),), -1, dtype=torch.long, device=dev)
+        rows[idx] = torch.arange(len(idx), device=dev)
+        kf = self.fine_dims(sp, 1)
+        gf = [-(-v // a) for v, a in zip(vol.shape, kf)]
+        xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
+        par = torch.minimum(((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(k8, device=dev)).long(),
+                            torch.tensor(g8, device=dev) - 1)
+        keep = (rows[(par[:, 0] * g8[1] + par[:, 1]) * g8[2] + par[:, 2]] >= 0).nonzero()[:, 0]
+        t, xyzk, gft, _ = self.to_fine(z8[idx], vol, sp, k8, g8, 1, keep=keep, zmap=rows)
+        return self.fine_mix([t], [xyzk], [gft], 1)[0], kf, gf, keep, par[keep]
+
+    def _select8(self, vol, k8, inside):
+        """The quota of the 8 mm cells (inside the scan) whose voxel intensities vary most."""
+        from ..data.volume import patchify
+        s = patchify(vol.float(), k8).std(1)[: len(inside)]
+        s = torch.where(inside, s, -torch.inf)
+        sel = torch.zeros_like(inside)
+        sel[s.argsort(descending=True)[: math.ceil(self.quota * int(inside.sum()))]] = True
+        return sel & inside
+
+    def _dense_pred(self, base: torch.Tensor, g8, gf, par, keep, fine: torch.Tensor):
+        """Predicted classes on the finest grid: each fine cell its 8 mm parent's, the refined ones their own."""
+        from ..curves import grid_coords
+        dev = base.device
+        xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
+        p = torch.minimum(xyz // 2, torch.tensor(g8, device=dev) - 1)
+        out = base[(p[:, 0] * g8[1] + p[:, 1]) * g8[2] + p[:, 2]].clone()
+        out[keep] = fine
+        return out
+
+    def matryoshka_sums(self, x: torch.Tensor, y: torch.Tensor, ctx: torch.Tensor, n_out: int, unsure: float = 0.05,
+                        rand: float = 0.02, edges: float = 0.1) -> tuple:
+        """A batch of tiles -> (sums of the final prediction, [sums of the 16, 8, 4 mm heads]), each summed over the
+        batch (segrun.sums_loss on each, added). Final: the 8 mm head where the 4 mm level is not read, the 4 mm head in
+        its cells, the native voxels decoded in a subset of them (GT edges, predicted edges, unsure, random)."""
+        st, V, sp = self(x, ctx, levels=True, stop=1)
+        add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
+        fin, aux = None, [None, None, None]
+        for b, (z8, k8, g8, emb8, cur) in enumerate(st):
+            z16, k16, _ = self._z16[b]
+            yy, vol = y[b, : V[b][0], : V[b][1], : V[b][2]], x[b, 0, : V[b][0], : V[b][1], : V[b][2]]
+            lab16, val16 = self._cells(yy, k16)
+            aux[0] = add(aux[0], self._cell_sums(self.head16(z16), self._hist(lab16, val16, n_out)))
+            lab8, val8 = self._cells(yy, k8)
+            h8, c8 = self._hist(lab8, val8, n_out), self.head8(z8)
+            aux[1] = add(aux[1], self._cell_sums(c8, h8))
+            self._cur = cur
+            four = fine_ok(self.fine_dims(sp[b], 1))
+            sel8 = self._select8(vol, k8, val8.any(1)) if four else torch.zeros(len(z8), dtype=torch.bool, device=z8.device)
+            f = self._cell_sums(c8[~sel8], h8[~sel8])
+            if sel8.any():
+                z, k, g, keep, par = self._sparse4(z8, vol, sp[b], k8, g8, sel8)
+                lab, val = self._cells(yy, k)
+                lab, val = lab[keep], val[keep]
+                h, c = self._hist(lab, val, n_out), self.head4(z)
+                aux[2] = add(aux[2], self._cell_sums(c, h))
+                emb, grid = self.fine[1][0].patch_embed, g
+            else:   # no 4 mm level (coarse voxels): decode at 8 mm
+                z, k, lab, val, h, c, emb = z8, k8, lab8, val8, h8, c8, emb8
+                f = [0 * t for t in f]
+            u = 1 - c.detach().float().softmax(1).max(1).values
+            r, r2 = torch.rand(len(u), device=z.device), torch.rand(len(u), device=z.device)
+            edge = (h > 0).sum(1) > 1
+            if sel8.any():
+                dense = self._dense_pred(c8.detach().argmax(1), g8, grid, par, keep, c.detach().argmax(1))
+                pe = self._pred_edge_lab(dense, grid)[keep]
+            else:
+                pe = self._pred_edge(c.detach(), g8)
+            dsel = (edge & (r < edges * len(u) / max(int(edge.sum()), 1))) | (u >= u.quantile(1 - unsure)) \
+                | (r > 1 - rand) | (pe & (r2 < edges * len(u) / max(int(pe.sum()), 1)))
+            f = add(f, self._cell_sums(c[~dsel], h[~dsel]))
+            if dsel.any():
+                lg = self.kernel_decode(z[dsel], emb, sp[b], k, None).flatten(2).transpose(1, 2)
+                f = add(f, sums(lg[val[dsel]], lab[dsel][val[dsel]], 1.0, n_out))
+            fin = add(fin, f)
+            self.last_refined = (float(sel8.float().mean()), float(dsel.float().mean()))
+        return fin, [a for a in aux if a is not None]
+
+    @staticmethod
+    def _pred_edge_lab(lab: torch.Tensor, g) -> torch.Tensor:
+        a = lab.float().view(1, 1, *g)
+        return (F.max_pool3d(a, 3, 1, 1) != -F.max_pool3d(-a, 3, 1, 1)).flatten()
+
+    @torch.no_grad()
+    def matryoshka_predict(self, x: torch.Tensor, ctx: torch.Tensor, n_out: int) -> torch.Tensor:
+        """A whole scan [C, *S] in one pass -> probabilities [n_out, *S]: 16 -> 8 mm on the whole scan, the 8 mm head
+        everywhere, the 4 mm level in the quota of cells with the most varying intensities (its head there), the native
+        voxels decoded in the 4 mm cells on the predicted boundary or unsure (max probability < tau)."""
+        dev, S = x.device, tuple(x.shape[1:])
+        c = torch.cat([ctx[:7].float().cpu(), torch.zeros(3)]).to(dev)
+        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
+        try:
+            st, _, sp = self(x[None].float(), c[None], levels=True, stop=1)
+            z8, k8, g8, emb8, cur = st[0]
+            vol, p8 = x[0], self.head8(z8).float().softmax(1)
+            self._cur = cur
+            four = fine_ok(self.fine_dims(sp[0], 1))
+            inside = (patchify_any(vol, k8).abs().sum(1) > 0)[: len(z8)]
+            if four:
+                sel8 = self._select8(vol, k8, inside)
+                z, k, g, keep, par = self._sparse4(z8, vol, sp[0], k8, g8, sel8)
+                p = self.head4(z).float().softmax(1)
+                emb = self.fine[1][0].patch_embed
+                base = self._dense_pred(p8.argmax(1), g8, g, par, keep, p.argmax(1))
+                pe = self._pred_edge_lab(base, g)[keep]
+            else:
+                z, k, g, p, emb = z8, k8, g8, p8, emb8
+                keep = torch.arange(len(z8), device=dev)
+                pe = self._pred_edge(p8, g8)
+        finally:
+            self.fine_seg = fs
+        dsel = pe | (p.max(1).values < self.tau)
+        P, N = math.prod(k), math.prod(g)
+        fits = n_out * N * P * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
+        from ..curves import grid_coords
+        xyz = grid_coords(torch.tensor(g, device=dev)[None], N)[0]
+        q = torch.minimum(xyz * torch.tensor(k, device=dev) // torch.tensor(k8, device=dev), torch.tensor(g8, device=dev) - 1)
+        pr = p8[(q[:, 0] * g8[1] + q[:, 1]) * g8[2] + q[:, 2]].half().to(dev if fits else "cpu")
+        pr[keep.to(pr.device)] = p.half().to(pr.device)
+        pr = pr[:, :, None].expand(-1, -1, P).contiguous()
+        for idx in dsel.nonzero()[:, 0].split(1 << 15):
+            if len(idx):
+                pr[keep[idx].to(pr.device)] = self.kernel_decode(z[idx], emb, sp[0], k, None).float().softmax(1).flatten(2).half().to(pr.device)
+        self.last_refined = float(dsel.float().mean())
+        out = pr.view(*g, n_out, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(g, k)))
+        return out[:, : S[0], : S[1], : S[2]]
+
+
+def patchify_any(vol, k):
+    from ..data.volume import patchify
+    return patchify(vol.float(), k)
+
 def sums(logits: torch.Tensor, lab: torch.Tensor, w, k: int) -> list:
     """Points' logits [M, k] and labels [M], each point standing for w voxels -> [CE sum, voxels, per class: soft
     intersection, predicted sum, target sum] (segrun.sums_loss: CE / voxels + 1 - mean soft Dice of the classes > 0)."""
@@ -521,7 +671,8 @@ class SFC(Wrapper):
                      image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")),
                      refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"),
                      fine_pca=int(self.args.get("fine_pca") or 0), adaptive=bool(self.args.get("adaptive")),
-                     refine_tau=float(self.args.get("refine_tau") or 0.9))
+                     refine_tau=float(self.args.get("refine_tau") or 0.9), matryoshka=bool(self.args.get("matryoshka")),
+                     quota=float(self.args.get("refine_quota") or 0.5))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
