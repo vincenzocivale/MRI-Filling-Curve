@@ -385,7 +385,13 @@ class SegNet(nn.Module):
         only in the cells it is unsure of (max probability < tau) and their neighbours."""
         dev, S = x.device, tuple(x.shape[1:])
         c = torch.cat([ctx[:7].float().cpu(), torch.zeros(3)]).to(dev)   # corner 0: the tile is the scan
-        st, _, sp = self(x[None].float(), c[None], levels=True)
+        # the refine levels' sequences cut every 65536 tokens along the curve, the longest a 16 cm training tile gives
+        # (a whole-body 4 mm sequence, ~1e6 tokens, passed the Triton grid limit of the short convolution)
+        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
+        try:
+            st, _, sp = self(x[None].float(), c[None], levels=True)
+        finally:
+            self.fine_seg = fs
         z, k, g, emb, _ = st[0]
         p = self.cellhead(z).float().softmax(1)
         sel = self._dilate(p.max(1).values < self.tau, g) | self._pred_edge(p, g)
