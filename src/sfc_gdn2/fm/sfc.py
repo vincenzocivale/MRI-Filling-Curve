@@ -325,7 +325,8 @@ class SegNet(nn.Module):
         """Labels [*S] (255 = ignore) -> per cell of k voxels: labels [N, P] and valid [N, P] (padding invalid)."""
         from ..data.volume import patchify
         v = patchify(y.float() + 1, k)
-        return (v - 1).clamp_min(0).long(), (v > 0) & (v < 256)
+        ok = (v > 0) & (v < 256)
+        return torch.where(ok, v - 1, 0).long(), ok   # ignored voxels (255) get class 0 with weight 0, not index 255
 
     @staticmethod
     def _dilate(sel: torch.Tensor, g) -> torch.Tensor:
