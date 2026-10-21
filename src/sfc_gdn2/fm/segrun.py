@@ -137,6 +137,9 @@ def tile_of(patch, align, k: int = 2):
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
     on that grid (token cache), the volume padded so that the last tile ends on it."""
+    if getattr(net, "adaptive", False) and ctx is not None:   # the whole scan in one pass (no tiles)
+        with amp():
+            return net.adaptive_predict(x, ctx.to(x.device), n_out)
     S = tuple(x.shape[1:])
     patch = tile_of(patch, align, n_out)
     patch = S if patch is None else tuple(patch)
@@ -314,6 +317,27 @@ def joint_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
     return loss.detach()
 
 
+def sums_loss(t: list) -> torch.Tensor:
+    """SegNet.adaptive_sums' sums -> CE per voxel + 1 - mean soft Dice of the classes > 0 (loss_fn's)."""
+    ce, n, inter, psum, tsum = t
+    return ce / n.clamp_min(1) + 1 - ((2 * inter[1:] + 1e-5) / (psum[1:] + tsum[1:] + 1e-5)).mean()
+
+
+def adaptive_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
+    """Decoder F adaptive (21/10): each tile's sums (final prediction, coarse head), summed over the batch, one
+    backward of both losses."""
+    parts = list(zip(x, y, c)) if isinstance(x, list) else [(x[i:i + 1], y[i:i + 1], c[i:i + 1]) for i in range(len(x))]
+    fin = coa = None
+    for xi, yi, ci in parts:
+        with amp():
+            f, a = net.adaptive_sums(xi[0].to(dev).float(), yi[0].to(dev), ci[0].to(dev), k)
+        fin = f if fin is None else [u + v for u, v in zip(fin, f)]
+        coa = a if coa is None else [u + v for u, v in zip(coa, a)]
+    loss = sums_loss(fin) + sums_loss(coa)
+    loss.backward()
+    return loss.detach()
+
+
 def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
     y = y.long()
     ce = F.cross_entropy(logits.float(), y, ignore_index=255)
@@ -446,7 +470,10 @@ def train(job: dict) -> None:
             # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
             # of ~1e7 voxels x 50 classes: then micro_step (the two graphs of joint_step went OOM)
             vox = sum(t.numel() for t in x) if isinstance(x, list) else x.numel()
-            if tcache is not None and (isinstance(x, list) or k > 10) and vox * k <= JOINT_MAX:
+            if getattr(net, "adaptive", False):
+                loss = adaptive_step(net, x, y, c, k, amp, dev)
+                logits = torch.zeros(1, device=dev)
+            elif tcache is not None and (isinstance(x, list) or k > 10) and vox * k <= JOINT_MAX:
                 loss = joint_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             elif isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes

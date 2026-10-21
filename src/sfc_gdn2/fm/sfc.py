@@ -18,6 +18,7 @@ bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in ou
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import nibabel.orientations as nio
@@ -57,7 +58,8 @@ class SegNet(nn.Module):
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
-                 refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0):
+                 refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
+                 adaptive: bool = False, refine_tau: float = 0.9):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -126,6 +128,12 @@ class SegNet(nn.Module):
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
         # every decoder can read the cached whole-scan tokens (20/10)
         self.cache, self._cur, self.width = (TokenCache(token_cache) if token_cache else None), None, width
+        # adaptive (21/10, notes/adaptive_decoding.md): a per-cell head on the whole scan's 16 mm tokens, the finer
+        # levels only on the cells it is unsure of (+ GT edges and a random share in training), loss on points
+        self.adaptive, self.tau = bool(adaptive), float(refine_tau)
+        if self.adaptive:
+            assert self.cache is not None and self.kernel and self.refine, "adaptive decoding: token cache and decoder F"
+            self.coarse = nn.Sequential(nn.Linear(encoder.dim, 128), nn.GELU(), nn.Linear(128, n_out))
         if self.cache is not None and getattr(self, "fine_tok", None) is not None:
             self.cache.levels = (16.0, 8.0, 4.0)
             if fine_pca:   # the fine levels' tokens on token_cache.project's PCA basis: fine_tok reads them directly
@@ -210,7 +218,7 @@ class SegNet(nn.Module):
         from ..data.volume import patch_dims
         return [a * 2 ** (1 - i) for a in self._cur[2]] if self._cur else patch_dims(sp.tolist(), self.fine_mm[i])
 
-    def to_fine(self, z, vol, sp, k, g, i):
+    def to_fine(self, z, vol, sp, k, g, i, keep=None, zmap=None):
         """Tokens [N, c] on grid g -> the fine level's inputs [Nf, 128] on the grid of half the patch (parent token +
         the voxels' embedding), their coordinates, grid and patch dims; fine_mix mixes them along each curve."""
         from ..curves import grid_coords, keys
@@ -219,12 +227,17 @@ class SegNet(nn.Module):
         kf = self.fine_dims(sp, i)
         gf = patch_grid(vol.shape, kf).to(z.device)
         xyz = grid_coords(gf[None], int(gf.prod()))[0]                                    # [Nf, 3] raster
+        if keep is not None:   # adaptive decoding: only these children (z holds the kept parents, zmap: dense -> row)
+            xyz = xyz[keep]
         par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
         par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
-        t = self.up[i](z)[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]]
+        pidx = (par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]
+        t = self.up[i](z)[pidx if zmap is None else zmap[pidx]]
+        sub = (lambda a: a) if keep is None else (lambda a: a[keep])
         if self._cur is not None and self.fine_tok is not None:   # fine_encoder from the cache: the whole-scan reading
             ci, corner, _ = self._cur                                 # of this level, last block ++ taps as at 16 mm
             tf = self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float()
+            tf = sub(tf)
             t = t + self.fine_tok[i](tf if self.cache.pca else self.proj(tf))
         elif self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
             if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
@@ -248,17 +261,17 @@ class SegNet(nn.Module):
             pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
             pe.patch_mm = self.fine_mm[i]
             with torch.no_grad():
-                im = pe(patchify(vol.float(), kf), pe.weights(sp.float(), kf))
+                im = pe(sub(patchify(vol.float(), kf)), pe.weights(sp.float(), kf))
             pe.patch_mm = mm0
             t = t + self.enc_img[i](im)
         elif self.image and self.zoom is not None:
             e = self.encoder.patch_embed
             with torch.no_grad():
-                im = e(patchify(vol.float(), kf), e.weights(sp.float() * (self.patch_mm / self.fine_mm[i]), kf))
+                im = e(sub(patchify(vol.float(), kf)), e.weights(sp.float() * (self.patch_mm / self.fine_mm[i]), kf))
             t = t + self.zoom[i](im)
         elif self.image:
             e = self.fine[i][0].patch_embed
-            t = t + e(patchify(vol.float(), kf), e.weights(sp.float(), kf))
+            t = t + e(sub(patchify(vol.float(), kf)), e.weights(sp.float(), kf))
         return t, xyz, gf, kf
 
     def fine_mix(self, ts: list, xyzs: list, gfs: list, i: int) -> list:
@@ -298,8 +311,137 @@ class SegNet(nn.Module):
             return torch.einsum("noabc,xa,yb,zc->noxyz", c, px, py, pz) / (R[0] * R[1] * R[2]) ** 0.5
         n = max(1, (1 << 25) // max(len(b), 1))
         m = torch.cat([checkpoint(dec, z[i:i + n], use_reentrant=False) for i in range(0, len(z), n)])
+        if g is None:   # per cell: [N, n_out, *k]
+            return m
         o = m.shape[1]
         return m.reshape(*g, o, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(o, *(a * c for a, c in zip(g, k)))
+
+
+    # ------------------------------------------------------------------------------ adaptive decoding (21/10)
+    @staticmethod
+    def _cells(y: torch.Tensor, k) -> tuple:
+        """Labels [*S] (255 = ignore) -> per cell of k voxels: labels [N, P] and valid [N, P] (padding invalid)."""
+        from ..data.volume import patchify
+        v = patchify(y.float() + 1, k)
+        return (v - 1).clamp_min(0).long(), (v > 0) & (v < 256)
+
+    @staticmethod
+    def _dilate(sel: torch.Tensor, g) -> torch.Tensor:
+        return F.max_pool3d(sel.float().view(1, 1, *g), 3, 1, 1).flatten().bool()
+
+    def _coarse(self, ci: str, corner, k4, V, dev) -> tuple:
+        """The 16 mm tokens of a region (cache) -> projected tokens [N16, d], per-cell logits, cell dims, grid."""
+        k16 = [4 * a for a in k4]
+        g16 = [-(-v // a) for v, a in zip(V, k16)]
+        w16 = self.width // (2 if self.context else 1)
+        z16 = self.proj(self.cache.tokens(ci, 16.0, corner, g16, k16)[:, :w16].to(dev).float())
+        return z16, self.coarse(z16), k16, g16
+
+    def _chain(self, z16, sel, vol, sp, k16, g16, cur) -> tuple:
+        """The refine levels on the descendants of the selected 16 mm cells only -> tokens of the finest cells, their
+        dims, grid, dense indices in it, and the kernel embedding to decode them with."""
+        from ..curves import grid_coords
+        self._cur, dev = cur, z16.device
+        idx = sel.nonzero()[:, 0]
+        rows = torch.full((len(z16),), -1, dtype=torch.long, device=dev)
+        rows[idx] = torch.arange(len(idx), device=dev)
+        z, k, g, dense, emb = z16[idx], k16, g16, idx, self.encoder.patch_embed
+        for i in range(self.refine):
+            if i and not fine_ok(self.fine_dims(sp, i)):
+                break
+            kf = self.fine_dims(sp, i)
+            gf = [-(-v // a) for v, a in zip(vol.shape, kf)]
+            xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
+            par = ((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(k, device=dev)).long()
+            par = torch.minimum(par, torch.tensor(g, device=dev) - 1)
+            keep = (rows[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]] >= 0).nonzero()[:, 0]
+            t, xyzk, gft, _ = self.to_fine(z, vol, sp, k, g, i, keep=keep, zmap=rows)
+            t = self.fine_mix([t], [xyzk], [gft], i)[0]
+            rows = torch.full((math.prod(gf),), -1, dtype=torch.long, device=dev)
+            rows[keep] = torch.arange(len(keep), device=dev)
+            z, k, g, dense, emb = t, kf, gf, keep, self.fine[i][0].patch_embed
+        return z, k, g, dense, emb
+
+    def adaptive_sums(self, x: torch.Tensor, y: torch.Tensor, ctx: torch.Tensor, n_out: int, n_points: int = 16384):
+        """One training tile ([C, *T] voxels, [*T] labels, segrun's ctx row) -> the loss sums (segrun.sums_loss) of
+        the final prediction (fine levels in the refined cells, every voxel; the coarse head elsewhere, on uniform
+        points weighted to the region's voxel count) and of the coarse head alone (uniform points everywhere)."""
+        dev, T = x.device, tuple(x.shape[1:])
+        corner, ext = ctx[7:10].long().tolist(), ctx[3:6].long().tolist()
+        V = [max(1, min(e - c, t)) for e, c, t in zip(ext, corner, T)]
+        vol, yy, sp = x[0, : V[0], : V[1], : V[2]].float(), y[: V[0], : V[1], : V[2]], ctx[:3].float()
+        ci = self.cache.ids[int(ctx[6])]
+        k4 = self.cache.meta(ci)["k4"]
+        z16, cl, k16, g16 = self._coarse(ci, corner, k4, V, dev)
+        lab16, val16 = self._cells(yy, k16)
+        hi = torch.where(val16, lab16, -1).max(1).values
+        lo = torch.where(val16, lab16, 1 << 20).min(1).values
+        edge = (hi >= 0) & (hi != lo)                                          # cells holding two labels (GT)
+        # the criterion used at test, capped at the most unsure 20 % of the cells (early on every cell is unsure)
+        u = 1 - cl.detach().float().softmax(1).max(1).values
+        unsure = (u > 1 - self.tau) & (u >= u.quantile(0.8))
+        sel = self._dilate(edge | unsure | (torch.rand(len(cl), device=dev) < 0.05), g16)
+        # uniform points over the region's voxels (cell, voxel within it)
+        cell = torch.randint(len(cl), (n_points,), device=dev)
+        vox = torch.randint(lab16.shape[1], (n_points,), device=dev)
+        ok = val16[cell, vox]
+        cell, lab = cell[ok], lab16[cell[ok], vox[ok]]
+        total = val16.sum()
+        coarse = sums(cl[cell], lab, total / max(len(lab), 1), n_out)          # the coarse head everywhere
+        out = ~sel[cell]
+        n_out_vox = val16[~sel].sum()
+        final = sums(cl[cell[out]], lab[out], n_out_vox / max(int(out.sum()), 1), n_out)
+        if sel.any():
+            z, kf, _, dense, emb = self._chain(z16, sel, vol, sp, k16, g16, (ci, corner, k4))
+            lg = self.kernel_decode(z, emb, sp, kf, None).flatten(2).transpose(1, 2)   # [Nf, P, n_out]
+            labf, valf = self._cells(yy, kf)
+            labf, valf = labf[dense], valf[dense]
+            final = [a + b for a, b in zip(final, sums(lg[valf], labf[valf], 1.0, n_out))]
+        self.last_refined = float(sel.float().mean())
+        return final, coarse
+
+    @torch.no_grad()
+    def adaptive_predict(self, x: torch.Tensor, ctx: torch.Tensor, n_out: int) -> torch.Tensor:
+        """A whole scan [C, *S] in one pass -> class probabilities [n_out, *S]: the coarse head on every 16 mm cell,
+        the finer levels on the cells it is unsure of (max probability < tau) and their neighbours, in chunks."""
+        from ..curves import grid_coords
+        dev, S = x.device, tuple(x.shape[1:])
+        vol, sp = x[0].float(), ctx[:3].float().to(dev)
+        ci = self.cache.ids[int(ctx[6])]
+        k4 = self.cache.meta(ci)["k4"]
+        cur = (ci, [0, 0, 0], k4)
+        z16, cl, k16, g16 = self._coarse(ci, [0, 0, 0], k4, S, dev)
+        p16 = cl.float().softmax(1)
+        sel = self._dilate(p16.max(1).values < self.tau, g16)
+        self._cur = cur
+        last = max(i for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
+        kf = self.fine_dims(sp, last)
+        gf = [-(-v // a) for v, a in zip(S, kf)]
+        xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
+        par = torch.minimum((xyz * torch.tensor(kf, device=dev)) // torch.tensor(k16, device=dev),
+                            torch.tensor(g16, device=dev) - 1)
+        fits = n_out * math.prod(gf) * math.prod(kf) * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
+        pr = p16[(par[:, 0] * g16[1] + par[:, 1]) * g16[2] + par[:, 2]].half().to(dev if fits else "cpu")
+        pr = pr[:, :, None].expand(-1, -1, math.prod(kf)).contiguous()                  # [Nf, n_out, P]
+        for chunk in sel.nonzero()[:, 0].split(4096):
+            s = torch.zeros_like(sel)
+            s[chunk] = True
+            z, kfc, _, dense, emb = self._chain(z16, s, vol, sp, k16, g16, cur)
+            pr[dense.to(pr.device)] = self.kernel_decode(z, emb, sp, kfc, None).float().softmax(1).flatten(2).half().to(pr.device)
+        self.last_refined = float(sel.float().mean())
+        out = pr.view(*gf, n_out, *kf).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(gf, kf)))
+        return out[:, : S[0], : S[1], : S[2]]
+
+
+def sums(logits: torch.Tensor, lab: torch.Tensor, w, k: int) -> list:
+    """Points' logits [M, k] and labels [M], each point standing for w voxels -> [CE sum, voxels, per class: soft
+    intersection, predicted sum, target sum] (segrun.sums_loss: CE / voxels + 1 - mean soft Dice of the classes > 0)."""
+    lp = logits.float().log_softmax(1)
+    p = lp.exp()
+    z = torch.zeros(k, device=logits.device)
+    return [-lp.gather(1, lab[:, None]).sum() * w, torch.as_tensor(len(lab) * w, device=logits.device, dtype=torch.float),
+            z.scatter_add(0, lab, p.gather(1, lab[:, None])[:, 0]) * w, p.sum(0) * w,
+            z.scatter_add(0, lab, torch.ones_like(lab, dtype=torch.float)) * w]
 
 
 def checkpoint_path(path: str | Path, step: int | None = None) -> Path:
@@ -393,7 +535,8 @@ class SFC(Wrapper):
                      erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"),
                      image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")),
                      refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"),
-                     fine_pca=int(self.args.get("fine_pca") or 0))
+                     fine_pca=int(self.args.get("fine_pca") or 0), adaptive=bool(self.args.get("adaptive")),
+                     refine_tau=float(self.args.get("refine_tau") or 0.9))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

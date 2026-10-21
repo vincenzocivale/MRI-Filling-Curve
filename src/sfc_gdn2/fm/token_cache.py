@@ -41,6 +41,7 @@ class TokenCache:
         from concurrent.futures import ThreadPoolExecutor
         self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(16)
         self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(4), {}, (16.0,), {}, 0
+        self._recent = {}
         self.pca = None   # SegNet fine_pca: the 8 / 4 mm levels from <id>.<mm>.p<pca>.npy (project())
 
     def meta(self, i: str) -> dict:
@@ -81,8 +82,13 @@ class TokenCache:
                     self._ahead[key] = (self._gen, self._io.submit(self._read, i, mm, corner, n, k))
 
     def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
-        f = self._ahead.get((i, mm, tuple(int(c) for c in corner), tuple(n)))   # kept: micro_step reads twice
-        return f[1].result() if f is not None else self._read(i, mm, corner, n, k)
+        key = (i, mm, tuple(int(c) for c in corner), tuple(n))
+        f = self._ahead.get(key)   # kept: micro_step reads twice
+        if f is not None:
+            return f[1].result()
+        if key not in self._recent:   # the last few reads (adaptive decoding reads a scan's levels once per chunk)
+            self._recent = dict(list(self._recent.items())[-3:]) | {key: self._read(i, mm, corner, n, k)}
+        return self._recent[key]
 
     def _read(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
         fd, shape, dt, off = self._open(i, mm, self.pca if mm < 16 else None)
