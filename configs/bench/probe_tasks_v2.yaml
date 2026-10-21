@@ -58,3 +58,4 @@ heart_seg:     {type: seg, label: seg, query: "dataset == 'HVSMR' and official_s
 ms_seg:        {type: seg, label: seg, query: "dataset == 'MSLesSeg' and modality == 'FLAIR'"}
 bladder_seg:   {type: seg, label: seg, query: "dataset == 'FedBCa'"}                # union of the tumour masks
 cow_seg:       {type: seg, label: seg, query: "dataset == 'TopCoW'", classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15]}                # 13 CoW vessel classes (labels 1-12, 15)
+hie_seg:       {type: seg, label: seg, query: "dataset == 'BONBID' and modality == 'ADC'"}   # neonatal HIE lesions, ADC input; official test (44) fixed
