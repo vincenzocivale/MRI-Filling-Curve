@@ -61,7 +61,8 @@ class SegNet(nn.Module):
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
                  refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
                  adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0,
-                 rand_dec: float = 0.02, test_all: bool = False, kernel_skip: int = 0):
+                 rand_dec: float = 0.02, test_all: bool = False, kernel_skip: int = 0, kernel_skip_mm: float = 0.0,
+                 level2: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -131,7 +132,23 @@ class SegNet(nn.Module):
         # basis, without the token's bottleneck: their coefficients through K learned separable maps per axis (a
         # filter in the basis, identity at init), back on the voxels, then per voxel sum_k g_ok(token) gelu(a_k(token)
         # f_k + b_k(token)). The token says what to look for, the voxels where it is (gates zero at init: = decoder F).
-        self.kskip = int(kernel_skip)
+        # kernel_skip_mm m (22/10): the filter reads the cell plus m mm of its neighbours per side (the window in the
+        # basis of its own extent), so a dot or an edge across the cell border is seen whole
+        self.kskip, self.kskip_mm = int(kernel_skip), float(kernel_skip_mm)
+        # level2 (22/10, user: "forse dobbiamo davvero fare 2 mm"): a decoder-only 2 mm level under the decoded 4 mm
+        # cells: each child = its parent's token + its own voxels through the encoder's frozen kernel at 2 mm (the
+        # B-spline refinement of the 4 mm basis), mixed along the curve by 2 GDN-2 blocks (the fine cells see each
+        # other), then decoded at the native voxels; the encoder itself never reads 2 mm
+        self.level2 = bool(level2)
+        if self.level2:
+            from ..model import Encoder
+            self.up2, self.img2 = nn.Linear(128, 128), nn.Linear(encoder.dim, 128)
+            self.fine2 = nn.ModuleList(Encoder(128, 2, 64, 2, bidir="alternate", patch_mm=2.0, freq_decay=0.0 if rough else 1.0)
+                                       for _ in self.fine_curves)
+            if erase == "head":
+                for m in self.fine2.modules():
+                    if hasattr(m, "b_proj") and hasattr(m, "head_k_dim"):
+                        m.b_proj = HeadErase(m)
         if self.kskip:
             r = encoder.patch_embed.rank
             self.kA = nn.Parameter(torch.eye(r).expand(3, self.kskip, r, r).clone())
@@ -301,12 +318,12 @@ class SegNet(nn.Module):
             t = t + e(sub(patchify(vol.float(), kf)), e.weights(sp.float(), kf))
         return t, xyz, gf, kf
 
-    def fine_mix(self, ts: list, xyzs: list, gfs: list, i: int) -> list:
+    def fine_mix(self, ts: list, xyzs: list, gfs: list, i: int, encs=None) -> list:
         """Level i's refine blocks along each curve of fine_curves in turn, the tiles' sequences packed in one call
         (cu_seqlens): a batch of sliding-window tiles costs one GDN-2 call per curve, not one per tile."""
         from ..curves import keys
 
-        for curve, enc in zip(self.fine_curves, self.fine[i]):
+        for curve, enc in zip(self.fine_curves, self.fine[i] if encs is None else encs):
             orders = [keys(curve, xyz, gf, self.seed).argsort() for xyz, gf in zip(xyzs, gfs)]
             cu, o = [0], 0
             for t in ts:
@@ -327,10 +344,10 @@ class SegNet(nn.Module):
             ts = [hh[od.argsort()] for hh, od in zip(h.split([len(t) for t in ts]), orders)]
         return ts
 
-    def kernel_decode(self, z, emb, sp, k, g, vox=None):
+    def kernel_decode(self, z, emb, sp, k, g, vox=None, kv=None):
         """Tokens [N, c] on grid g -> logits [n_out, *(g k)] at the native voxels: per token coefficients in the
         basis of `emb` (KernelEmbed), each voxel the mean of that function over its extent (same 1D integrals).
-        vox [N, prod(k)]: the cells' own voxels (kernel_skip)."""
+        vox [N, prod(kv)]: the cells' voxels (kernel_skip), kv: their window (default k; with a margin, k + 2m)."""
         # each basis function at RMS 1 over the patch's voxels (any spacing), the sum of r^3 terms over r^1.5: the
         # trained encoder's phi reach 1.3, unscaled every Adam step moved the logits by ~10 (no learning, 17/10)
         r = emb.rank
@@ -343,22 +360,28 @@ class SegNet(nn.Module):
         w = lin.weight.view(-1, r, r, r, lin.in_features)[:, : R[0], : R[1], : R[2]].reshape(-1, lin.in_features)
         b = lin.bias.view(-1, r, r, r)[:, : R[0], : R[1], : R[2]].reshape(-1)
 
+        use = self.kskip and vox is not None
+        if use:   # the window's basis (its own extent), normalized as px
+            kv = list(kv or k)
+            Rv = [min(r, int(a)) for a in kv]
+            qx, qy, qz = (p[:, :q] / p[:, :q].pow(2).mean(0, keepdim=True).sqrt().clamp_min(1e-6)
+                          for p, q in zip(emb.axis_integrals(sp, kv), Rv))
+
         def dec(zz, vv):   # in chunks recomputed in backward: the coefficients are tokens x classes x R0 R1 R2
             c = nn.functional.linear(self.coef[:-1](zz), w, b).view(len(zz), -1, *R)
             out = torch.einsum("noabc,xa,yb,zc->noxyz", c, px, py, pz) / (R[0] * R[1] * R[2]) ** 0.5
             if vv is None:
                 return out
             K = self.kskip
-            ci = torch.einsum("nxyz,xa,yb,zc->nabc", vv.float().view(len(vv), *k), px, py, pz) / math.prod(k)
-            A = [self.kA[j, :, : R[j], : R[j]] for j in range(3)]
+            ci = torch.einsum("nxyz,xa,yb,zc->nabc", vv.float().view(len(vv), *kv), qx, qy, qz) / math.prod(kv)
+            A = [self.kA[j, :, : R[j], : Rv[j]] for j in range(3)]
             fc = torch.einsum("nabc,kda,keb,kfc->nkdef", ci, *A)
             f = torch.einsum("nkdef,xd,ye,zf->nkxyz", fc, px, py, pz)
             gt = self.kgate(zz)
             a, bb, gg = gt[:, :K], gt[:, K: 2 * K], gt[:, 2 * K:].view(len(zz), -1, K)
             h = nn.functional.gelu(a[:, :, None, None, None] * f + bb[:, :, None, None, None])
             return out + torch.einsum("nok,nkxyz->noxyz", gg, h)
-        use = self.kskip and vox is not None
-        n = max(1, (1 << 25) // max(len(b) + (self.kskip * math.prod(k) if use else 0), 1))
+        n = max(1, (1 << 25) // max(len(b) + (self.kskip * math.prod(kv) if use else 0), 1))
         m = torch.cat([checkpoint(dec, z[i:i + n], vox[i:i + n] if use else None, use_reentrant=False)
                        for i in range(0, len(z), n)])
         if g is None:   # per cell: [N, n_out, *k]
@@ -456,6 +479,38 @@ class SegNet(nn.Module):
         out = pr.view(*g, n_out, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(g, k)))
         return out[:, : S[0], : S[1], : S[2]]
 
+    def _vox(self, vol, k, cells, sp):
+        """kernel_skip's input: the cells' voxels (+ kernel_skip_mm of margin per side) and the window dims."""
+        if not self.kskip:
+            return None, None
+        if not self.kskip_mm:
+            return patchify_any(vol, k)[cells], list(k)
+        m = [max(1, round(self.kskip_mm / float(s))) for s in sp]
+        return windows(vol, k, m, cells), [a + 2 * b for a, b in zip(k, m)]
+
+    def decode_cells(self, z, cells, vol, sp, k, g, emb):
+        """The decoded cells (tokens z, raster indices `cells` on grid g of k-voxel cells) -> logits [n, n_out, *k]
+        at their native voxels; level2: through their 2 mm children."""
+        r = [2 if self.level2 and a >= 2 and a % 2 == 0 else 1 for a in k]
+        if math.prod(r) == 1:
+            return self.kernel_decode(z, emb, sp, k, None, *self._vox(vol, k, cells, sp))
+        dev, k2 = z.device, [a // q for a, q in zip(k, r)]
+        g2 = [a * q for a, q in zip(g, r)]
+        pc = torch.stack([cells // (g[1] * g[2]), cells // g[2] % g[1], cells % g[2]], 1)
+        off = torch.stack(torch.meshgrid(*(torch.arange(q, device=dev) for q in r), indexing="ij"), -1).view(-1, 3)
+        xyz = (pc[:, None] * torch.tensor(r, device=dev) + off[None]).view(-1, 3)        # parent-major, children raster
+        cidx = (xyz[:, 0] * g2[1] + xyz[:, 1]) * g2[2] + xyz[:, 2]
+        t = self.up2(z).repeat_interleave(len(off), 0)
+        pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
+        pe.patch_mm = 2.0
+        with torch.no_grad():
+            im = pe(patchify_any(vol, k2)[cidx], pe.weights(sp.float(), k2))
+        pe.patch_mm = mm0
+        t = self.fine_mix([t + self.img2(im)], [xyz], [torch.tensor(g2, device=dev)], 0, self.fine2)[0]
+        out = self.kernel_decode(t, emb, sp, k2, None, *self._vox(vol, k2, cidx, sp))       # [n R, o, *k2]
+        o = out.shape[1]
+        return out.view(len(z), *r, o, *k2).permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(len(z), o, *k)
+
     # --------------------------------------------------------------------------------- matryoshka decoding (21/10)
     def _hist(self, lab, val, n_out):
         return torch.zeros(len(lab), n_out, device=lab.device).scatter_add_(1, lab, val.float())
@@ -539,8 +594,8 @@ class SegNet(nn.Module):
             f = add(f, self._cell_sums(c[~dsel], h[~dsel]))
             if dsel.any():
                 cells = keep if sel8.any() else torch.arange(len(z), device=z.device)
-                vox = patchify_any(vol, k)[cells[dsel]] if self.kskip else None
-                lg = self.kernel_decode(z[dsel], emb, sp[b], k, None, vox).flatten(2).transpose(1, 2)
+                lg = self.decode_cells(z[dsel], cells[dsel], vol, sp[b], k, grid if sel8.any() else g8, emb)
+                lg = lg.flatten(2).transpose(1, 2)
                 f = add(f, sums(lg[val[dsel]], lab[dsel][val[dsel]], 1.0, n_out))
             fin = add(fin, f)
             self.last_refined = (float(sel8.float().mean()), float(dsel.float().mean()))
@@ -588,14 +643,23 @@ class SegNet(nn.Module):
         pr = p8[(q[:, 0] * g8[1] + q[:, 1]) * g8[2] + q[:, 2]].half().to(dev if fits else "cpu")
         pr[keep.to(pr.device)] = p.half().to(pr.device)
         pr = pr[:, :, None].expand(-1, -1, P).contiguous()
-        patches = patchify_any(vol, k) if self.kskip else None
         for idx in dsel.nonzero()[:, 0].split(1 << 15):
             if len(idx):
-                vox = patches[keep[idx]] if self.kskip else None
-                pr[keep[idx].to(pr.device)] = self.kernel_decode(z[idx], emb, sp[0], k, None, vox).float().softmax(1).flatten(2).half().to(pr.device)
+                lg = self.decode_cells(z[idx], keep[idx], vol, sp[0], k, g, emb)
+                pr[keep[idx].to(pr.device)] = lg.float().softmax(1).flatten(2).half().to(pr.device)
         self.last_refined = float(dsel.float().mean())
         out = pr.view(*g, n_out, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(g, k)))
         return out[:, : S[0], : S[1], : S[2]]
+
+
+def windows(vol, k, m, idx) -> torch.Tensor:
+    """Cells idx (raster on the grid of k-voxel cells, as patchify) with m voxels of margin per side (zeros past the
+    scan) -> [n, prod(k + 2m)]."""
+    g = [-(-n // a) for n, a in zip(vol.shape, k)]
+    v = F.pad(vol.float(), [p for a, b, n in zip(reversed(k), reversed(m), reversed(vol.shape)) for p in (b, b + (-n % a))])
+    w = v.unfold(0, k[0] + 2 * m[0], k[0]).unfold(1, k[1] + 2 * m[1], k[1]).unfold(2, k[2] + 2 * m[2], k[2])
+    i = torch.stack([idx // (g[1] * g[2]), idx // g[2] % g[1], idx % g[2]], 1)
+    return w[i[:, 0], i[:, 1], i[:, 2]].reshape(len(idx), -1)
 
 
 def patchify_any(vol, k):
@@ -708,7 +772,8 @@ class SFC(Wrapper):
                      refine_tau=float(self.args.get("refine_tau") or 0.9), matryoshka=bool(self.args.get("matryoshka")),
                      quota=float(self.args.get("refine_quota") or 0.5), head_w=float(self.args.get("head_w") or 1.0),
                      rand_dec=float(self.args.get("rand_dec") or 0.02), test_all=bool(self.args.get("test_decode_all")),
-                     kernel_skip=int(self.args.get("kernel_skip") or 0))
+                     kernel_skip=int(self.args.get("kernel_skip") or 0),
+                     kernel_skip_mm=float(self.args.get("kernel_skip_mm") or 0.0), level2=bool(self.args.get("level2")))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
