@@ -133,14 +133,14 @@ class SegNet(nn.Module):
         self.adaptive, self.tau = bool(adaptive), float(refine_tau)
         if self.adaptive:
             assert self.cache is not None and self.kernel and self.refine, "adaptive decoding: token cache and decoder F"
-            self.coarse = nn.Sequential(nn.Linear(encoder.dim, 128), nn.GELU(), nn.Linear(128, n_out))
+            self.cellhead = nn.Linear(128, n_out)   # one prediction per cell of the finest level
         if self.cache is not None and getattr(self, "fine_tok", None) is not None:
             self.cache.levels = (16.0, 8.0, 4.0)
             if fine_pca:   # the fine levels' tokens on token_cache.project's PCA basis: fine_tok reads them directly
                 self.cache.pca = int(fine_pca)
                 self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) for _ in range(self.refine))
 
-    def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, spacing: torch.Tensor, levels: bool = False):
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
         -> logits [B, n_out, *T]. Only the scan's own voxels are read: segrun right-pads a tile up to SEG_PATCH voxels,
         ~160 mm for resampled models but up to 1.2 m of zeros on our native grids (TotalSeg 64^3 at 7.5 mm: 5e5 tokens,
@@ -208,6 +208,8 @@ class SegNet(nn.Module):
                 ts = self.fine_mix([a[0] for a in inp], [a[1] for a in inp], [a[2] for a in inp], i)
                 for b, t, (_, _, gf, kf) in zip(act, ts, inp):
                     st[b] = [t, kf, gf.tolist(), self.fine[i][0].patch_embed, st[b][4]]
+            if levels:   # adaptive decoding: each tile's finest tokens [z, k, g, emb, cur], its scan part V, spacing
+                return st, V, spacing
             out = [self.kernel_decode(z, emb, spacing[b], k, g)[:, : V[b][0], : V[b][1], : V[b][2]]
                    for b, (z, k, g, emb, _) in enumerate(st)]
         return torch.stack([F.pad(o, [p for v, t in zip(reversed(o.shape[1:]), reversed(T)) for p in (0, t - v)])
@@ -329,115 +331,63 @@ class SegNet(nn.Module):
     def _dilate(sel: torch.Tensor, g) -> torch.Tensor:
         return F.max_pool3d(sel.float().view(1, 1, *g), 3, 1, 1).flatten().bool()
 
-    def _coarse(self, ci: str, corner, k4, V, dev) -> tuple:
-        """The 16 mm tokens of a region (cache) -> projected tokens [N16, d], per-cell logits, cell dims, grid."""
-        k16 = [4 * a for a in k4]
-        g16 = [-(-v // a) for v, a in zip(V, k16)]
-        w16 = self.width // (2 if self.context else 1)
-        z16 = self.proj(self.cache.tokens(ci, 16.0, corner, g16, k16)[:, :w16].to(dev).float())
-        return z16, self.coarse(z16), k16, g16
+    def _cell_sums(self, cl: torch.Tensor, hist: torch.Tensor) -> list:
+        """Cells predicted by one logit vector each ([M, n_out]) and their voxels' label counts [M, n_out] -> the exact
+        voxel sums of sums() (every voxel of a cell shares the cell's probabilities)."""
+        lp = cl.float().log_softmax(1)
+        p, nv = lp.exp(), hist.sum(1, keepdim=True)
+        return [-(hist * lp).sum(), hist.sum(), (p * hist).sum(0), (p * nv).sum(0), hist.sum(0)]
 
-    def _chain(self, z16, sel, vol, sp, k16, g16, cur) -> tuple:
-        """The refine levels on the descendants of the selected 16 mm cells only -> tokens of the finest cells, their
-        dims, grid, dense indices in it, and the kernel embedding to decode them with."""
-        from ..curves import grid_coords
-        self._cur, dev = cur, z16.device
-        idx = sel.nonzero()[:, 0]
-        rows = torch.full((len(z16),), -1, dtype=torch.long, device=dev)
-        rows[idx] = torch.arange(len(idx), device=dev)
-        z, k, g, dense, emb = z16[idx], k16, g16, idx, self.encoder.patch_embed
-        for i in range(self.refine):
-            if i and not fine_ok(self.fine_dims(sp, i)):
-                break
-            kf = self.fine_dims(sp, i)
-            gf = [-(-v // a) for v, a in zip(vol.shape, kf)]
-            xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
-            par = ((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(k, device=dev)).long()
-            par = torch.minimum(par, torch.tensor(g, device=dev) - 1)
-            keep = (rows[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]] >= 0).nonzero()[:, 0]
-            if not len(keep):   # no child inside the scan (fine_mix cannot take an empty sequence)
-                break
-            t, xyzk, gft, _ = self.to_fine(z, vol, sp, k, g, i, keep=keep, zmap=rows)
-            t = self.fine_mix([t], [xyzk], [gft], i)[0]
-            rows = torch.full((math.prod(gf),), -1, dtype=torch.long, device=dev)
-            rows[keep] = torch.arange(len(keep), device=dev)
-            z, k, g, dense, emb = t, kf, gf, keep, self.fine[i][0].patch_embed
-        return z, k, g, dense, emb
-
-    def adaptive_sums(self, x: torch.Tensor, y: torch.Tensor, ctx: torch.Tensor, n_out: int, n_points: int = 16384):
-        """One training tile ([C, *T] voxels, [*T] labels, segrun's ctx row) -> the loss sums (segrun.sums_loss) of
-        the final prediction (fine levels in the refined cells, every voxel; the coarse head elsewhere, on uniform
-        points weighted to the region's voxel count) and of the coarse head alone (uniform points everywhere)."""
-        dev, T = x.device, tuple(x.shape[1:])
-        corner, ext = ctx[7:10].long().tolist(), ctx[3:6].long().tolist()
-        V = [max(1, min(e - c, t)) for e, c, t in zip(ext, corner, T)]
-        vol, yy, sp = x[0, : V[0], : V[1], : V[2]].float(), y[: V[0], : V[1], : V[2]], ctx[:3].float()
-        ci = self.cache.ids[int(ctx[6])]
-        k4 = self.cache.meta(ci)["k4"]
-        z16, cl, k16, g16 = self._coarse(ci, corner, k4, V, dev)
-        lab16, val16 = self._cells(yy, k16)
-        hi = torch.where(val16, lab16, -1).max(1).values
-        lo = torch.where(val16, lab16, 1 << 20).min(1).values
-        edge = (hi >= 0) & (hi != lo)                                          # cells holding two labels (GT)
-        # the criterion used at test, capped at the most unsure 20 % of the cells (early on every cell is unsure)
-        u = 1 - cl.detach().float().softmax(1).max(1).values
-        unsure = (u > 1 - self.tau) & (u >= u.quantile(0.8))
-        sel = self._dilate(edge | unsure | (torch.rand(len(cl), device=dev) < 0.05), g16)
-        # uniform points over the region's voxels (cell, voxel within it)
-        cell = torch.randint(len(cl), (n_points,), device=dev)
-        vox = torch.randint(lab16.shape[1], (n_points,), device=dev)
-        ok = val16[cell, vox]
-        cell, lab = cell[ok], lab16[cell[ok], vox[ok]]
-        total = val16.sum()
-        coarse = sums(cl[cell], lab, total / max(len(lab), 1), n_out)          # the coarse head everywhere
-        out = ~sel[cell]
-        n_out_vox = val16[~sel].sum()
-        final = sums(cl[cell[out]], lab[out], n_out_vox / max(int(out.sum()), 1), n_out)
-        z = kf = None
-        if sel.any():
-            z, kf, _, dense, emb = self._chain(z16, sel, vol, sp, k16, g16, (ci, corner, k4))
-        if z is not None and kf != k16:
-            lg = self.kernel_decode(z, emb, sp, kf, None).flatten(2).transpose(1, 2)   # [Nf, P, n_out]
-            labf, valf = self._cells(yy, kf)
-            labf, valf = labf[dense], valf[dense]
-            final = [a + b for a, b in zip(final, sums(lg[valf], labf[valf], 1.0, n_out))]
-        self.last_refined = float(sel.float().mean())
-        return final, coarse
+    def adaptive_sums(self, x: torch.Tensor, y: torch.Tensor, ctx: torch.Tensor, n_out: int, unsure: float = 0.05,
+                      rand: float = 0.02, edges: float = 0.1) -> tuple:
+        """A batch of tiles [B, C, *T] (labels [B, *T], segrun's ctx [B, 10]) -> the loss sums of the final prediction
+        and of the cell head, summed over the batch. The refine levels run densely, as decoder F; only the expensive
+        part, the kernel decoding of every native voxel (x n_out classes), is adaptive: at the finest level a cell head
+        gives one prediction per cell, and the voxels are decoded only in cells holding two labels (GT edges, a random
+        subset of at most `edges` of the cells), the most unsure `unsure` share and a random `rand` share. The other cells' voxels share their cell's prediction:
+        their sums come exactly from the cell's label counts. Both losses are exact over every voxel."""
+        st, V, sp = self(x, ctx, levels=True)
+        fin = aux = None
+        for b, (z, k, g, emb, _) in enumerate(st):
+            yy = y[b, : V[b][0], : V[b][1], : V[b][2]]
+            lab, val = self._cells(yy, k)
+            hist = torch.zeros(len(lab), n_out, device=z.device).scatter_add_(1, lab, val.float())
+            cl = self.cellhead(z)
+            a = self._cell_sums(cl, hist)
+            u = 1 - cl.detach().float().softmax(1).max(1).values
+            # the decoding's backward is ~3/4 of the step (TotalSeg: 50 organs, many edge cells): a random subset of
+            # the edge cells (at most `edges` of all cells) per step, the rest of them through the cell head as at test
+            edge = (hist > 0).sum(1) > 1
+            r = torch.rand(len(u), device=z.device)
+            sel = (edge & (r < edges * len(u) / max(int(edge.sum()), 1))) | (u >= u.quantile(1 - unsure)) | (r > 1 - rand)
+            f = self._cell_sums(cl[~sel], hist[~sel])
+            if sel.any():
+                lg = self.kernel_decode(z[sel], emb, sp[b], k, None).flatten(2).transpose(1, 2)   # [Ns, P, n_out]
+                f = [u_ + v_ for u_, v_ in zip(f, sums(lg[val[sel]], lab[sel][val[sel]], 1.0, n_out))]
+            fin = f if fin is None else [u_ + v_ for u_, v_ in zip(fin, f)]
+            aux = a if aux is None else [u_ + v_ for u_, v_ in zip(aux, a)]
+            self.last_refined = float(sel.float().mean())
+        return fin, aux
 
     @torch.no_grad()
     def adaptive_predict(self, x: torch.Tensor, ctx: torch.Tensor, n_out: int) -> torch.Tensor:
-        """A whole scan [C, *S] in one pass -> class probabilities [n_out, *S]: the coarse head on every 16 mm cell,
-        the finer levels on the cells it is unsure of (max probability < tau) and their neighbours, in chunks."""
-        from ..curves import grid_coords
+        """A whole scan [C, *S] in one pass (no tiles: the cached tokens already carry the whole scan) -> class
+        probabilities [n_out, *S]: the refine levels on the whole scan, the cell head everywhere, the voxels decoded
+        only in the cells it is unsure of (max probability < tau) and their neighbours."""
         dev, S = x.device, tuple(x.shape[1:])
-        vol, sp = x[0].float(), ctx[:3].float().to(dev)
-        ci = self.cache.ids[int(ctx[6])]
-        k4 = self.cache.meta(ci)["k4"]
-        cur = (ci, [0, 0, 0], k4)
-        z16, cl, k16, g16 = self._coarse(ci, [0, 0, 0], k4, S, dev)
-        p16 = cl.float().softmax(1)
-        sel = self._dilate(p16.max(1).values < self.tau, g16)
-        self._cur = cur
-        last = max(i for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
-        kf = self.fine_dims(sp, last)
-        gf = [-(-v // a) for v, a in zip(S, kf)]
-        xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
-        par = torch.minimum((xyz * torch.tensor(kf, device=dev)) // torch.tensor(k16, device=dev),
-                            torch.tensor(g16, device=dev) - 1)
-        fits = n_out * math.prod(gf) * math.prod(kf) * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
-        pr = p16[(par[:, 0] * g16[1] + par[:, 1]) * g16[2] + par[:, 2]].half().to(dev if fits else "cpu")
-        pr = pr[:, :, None].expand(-1, -1, math.prod(kf)).contiguous()                  # [Nf, n_out, P]
-        for chunk in sel.nonzero()[:, 0].split(4096):
-            s = torch.zeros_like(sel)
-            s[chunk] = True
-            z, kfc, _, dense, emb = self._chain(z16, s, vol, sp, k16, g16, cur)
-            if kfc != kf:   # the chain stopped early (no child in the scan): the coarse probabilities stay
-                continue
-            pr[dense.to(pr.device)] = self.kernel_decode(z, emb, sp, kfc, None).float().softmax(1).flatten(2).half().to(pr.device)
+        c = torch.cat([ctx[:7].float().cpu(), torch.zeros(3)]).to(dev)   # corner 0: the tile is the scan
+        st, _, sp = self(x[None].float(), c[None], levels=True)
+        z, k, g, emb, _ = st[0]
+        p = self.cellhead(z).float().softmax(1)
+        sel = self._dilate(p.max(1).values < self.tau, g)
+        P = math.prod(k)
+        fits = n_out * len(p) * P * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
+        pr = p.half().to(dev if fits else "cpu")[:, :, None].expand(-1, -1, P).contiguous()       # [N, n_out, P]
+        for idx in sel.nonzero()[:, 0].split(1 << 15):
+            pr[idx.to(pr.device)] = self.kernel_decode(z[idx], emb, sp[0], k, None).float().softmax(1).flatten(2).half().to(pr.device)
         self.last_refined = float(sel.float().mean())
-        out = pr.view(*gf, n_out, *kf).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(gf, kf)))
+        out = pr.view(*g, n_out, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(g, k)))
         return out[:, : S[0], : S[1], : S[2]]
-
 
 def sums(logits: torch.Tensor, lab: torch.Tensor, w, k: int) -> list:
     """Points' logits [M, k] and labels [M], each point standing for w voxels -> [CE sum, voxels, per class: soft

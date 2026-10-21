@@ -324,16 +324,16 @@ def sums_loss(t: list) -> torch.Tensor:
 
 
 def adaptive_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
-    """Decoder F adaptive (21/10): each tile's sums (final prediction, coarse head), summed over the batch, one
-    backward of both losses."""
-    parts = list(zip(x, y, c)) if isinstance(x, list) else [(x[i:i + 1], y[i:i + 1], c[i:i + 1]) for i in range(len(x))]
-    fin = coa = None
+    """Decoder F adaptive (21/10): the batch's sums (final prediction, cell head) in one pass (a list of tiles of
+    several shapes: one pass each), one backward of both losses."""
+    parts = [(t, u, v) for t, u, v in zip(x, y, c)] if isinstance(x, list) else [(x, y, c)]
+    fin = aux = None
     for xi, yi, ci in parts:
         with amp():
-            f, a = net.adaptive_sums(xi[0].to(dev).float(), yi[0].to(dev), ci[0].to(dev), k)
+            f, a = net.adaptive_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), k)
         fin = f if fin is None else [u + v for u, v in zip(fin, f)]
-        coa = a if coa is None else [u + v for u, v in zip(coa, a)]
-    loss = sums_loss(fin) + sums_loss(coa)
+        aux = a if aux is None else [u + v for u, v in zip(aux, a)]
+    loss = sums_loss(fin) + sums_loss(aux)
     loss.backward()
     return loss.detach()
 
