@@ -52,6 +52,7 @@ from .worker import build, fail, prepared
 # token-cache runs (20/10): tiles of TILE_CELLS 16 mm cells per axis (16 cm, as the resampled models' 160 voxels at
 # ~1 mm) instead of 160 native voxels (67 cm of TotalSeg's 4.2 mm voxels, 7 cm of SOOP's 0.45 mm)
 TILE_CELLS = 10
+AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
 JOINT_MAX = 2e8   # voxels x classes of a batch that joint_step keeps in graphs (~5 GB of fp32 logits and softmax)
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
@@ -457,15 +458,20 @@ def train(job: dict) -> None:
                 m.eval()
 
         set_mode()
-        nxt = data.sample(int(job["batch"]))
+        # the next AHEAD batches drawn in advance, their cached tokens read while the current ones train: a TotalSeg
+        # tile's fine tokens are ~1600 small Lustre reads per level (~3 s against ~0.7 s of GPU, 21/10)
+        def draw():
+            b = data.sample(int(job["batch"]))
+            if tcache is not None:
+                tcache.next_batch(keep=AHEAD)
+                for xi, ci in (zip(b[0], b[2]) if isinstance(b[0], list) else [(b[0], b[2])]):
+                    tcache.prefetch(ci, tuple(xi.shape[2:]))
+            return b
+        queue = [draw() for _ in range(min(AHEAD, iters - start + 1))]
         for it in range(start, iters + 1):
-            x, y, c = nxt
-            if it < iters:   # the next batch drawn now, its cached tokens read while this one trains
-                nxt = data.sample(int(job["batch"]))
-                if tcache is not None:
-                    tcache.next_batch()
-                    for xi, ci in (zip(nxt[0], nxt[2]) if isinstance(nxt[0], list) else [(nxt[0], nxt[2])]):
-                        tcache.prefetch(ci, tuple(xi.shape[2:]))
+            x, y, c = queue.pop(0)
+            if it + len(queue) < iters:
+                queue.append(draw())
             opt.zero_grad(set_to_none=True)
             # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
             # of ~1e7 voxels x 50 classes: then micro_step (the two graphs of joint_step went OOM)

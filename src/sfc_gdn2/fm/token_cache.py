@@ -39,8 +39,8 @@ class TokenCache:
 
     def __init__(self, root: str | Path):
         from concurrent.futures import ThreadPoolExecutor
-        self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(16)
-        self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(4), {}, (16.0,), {}, 0
+        self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(32)
+        self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(16), {}, (16.0,), {}, 0
         self._recent = {}
         self.pca = None   # SegNet fine_pca: the 8 / 4 mm levels from <id>.<mm>.p<pca>.npy (project())
 
@@ -60,10 +60,10 @@ class TokenCache:
             self._fd[key] = (os.open(self.root / name, os.O_RDONLY), shape, np.dtype(dtype), off)
         return self._fd[key]
 
-    def next_batch(self) -> None:
-        """A new batch is being prefetched: drop what the batch before the current one read."""
+    def next_batch(self, keep: int = 1) -> None:
+        """A new batch is being prefetched: drop the reads of the batches more than `keep` + 1 batches back."""
         self._gen += 1
-        self._ahead = {k: v for k, v in self._ahead.items() if v[0] >= self._gen - 1}
+        self._ahead = {k: v for k, v in self._ahead.items() if v[0] >= self._gen - keep - 1}
 
     def prefetch(self, ctx: torch.Tensor, T) -> None:
         """Start reading the tokens a batch of tiles will ask for (ctx rows as SegNet takes them, tiles of T voxels)
