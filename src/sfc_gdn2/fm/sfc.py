@@ -377,8 +377,10 @@ class SegNet(nn.Module):
             # the edge cells (at most `edges` of all cells) per step, the rest of them through the cell head as at test
             edge = (hist > 0).sum(1) > 1
             r = torch.rand(len(u), device=z.device)
+            pe = self._pred_edge(cl.detach(), g)   # the test's criterion, subsampled as the GT edges (TotalSeg: 50
+            r2 = torch.rand(len(u), device=z.device)   # organs, an early prediction has edges almost everywhere)
             sel = (edge & (r < edges * len(u) / max(int(edge.sum()), 1))) | (u >= u.quantile(1 - unsure)) | (r > 1 - rand) \
-                | self._pred_edge(cl.detach(), g)   # as at test
+                | (pe & (r2 < edges * len(u) / max(int(pe.sum()), 1)))
             f = self._cell_sums(cl[~sel], hist[~sel])
             if sel.any():
                 lg = self.kernel_decode(z[sel], emb, sp[b], k, None).flatten(2).transpose(1, 2)   # [Ns, P, n_out]
