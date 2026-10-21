@@ -53,7 +53,7 @@ prostate_lesion: {type: seg, label: seg, query: "dataset == 'Prostate158' and mo
 wmh_seg:       {type: seg, label: seg, query: "dataset == 'WMH2017'", classes: [1], ignore: [2]}   # 2 = other pathology
 cmb_seg:       {type: seg, label: seg, query: "dataset == 'VALDO' and session == 'task2' and modality == 'T2star'", save_pred: true,
                 extra_metric_note: "lesion-wise F1 (Dice is unstable on 2-10 mm dots)"}
-lacune_seg:    {type: seg, label: seg, query: "dataset == 'VALDO' and session == 'task3' and modality == 'FLAIR'"}
+# lacune_seg removed (21/10, user): Dice 0 for all 13 models, 28 train volumes and 4 test volumes with lacunes
 heart_seg:     {type: seg, label: seg, query: "dataset == 'HVSMR' and official_split == 'no'", classes: [1, 2, 3, 4, 5, 6, 7, 8]}  # without the 20 HVSMR 2016 cases
 ms_seg:        {type: seg, label: seg, query: "dataset == 'MSLesSeg' and modality == 'FLAIR'"}
 bladder_seg:   {type: seg, label: seg, query: "dataset == 'FedBCa'"}                # union of the tumour masks

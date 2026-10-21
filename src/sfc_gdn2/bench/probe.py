@@ -34,6 +34,10 @@ from torch.nn import functional as F
 
 L2_GRID = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
 HIDDEN = {"linear": 0, "mlp": 256}
+# val with fewer subjects than this (user, 21/10: e.g. cmb_any, 7 val subjects -> val AUROC 0.32, test 0.74): the
+# (feature, L2) is chosen on out-of-fold predictions of a CV_FOLDS-fold split of train + val by subject, then the head
+# is refitted on train + val; test is never seen by the choice. Same rule for every model.
+CV_MIN_VAL, CV_FOLDS = 25, 5
 
 
 # ------------------------------------------------------------------------------------------- features
@@ -307,26 +311,52 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
     out = {"task": name, "type": cfg["type"], "metric": kind.key, "classes": [str(c) for c in classes],
            "n": {s: len(v) for s, v in sel.items()}, "subjects": {s: int(rows.iloc[v]["subject"].nunique())
                                                                       for s, v in sel.items()}}
+    cv = out["subjects"]["val"] < CV_MIN_VAL
+    out["selection"] = f"cv{CV_FOLDS}" if cv else "val"
+    if cv:  # selection split: train + val, folds by subject (shuffled with a fixed seed)
+        sel["fit"] = np.concatenate([sel["train"], sel["val"]])
+        subj = rows.iloc[sel["fit"]]["subject"].to_numpy()
+        order = np.random.default_rng(0).permutation(np.unique(subj))
+        fold = pd.Series(np.arange(len(order)) % CV_FOLDS, index=order)[subj].to_numpy()
+        y["fit"] = y_all[sel["fit"]].to(device)
+    fit_on = "fit" if cv else "train"
+
+    def standardize(x, idx):
+        return (x - x[idx].mean(0)) / x[idx].std(0).clamp_min(1e-6)
+
     for variant, hidden in HIDDEN.items():
         best, cands = None, {}
         for fname, f in feats.items():
             x = f[rid].float().to(device)
-            mu, sd = x[sel["train"]].mean(0), x[sel["train"]].std(0).clamp_min(1e-6)
-            x = (x - mu) / sd
-            xs = {s: x[sel[s]] for s in sel}
+            xs = {s: v[sel[s]] for v in (standardize(x, sel[fit_on]),) for s in sel}
             for l2 in L2_GRID:
-                head = fit(xs["train"], y["train"], kind, l2, hidden)
-                val = kind.metrics(kind.predict(head(xs["val"])), y["val"], rows.iloc[sel["val"]])
+                if cv:  # out-of-fold outputs, each fold standardized on its own training part
+                    oof = None
+                    for k in range(CV_FOLDS):
+                        tr, te = sel["fit"][fold != k], sel["fit"][fold == k]
+                        xk = standardize(x, tr)
+                        o = fit(xk[tr], y_all[tr].to(device), kind, l2, hidden)(xk[te])
+                        oof = o.new_zeros((len(sel["fit"]), *o.shape[1:])) if oof is None else oof
+                        oof[torch.from_numpy(np.flatnonzero(fold == k)).to(device)] = o
+                    val = kind.metrics(kind.predict(oof), y["fit"], rows.iloc[sel["fit"]])
+                else:
+                    head = fit(xs["train"], y["train"], kind, l2, hidden)
+                    val = kind.metrics(kind.predict(head(xs["val"])), y["val"], rows.iloc[sel["val"]])
                 cands[fname] = max(cands.get(fname, -float("inf")), val[kind.key])   # best val per feature
                 if best is None or val[kind.key] > best["val"][kind.key]:
-                    best = {"feature": fname, "l2": l2, "val": val, "head": head, "xs": xs}
+                    best = {"feature": fname, "l2": l2, "val": val, "xs": xs, "oof": oof if cv else None}
+                    if not cv:
+                        best["head"] = head
+        if cv:  # the chosen (feature, L2) refitted on train + val
+            best["head"] = fit(best["xs"]["fit"], y["fit"], kind, best["l2"], hidden)
         pred = {s: kind.predict(best["head"](best["xs"][s])) for s in sel}
         test_rows = rows.iloc[sel["test"]]
         res = {"feature": best["feature"], "l2": best["l2"], "val": best["val"], "candidates": cands,
                "test": kind.metrics(pred["test"], y["test"], test_rows),
                "test_ci95": bootstrap(kind, pred["test"], y["test"], test_rows)}
-        if cfg["type"] == "dex":  # age-bias correction (regression to the mean) fitted on val
-            a, b = np.polyfit(y["val"].cpu().numpy(), pred["val"].cpu().numpy(), 1)
+        if cfg["type"] == "dex":  # age-bias correction (regression to the mean) fitted on val (cv: out-of-fold)
+            yv, pv = (y["fit"], kind.predict(best["oof"])) if cv else (y["val"], pred["val"])
+            a, b = np.polyfit(yv.cpu().numpy(), pv.cpu().numpy(), 1)
             res["test"]["mae_bias_corrected"] = float(((pred["test"] - b) / a - y["test"]).abs().mean())
         res["predictions"] = {"id": test_rows["id"].tolist(), "pred": pred["test"].cpu().tolist()}
         out[variant] = res
