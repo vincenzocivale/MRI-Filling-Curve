@@ -436,8 +436,11 @@ def train(job: dict) -> None:
         return {n: t.detach().to("cpu", copy=True) for n, t in net.state_dict().items() if n not in frozen_names}
 
     def load_trained(state: dict) -> None:
-        missing, unexpected = net.load_state_dict(state, strict=False)
-        assert not unexpected and set(missing) <= frozen_names, (unexpected, missing)
+        # keys checked here: some repos' nets (FOMO26 / asparagus) override load_state_dict and return None
+        names = set(net.state_dict())
+        unexpected, missing = set(state) - names, names - set(state)
+        assert not unexpected and missing <= frozen_names, (unexpected, missing)
+        net.load_state_dict(state, strict=False)
 
     if saved.get("key") == key:
         best, curve = saved["best"], saved["curve"]

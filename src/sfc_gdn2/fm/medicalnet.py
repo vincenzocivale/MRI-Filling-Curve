@@ -73,7 +73,12 @@ class MedicalNet(Wrapper):
                          phase="test")
         with tempfile.TemporaryDirectory() as tmp:
             img_list = Path(tmp) / "test.txt"
-            img_list.write_text(str(Path(image).resolve()) + "\n")  # root_dir is ignored for absolute paths
+            # the repo splits each list line on " " (brains18.py:63): paths with spaces (MSLesSeg, WMH2017) go
+            # through a space-free link, same file
+            src = Path(image).resolve()
+            link = Path(tmp) / ("img" + "".join(src.suffixes[-2:]))
+            link.symlink_to(src)
+            img_list.write_text(str(link) + "\n")  # root_dir is ignored for absolute paths
             dataset = BrainS18Dataset(tmp, str(img_list), sets)
             if self.seed is not None:
                 np.random.seed(int(self.seed))

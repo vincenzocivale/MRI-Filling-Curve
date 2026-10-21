@@ -226,7 +226,7 @@ def project(path: str) -> None:
     while not bfile.exists():
         time.sleep(30)
     basis = {mm: (m.cuda(), V.cuda()) for mm, (m, V) in torch.load(bfile).items()}
-    ids = sorted(p.name.split(".")[0] for p in root.glob("*.json"))[i0::n]
+    ids = sorted(p.name.removesuffix(".json") for p in root.glob("*.json"))[i0::n]  # ids may contain dots (WMH2017)
     for c, i in enumerate(ids):
         for mm, (mu, V) in basis.items():
             src, dst = root / f"{i}.{mm}.npy", root / f"{i}.{mm}.p{dim}.npy"
