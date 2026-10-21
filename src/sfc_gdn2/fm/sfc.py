@@ -32,6 +32,7 @@ from .base import Image, Wrapper
 from .token_cache import TokenCache, fine_ok
 
 SEG_PATCH = (160, 160, 160)   # voxels, as the Primus / nnFoundation ViT runs
+MIX_MAX = 1 << 19   # tokens per refine-block call (fine_mix)
 DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
 
 
@@ -287,9 +288,18 @@ class SegNet(nn.Module):
             for t in ts:
                 cu += [o + j for j in range(self.fine_seg or len(t), len(t), self.fine_seg or len(t))] + [o + len(t)]
                 o += len(t)
-            cu = torch.tensor(cu, device=ts[0].device, dtype=torch.int32)
+            seq = torch.cat([t[od] for t, od in zip(ts, orders)])
+            # calls of at most MIX_MAX tokens, cut at sequence boundaries: the short convolution's Triton grid failed
+            # on a whole-body scan (~1e6 tokens in one call, 21/10)
+            groups, a = [], 0
+            for j in range(1, len(cu)):
+                if cu[j] - cu[a] > MIX_MAX and j - 1 > a:
+                    groups.append((a, j - 1))
+                    a = j - 1
+            groups.append((a, len(cu) - 1))
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                h = enc.flat(torch.cat([t[od] for t, od in zip(ts, orders)]), cu).float()
+                h = torch.cat([enc.flat(seq[cu[a]: cu[b]], torch.tensor([c - cu[a] for c in cu[a: b + 1]], device=seq.device,
+                                                                        dtype=torch.int32)).float() for a, b in groups])
             ts = [hh[od.argsort()] for hh, od in zip(h.split([len(t) for t in ts]), orders)]
         return ts
 
