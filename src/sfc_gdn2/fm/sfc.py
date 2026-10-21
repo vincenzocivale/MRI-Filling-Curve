@@ -385,6 +385,8 @@ class SegNet(nn.Module):
         fits = n_out * len(p) * P * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
         pr = p.half().to(dev if fits else "cpu")[:, :, None].expand(-1, -1, P).contiguous()       # [N, n_out, P]
         for idx in sel.nonzero()[:, 0].split(1 << 15):
+            if not len(idx):   # nothing unsure (split of an empty selection still yields one empty chunk)
+                continue
             pr[idx.to(pr.device)] = self.kernel_decode(z[idx], emb, sp[0], k, None).float().softmax(1).flatten(2).half().to(pr.device)
         self.last_refined = float(sel.float().mean())
         out = pr.view(*g, n_out, *k).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(g, k)))
