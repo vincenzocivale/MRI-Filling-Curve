@@ -40,7 +40,7 @@ bladder_mibc:     {type: class, label: mibc, query: "dataset == 'FedBCa'"}      
 liver_lesion:     {type: class, label: liver_class, query: "dataset == 'LLDMMRI'"}    # 7 classes, balanced accuracy;
                   # input = crop around the MedSAM2 lesion mask (+20 mm in-plane, +1 slice), all 8 phases pooled
 liver_malignant:  {type: class, label: malignant, query: "dataset == 'LLDMMRI'"}      # optional: benign vs malignant
-edss:             {type: dex, label: edss, bin: 0.5, query: "dataset == 'MSLesSeg' and session in ['', 'T1']"}  # first timepoint
+edss:             {type: dex, label: edss, bin: 0.5, query: "dataset == 'MSLesSeg' and (session == 'T1' or session != session)"}  # first timepoint
 pcom_any:         {type: class, label: pcom_any, query: "dataset == 'TopCoW'"}         # any posterior communicating artery (78/47)
 cmb_any:          {type: class, label: "cmb_count > 0", requires: [cmb_count], query: "dataset == 'VALDO' and session == 'task2'"}
 
