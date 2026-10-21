@@ -355,6 +355,8 @@ class SegNet(nn.Module):
             par = ((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(k, device=dev)).long()
             par = torch.minimum(par, torch.tensor(g, device=dev) - 1)
             keep = (rows[(par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]] >= 0).nonzero()[:, 0]
+            if not len(keep):   # no child inside the scan (fine_mix cannot take an empty sequence)
+                break
             t, xyzk, gft, _ = self.to_fine(z, vol, sp, k, g, i, keep=keep, zmap=rows)
             t = self.fine_mix([t], [xyzk], [gft], i)[0]
             rows = torch.full((math.prod(gf),), -1, dtype=torch.long, device=dev)
@@ -391,8 +393,10 @@ class SegNet(nn.Module):
         out = ~sel[cell]
         n_out_vox = val16[~sel].sum()
         final = sums(cl[cell[out]], lab[out], n_out_vox / max(int(out.sum()), 1), n_out)
+        z = kf = None
         if sel.any():
             z, kf, _, dense, emb = self._chain(z16, sel, vol, sp, k16, g16, (ci, corner, k4))
+        if z is not None and kf != k16:
             lg = self.kernel_decode(z, emb, sp, kf, None).flatten(2).transpose(1, 2)   # [Nf, P, n_out]
             labf, valf = self._cells(yy, kf)
             labf, valf = labf[dense], valf[dense]
@@ -427,6 +431,8 @@ class SegNet(nn.Module):
             s = torch.zeros_like(sel)
             s[chunk] = True
             z, kfc, _, dense, emb = self._chain(z16, s, vol, sp, k16, g16, cur)
+            if kfc != kf:   # the chain stopped early (no child in the scan): the coarse probabilities stay
+                continue
             pr[dense.to(pr.device)] = self.kernel_decode(z, emb, sp, kfc, None).float().softmax(1).flatten(2).half().to(pr.device)
         self.last_refined = float(sel.float().mean())
         out = pr.view(*gf, n_out, *kf).permute(3, 0, 4, 1, 5, 2, 6).reshape(n_out, *(a * b for a, b in zip(gf, kf)))
