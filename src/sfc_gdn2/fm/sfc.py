@@ -60,7 +60,8 @@ class SegNet(nn.Module):
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
                  refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
-                 adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0):
+                 adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0,
+                 rand_dec: float = 0.02, test_all: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -137,6 +138,7 @@ class SegNet(nn.Module):
         # 4 mm level only in the `quota` of 8 mm cells whose voxel intensities vary most (label-free, decided before
         # reading them), the native-voxel decoding only in its boundary / unsure cells
         self.matryoshka, self.quota, self.head_w = bool(matryoshka), float(quota), float(head_w)
+        self.rand_dec, self.test_all = float(rand_dec), bool(test_all)   # training's random decoded share; decode all at test
         if self.matryoshka:
             assert self.cache is not None and self.kernel and self.refine == 2, "matryoshka decoding: token cache, F, refine 2"
             self.head16, self.head8, self.head4 = nn.Linear(encoder.dim, n_out), nn.Linear(128, n_out), nn.Linear(128, n_out)
@@ -467,11 +469,12 @@ class SegNet(nn.Module):
         return out
 
     def matryoshka_sums(self, x: torch.Tensor, y: torch.Tensor, ctx: torch.Tensor, n_out: int, unsure: float = 0.05,
-                        rand: float = 0.02, edges: float = 0.1) -> tuple:
+                        rand: float | None = None, edges: float = 0.1) -> tuple:
         """A batch of tiles -> (sums of the final prediction, [sums of the 16, 8, 4 mm heads]), each summed over the
         batch (segrun.sums_loss on each, added). Final: the 8 mm head where the 4 mm level is not read, the 4 mm head in
         its cells, the native voxels decoded in a subset of them (GT edges, predicted edges, unsure, random)."""
         st, V, sp = self(x, ctx, levels=True, stop=1)
+        rand = self.rand_dec if rand is None else rand
         add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
         fin, aux = None, [None, None, None]
         for b, (z8, k8, g8, emb8, cur) in enumerate(st):
@@ -547,7 +550,7 @@ class SegNet(nn.Module):
                 pe = self._pred_edge(p8, g8)
         finally:
             self.fine_seg = fs
-        dsel = pe | (p.max(1).values < self.tau)
+        dsel = pe | (p.max(1).values < self.tau) | self.test_all
         P, N = math.prod(k), math.prod(g)
         fits = n_out * N * P * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
         from ..curves import grid_coords
@@ -672,7 +675,8 @@ class SFC(Wrapper):
                      refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"),
                      fine_pca=int(self.args.get("fine_pca") or 0), adaptive=bool(self.args.get("adaptive")),
                      refine_tau=float(self.args.get("refine_tau") or 0.9), matryoshka=bool(self.args.get("matryoshka")),
-                     quota=float(self.args.get("refine_quota") or 0.5), head_w=float(self.args.get("head_w") or 1.0))
+                     quota=float(self.args.get("refine_quota") or 0.5), head_w=float(self.args.get("head_w") or 1.0),
+                     rand_dec=float(self.args.get("rand_dec") or 0.02), test_all=bool(self.args.get("test_decode_all")))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
