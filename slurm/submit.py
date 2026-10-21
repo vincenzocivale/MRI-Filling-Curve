@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import shlex
 import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -144,7 +145,9 @@ def main(argv: list[str] | None = None) -> int:
     Path(logs_dir).mkdir(parents=True, exist_ok=True)
     after, jobs = args.after_job, []
     for _ in range(args.chain):
-        cmd = ["sbatch", "--parsable", *([f"--dependency=afterany:{after}"] if after else [])]
+        # nodes to avoid (faulty GPUs): $SFC_EXCLUDE, explicit (SBATCH_EXCLUDE did not reach every job, 21/10)
+        excl = os.environ.get("SFC_EXCLUDE") or os.environ.get("SBATCH_EXCLUDE")
+        cmd = ["sbatch", "--parsable", *([f"--dependency=afterany:{after}"] if after else []), *([f"--exclude={excl}"] if excl else [])]
         out = subprocess.run(cmd, input=script, check=True, capture_output=True, text=True).stdout
         after = out.strip().split(";")[0]
         jobs.append(after)
