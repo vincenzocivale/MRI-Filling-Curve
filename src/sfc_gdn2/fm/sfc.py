@@ -60,7 +60,7 @@ class SegNet(nn.Module):
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
                  refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
-                 adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5):
+                 adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -136,7 +136,7 @@ class SegNet(nn.Module):
         # its own (exact loss from the cells' label counts, summed: any depth is a valid stop); 16 -> 8 mm dense, the
         # 4 mm level only in the `quota` of 8 mm cells whose voxel intensities vary most (label-free, decided before
         # reading them), the native-voxel decoding only in its boundary / unsure cells
-        self.matryoshka, self.quota = bool(matryoshka), float(quota)
+        self.matryoshka, self.quota, self.head_w = bool(matryoshka), float(quota), float(head_w)
         if self.matryoshka:
             assert self.cache is not None and self.kernel and self.refine == 2, "matryoshka decoding: token cache, F, refine 2"
             self.head16, self.head8, self.head4 = nn.Linear(encoder.dim, n_out), nn.Linear(128, n_out), nn.Linear(128, n_out)
@@ -672,7 +672,7 @@ class SFC(Wrapper):
                      refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"),
                      fine_pca=int(self.args.get("fine_pca") or 0), adaptive=bool(self.args.get("adaptive")),
                      refine_tau=float(self.args.get("refine_tau") or 0.9), matryoshka=bool(self.args.get("matryoshka")),
-                     quota=float(self.args.get("refine_quota") or 0.5))
+                     quota=float(self.args.get("refine_quota") or 0.5), head_w=float(self.args.get("head_w") or 1.0))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

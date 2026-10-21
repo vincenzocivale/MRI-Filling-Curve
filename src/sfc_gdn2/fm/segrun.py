@@ -336,7 +336,7 @@ def matryoshka_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
             f, a = net.matryoshka_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), k)
         fin = f if fin is None else [u + v for u, v in zip(fin, f)]
         aux = a if aux is None else [[u + v for u, v in zip(p, q)] for p, q in zip(aux, a)] + (aux[len(a):] or a[len(aux):])
-    loss = sums_loss(fin) + sum(sums_loss(a) for a in aux)
+    loss = sums_loss(fin) + getattr(net, "head_w", 1.0) * sum(sums_loss(a) for a in aux)
     loss.backward()
     return loss.detach()
 
