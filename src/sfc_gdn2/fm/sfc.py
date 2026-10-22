@@ -62,7 +62,8 @@ class SegNet(nn.Module):
                  refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
                  adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0,
                  rand_dec: float = 0.02, test_all: bool = False, kernel_skip: int = 0, kernel_skip_mm: float = 0.0,
-                 level2: bool = False, decoder_c: bool = False, c_points: int = 32768, c_local: bool = False):
+                 level2: bool = False, decoder_c: bool = False, c_points: int = 32768, c_local: bool = False,
+                 c_unweighted: bool = False, c_wpow: float = 1.0):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -148,6 +149,12 @@ class SegNet(nn.Module):
         # containing cell's own features and the voxel's position relative to that cell's centre (local implicit
         # function, relative only), and the intensities at +-1 and +-2 voxels per axis (13)
         self.decoder_c, self.c_points, self.c_local = bool(decoder_c), int(c_points), bool(c_local)
+        # c_unweighted (22/10): the stratified points count once each (class-balanced loss, as R4's decoded cells near the
+        # objects and nnU-Net's foreground oversampling): with importance weights the background points' small
+        # probabilities of a tiny class, times weights of ~1e3, dominate its soft-Dice sums (fetal landmarks, CMB: nothing)
+        self.c_unweighted = bool(c_unweighted)
+        # c_wpow a: the points' weights to the power a (1: unbiased, 0: unweighted); 0.5 between (MS lesions lost with 0)
+        self.c_wpow = 0.0 if self.c_unweighted else float(c_wpow)
         if self.decoder_c:
             CF = 32
             self.cfield = nn.ModuleList([nn.Linear(encoder.dim, CF), nn.Linear(128, CF), nn.Linear(128, CF)])
@@ -562,7 +569,7 @@ class SegNet(nn.Module):
             S = yy.shape
             pts = torch.stack([idx // (S[1] * S[2]), idx // S[2] % S[1], idx % S[2]], 1)
             lg = self.c_logits(lv, vol, pts)
-            fin = add(fin, wsums(lg, yy.flatten()[idx].long(), w, n_out))
+            fin = add(fin, wsums(lg, yy.flatten()[idx].long(), w ** self.c_wpow, n_out))
         return fin, [a for a in aux if a is not None]
 
     @torch.no_grad()
@@ -924,7 +931,8 @@ class SFC(Wrapper):
                      kernel_skip=int(self.args.get("kernel_skip") or 0),
                      kernel_skip_mm=float(self.args.get("kernel_skip_mm") or 0.0), level2=bool(self.args.get("level2")),
                      decoder_c=bool(self.args.get("decoder_c")), c_points=int(self.args.get("c_points") or 32768),
-                     c_local=bool(self.args.get("c_local")))
+                     c_local=bool(self.args.get("c_local")), c_unweighted=bool(self.args.get("c_unweighted")),
+                     c_wpow=float(self.args.get("c_wpow", 1.0)))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
