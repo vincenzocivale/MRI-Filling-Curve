@@ -122,7 +122,7 @@ class LeJEPA(nn.Module):
                  shift: float = 0.05, noise: float = 0.02, fg_threshold: float = 0.05, proj_hidden: int = 1024,
                  proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
-                 w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
+                 w_top: float = 1.0, w_tok: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
                  coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False,
                  volume_locals: bool = True, child: int = 0, child_adaptive: bool = False,
@@ -137,6 +137,7 @@ class LeJEPA(nn.Module):
         self.thick_prob, self.thick_mm = thick_prob, tuple(float(t) for t in thick_mm)
         self.coarse_max, self.coarse_prob = int(coarse_max), coarse_prob
         self.tokens_per_volume, self.sigreg_samples, self.w_top = tokens_per_volume, sigreg_samples, w_top
+        self.w_tok = w_tok   # weight of the token (masked patch) term in both means; 0: its ablation (22/10)
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
         self.levels = [int(c) for c in levels]
@@ -536,7 +537,7 @@ class LeJEPA(nn.Module):
                *(out[f"inv_{n}"] for n in ch), *extra]
         sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels),
                 *(out[f"sigreg_{n}"] for n in [*self.top, *cov]), *(out[f"sigreg_{n}"] for n in ch)]
-        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), *(self.w_top for _ in [*self.top, *cov]), *(1.0 for _ in ch), *w_extra]
+        w = [self.w_top, self.w_tok, *(1.0 for _ in self.levels), *(self.w_top for _ in [*self.top, *cov]), *(1.0 for _ in ch), *w_extra]
         ws_ = w[: len(sigs)]   # the extra invariances add no SIGReg (their embeddings are the token head's)
         wmean = lambda xs: sum(a * x for a, x in zip(w if len(xs) == len(w) else ws_, xs)) / sum(w if len(xs) == len(w) else ws_)
         for k, r in (("rec", rec), ("rec_visible", recv)):
