@@ -63,7 +63,9 @@ class SegNet(nn.Module):
                  adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0,
                  rand_dec: float = 0.02, test_all: bool = False, kernel_skip: int = 0, kernel_skip_mm: float = 0.0,
                  level2: bool = False, decoder_c: bool = False, c_points: int = 32768, c_local: bool = False,
-                 c_unweighted: bool = False, c_wpow: float = 1.0):
+                 c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
+                 cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
+                 cascade_rare: float = 1e-3, cascade_neg: float = 2.0):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -193,8 +195,27 @@ class SegNet(nn.Module):
         # reading them), the native-voxel decoding only in its boundary / unsure cells
         self.matryoshka, self.quota, self.head_w = bool(matryoshka), float(quota), float(head_w)
         self.rand_dec, self.test_all = float(rand_dec), bool(test_all)   # training's random decoded share; decode all at test
+        # cascade (22/10, notes/decoder_cascade.md, variant A): coarse to fine reading on top of decoder C. Per level a
+        # cell head [pure class k | mixed]; pure cells are filled, only the mixed ones' children are read (by the frozen
+        # encoder live, or from the token cache) with a ring of one neighbouring cell of context, down to g_min; the
+        # point head runs only in the cells still mixed there. "Mixed": more than eps of the cell off its majority
+        # class, or any voxel of a rare class (voxel frequency < cascade_rare on the training tiles). Each level's
+        # threshold is set on val (calibrate) so that every foreground class keeps a share r of its voxels per level.
+        self.cascade = bool(cascade)
+        if self.cascade:
+            assert decoder_c and matryoshka and refine == 2, "cascade: on decoder C2 (decoder_c, matryoshka, refine 2)"
+            lvl = [patch_mm] + self.fine_mm
+            self.cj0, self.cjmin = lvl.index(float(cascade_g0)), lvl.index(float(cascade_gmin))
+            self.cr, self.ceps, self.crare, self.cneg = float(cascade_r), float(cascade_eps), float(cascade_rare), float(cascade_neg)
+            self.lhead = nn.ModuleList([nn.Linear(encoder.dim, n_out + 1), nn.Linear(128, n_out + 1), nn.Linear(128, n_out + 1)])
+            # buffers, saved with the trained state: the levels' thresholds (set on val), the training tiles' voxel counts
+            # per class (rare classes) and cell-target counts (class weights, frequency^-0.5)
+            self.register_buffer("taus", torch.full((3,), 0.5))
+            self.register_buffer("cfreq", torch.zeros(n_out))
+            self.register_buffer("tcount", torch.zeros(n_out + 1))
         if self.matryoshka:
-            assert self.cache is not None and self.kernel and self.refine == 2, "matryoshka decoding: token cache, F, refine 2"
+            assert (self.cache is not None or self.cascade) and self.kernel and self.refine == 2, \
+                "matryoshka decoding: token cache, F, refine 2"
             self.head16, self.head8, self.head4 = nn.Linear(encoder.dim, n_out), nn.Linear(128, n_out), nn.Linear(128, n_out)
         if self.adaptive:
             assert self.cache is not None and self.kernel and self.refine, "adaptive decoding: token cache and decoder F"
@@ -321,7 +342,7 @@ class SegNet(nn.Module):
                 pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
                 pe.patch_mm = self.fine_mm[i]
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    x = pe(patchify(vol.float(), kf)[sel], pe.weights(sp.float(), kf))
+                    x = pe(sub(patchify(vol.float(), kf))[sel], pe.weights(sp.float(), kf))
                     cu1 = torch.tensor([0, len(sel)], device=z.device, dtype=torch.int32)
                     bf = sum(self.encoder.flat(x[o], cu1, pos=xyz[sel][o]).float()[o.argsort()]
                              for o in (keys(c, xyz[sel], gf, self.seed).argsort() for c in self.enc_curves)) / len(self.enc_curves)
@@ -592,6 +613,187 @@ class SegNet(nn.Module):
             out[:, a: a + len(i)] = self.c_logits(lv, vol, pts).float().softmax(1).T.half().to(out.device)
         return out.view(n_out, *S)
 
+    # ------------------------------------------------------------------------- cascade decoding (22/10, variant A)
+    def _targets(self, hist: torch.Tensor, n_out: int) -> torch.Tensor:
+        """Cells' label counts [M, n_out] -> targets [M]: the pure class, or n_out (mixed)."""
+        n, (mx, am) = hist.sum(1), hist.max(1)
+        tot = self.cfreq.sum()
+        rare = (self.cfreq / tot.clamp_min(1) < self.crare) & (tot > 0)
+        rare[0] = False
+        other_rare = ((hist > 0) & rare[None]).scatter(1, am[:, None], False).any(1)
+        return torch.where((n - mx > self.ceps * n) | other_rare, n_out, am)
+
+    def _level_sparse(self, zd, kp, gp, vol, sp, i, read):
+        """Level i's tokens on the dense grid of its cells: the children of the `read` parents read (to_fine + the refine
+        blocks, those children only, one sequence along each curve), the others their parent's token through up[i]
+        -> tokens [Nf, 128], dims, grid, parent index of every child."""
+        from ..curves import grid_coords
+        dev = zd.device
+        kf = self.fine_dims(sp, i)
+        gf = [-(-v // a) for v, a in zip(vol.shape, kf)]
+        xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
+        par = torch.minimum(((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(kp, device=dev)).long(),
+                            torch.tensor(gp, device=dev) - 1)
+        pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
+        dense = self.up[i](zd)[pidx]
+        keep = read[pidx].nonzero()[:, 0]
+        if len(keep):
+            t, xyzk, gft, _ = self.to_fine(zd, vol, sp, kp, gp, i, keep=keep)
+            dense = dense.index_copy(0, keep, self.fine_mix([t], [xyzk], [gft], i)[0].to(dense.dtype))
+        return dense, kf, gf, pidx
+
+    def _cascade(self, z16, k16, g16, vol, sp, cur, n_out, yy=None, train=False, upto=None):
+        """One tile / scan down the levels. -> dense tokens of the levels read (c_logits), per decided level (j, candidate
+        cells, head logits there, label counts there or None), the cells still mixed at the last level read, its dims
+        and grid, and the cells filled per level [(j, cells, class)]."""
+        self._cur = cur
+        L = 1 + sum(1 for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
+        jmin = min(self.cjmin, L - 1)
+        j0 = min(self.cj0, jmin)
+        lv, info, fill = [(z16, k16, g16)], [], []
+        z, k, g = z16, k16, g16
+        cand = torch.ones(len(z), dtype=torch.bool, device=z.device)
+        j = 0
+        while True:
+            inside = (patchify_any(vol, k).abs().sum(1) > 0)[: len(z)]
+            fill.append((j, (cand & ~inside).nonzero()[:, 0], None))   # no signal: background
+            cand = cand & inside
+            hist = None if yy is None else self._hist(*self._cells(yy, k), n_out)
+            if j < j0:
+                S = cand
+            else:
+                ci = cand.nonzero()[:, 0]
+                lg = self.lhead[j](z[ci])
+                p = lg.detach().float().softmax(1)
+                s, a = p[:, :n_out].max(1)
+                mix = s < self.taus[j]
+                hc = None if hist is None else hist[ci]
+                if train:   # the true mixed cells + at most cneg x as many predicted mixed (hard negatives)
+                    tm = self._targets(hc, n_out) == n_out
+                    fp = mix & ~tm
+                    m = max(64, int(self.cneg * int(tm.sum())))
+                    if int(fp.sum()) > m:
+                        fp &= torch.rand(len(fp), device=fp.device) < m / int(fp.sum())
+                    mix = tm | fp
+                info.append((j, ci, lg, hc))
+                fill.append((j, ci[~mix], a[~mix]))
+                S = torch.zeros_like(cand)
+                S[ci[mix]] = True
+            if j == jmin or j == upto or not S.any():
+                return lv, info, S, k, g, fill
+            zf, kf, gf, pidx = self._level_sparse(z, k, g, vol, sp, j, self._dilate(S, g) & inside)
+            lv.append((zf, list(kf), gf))
+            cand, z, k, g, j = S[pidx], zf, kf, gf, j + 1
+
+    def _whole(self, x, ctx):
+        """A whole scan's 16 mm tokens (the tile is the scan) -> z, k, g, cur, spacing."""
+        c = torch.cat([ctx[:7].float().cpu(), torch.zeros(3)]).to(x.device)
+        st, _, sp = self(x[None].float(), c[None], levels=True, stop=0)
+        z, k, g, _, cur = st[0]
+        return z, k, g, cur, sp[0]
+
+    def cascade_sums(self, x, y, ctx, n_out):
+        """Training (encoder frozen): the level heads on their candidate cells (weighted CE + soft Dice, targets pure k /
+        mixed, weights frequency^-0.5), the point head on stratified voxels of the cells still mixed at g_min (true
+        mixed + predicted ones), unweighted."""
+        st, V, sp = self(x, ctx, levels=True, stop=0)
+        add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
+        fin, aux = None, [None, None, None]
+        for b, (z, k, g, _, cur) in enumerate(st):
+            yy, vol = y[b, : V[b][0], : V[b][1], : V[b][2]], x[b, 0, : V[b][0], : V[b][1], : V[b][2]]
+            ok = yy < n_out
+            self.cfreq += torch.bincount(yy[ok].flatten().long(), minlength=n_out).float()
+            lv, info, S, kl, gl, _ = self._cascade(z, k, g, vol, sp[b], cur, n_out, yy=yy, train=True)
+            for j, ci, lg, hc in info:
+                keep = hc.sum(1) > 0
+                t = self._targets(hc[keep], n_out)
+                self.tcount += torch.bincount(t, minlength=n_out + 1).float()
+                f = self.tcount / self.tcount.sum()
+                w = f.clamp_min(1e-6) ** -0.5
+                w = w / w[f > 0].mean()
+                aux[j] = add(aux[j], wsums(lg[keep], t, w[t], n_out + 1))
+            if S.any():
+                idx, _ = _c_points(yy, n_out, self.c_points, region=_blocks(S, gl, kl, yy.shape))
+                if len(idx):
+                    Sh = yy.shape
+                    pts = torch.stack([idx // (Sh[1] * Sh[2]), idx // Sh[2] % Sh[1], idx % Sh[2]], 1)
+                    lab = yy.flatten()[idx].long()
+                    fin = add(fin, wsums(self.c_logits(lv, vol, pts), lab, torch.ones(len(idx), device=pts.device), n_out))
+            self.last_refined = float(S.float().mean())
+        if fin is None:   # nothing mixed in the batch
+            dev = x.device
+            fin = [torch.zeros((), device=dev), torch.zeros((), device=dev)] + [torch.zeros(n_out, device=dev)] * 3
+        return fin, [a for a in aux if a is not None]
+
+    @torch.no_grad()
+    def cascade_predict(self, x, ctx, n_out):
+        """A whole scan -> probabilities [n_out, *S]: pure cells one-hot, the point head in the cells mixed at g_min."""
+        dev, S = x.device, tuple(x.shape[1:])
+        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
+        try:
+            z, k, g, cur, sp = self._whole(x, ctx)
+            lv, _, _, _, _, fill = self._cascade(z, k, g, x[0], sp, cur, n_out)
+        finally:
+            self.fine_seg = fs
+        lab = torch.full(S, -1, dtype=torch.long, device=dev)
+        for j, cells, cls in fill:   # coarse to fine: each voxel takes the first level that decided it
+            if not len(cells):
+                continue
+            kj, gj = lv[j][1], lv[j][2]
+            cv = torch.full((math.prod(gj),), -1, dtype=torch.long, device=dev)
+            cv[cells] = 0 if cls is None else cls
+            bv = _blocks(cv, gj, kj, S)
+            lab = torch.where((lab < 0) & (bv >= 0), bv, lab)
+        N = math.prod(S)
+        fits = n_out * N * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
+        out = torch.zeros(n_out, N, dtype=torch.half, device=dev if fits else "cpu")
+        lf = lab.flatten()
+        done = (lf >= 0).nonzero()[:, 0]
+        out[lf[done].to(out.device), done.to(out.device)] = 1
+        rest = (lf < 0).nonzero()[:, 0]   # the cells mixed at the last level read
+        for i in rest.split(1 << 19):
+            if len(i):
+                pts = torch.stack([i // (S[1] * S[2]), i // S[2] % S[1], i % S[2]], 1)
+                out[:, i.to(out.device)] = self.c_logits(lv, x[0], pts).float().softmax(1).T.half().to(out.device)
+        self.last_refined = float(len(rest) / N)
+        return out.view(n_out, *S)
+
+    @torch.no_grad()
+    def calibrate(self, vols, n_out, amp):
+        """Each level's threshold on val (vols: segrun's val volumes), coarse to fine: the lowest tau (fewest cells read
+        further) at which every foreground class keeps a share r of its voxels at that level (lost: a cell filled with
+        another class)."""
+        L = self.cjmin + 1
+        tot = sum(torch.bincount(v["y"][v["y"] < n_out].flatten().long().to(self.taus.device), minlength=n_out).float()
+                  for v in vols)
+        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
+        try:
+            for j in range(self.cj0, L):
+                ss, lost = [], []
+                for v in vols:
+                    x, yy = v["x"].to(self.taus.device).float(), v["y"].to(self.taus.device)
+                    with amp():
+                        z, k, g, cur, sp = self._whole(x, v["ctx"].to(x.device))
+                        _, info, _, _, _, _ = self._cascade(z, k, g, x[0], sp, cur, n_out, yy=yy, upto=j)
+                    for jj, ci, lg, hc in info:
+                        if jj != j:
+                            continue
+                        s, a = lg.float().softmax(1)[:, :n_out].max(1)
+                        ls = hc.scatter(1, a[:, None], 0.0)   # the voxels of other classes than the filled one
+                        ss.append(s)
+                        lost.append(ls)
+                if not ss:
+                    continue
+                s, ls = torch.cat(ss), torch.cat(lost)
+                o = s.argsort(descending=True)
+                cum = ls[o].cumsum(0)[:, 1:]
+                okp = (cum <= (1 - self.cr) * tot[None, 1:]).all(1)
+                m = int(okp.long().cumprod(0).sum())   # the longest prefix (most confident cells) that may be filled
+                self.taus[j] = float(s[o[m - 1]]) if m else 1.01
+                print(f"[cascade] level {j}: tau {float(self.taus[j]):.4f}, filled {m}/{len(s)} cells", flush=True)
+        finally:
+            self.fine_seg = fs
+
     # --------------------------------------------------------------------------------- matryoshka decoding (21/10)
     def _hist(self, lab, val, n_out):
         return torch.zeros(len(lab), n_out, device=lab.device).scatter_add_(1, lab, val.float())
@@ -636,6 +838,8 @@ class SegNet(nn.Module):
         """A batch of tiles -> (sums of the final prediction, [sums of the 16, 8, 4 mm heads]), each summed over the
         batch (segrun.sums_loss on each, added). Final: the 8 mm head where the 4 mm level is not read, the 4 mm head in
         its cells, the native voxels decoded in a subset of them (GT edges, predicted edges, unsure, random)."""
+        if self.cascade:
+            return self.cascade_sums(x, y, ctx, n_out)
         if self.decoder_c:
             return self.c_sums(x, y, ctx, n_out)
         st, V, sp = self(x, ctx, levels=True, stop=1)
@@ -694,6 +898,8 @@ class SegNet(nn.Module):
         """A whole scan [C, *S] in one pass -> probabilities [n_out, *S]: 16 -> 8 mm on the whole scan, the 8 mm head
         everywhere, the 4 mm level in the quota of cells with the most varying intensities (its head there), the native
         voxels decoded in the 4 mm cells on the predicted boundary or unsure (max probability < tau)."""
+        if self.cascade:
+            return self.cascade_predict(x, ctx, n_out)
         if self.decoder_c:
             return self.c_predict(x, ctx, n_out)
         dev, S = x.device, tuple(x.shape[1:])
@@ -737,12 +943,15 @@ class SegNet(nn.Module):
         return out[:, : S[0], : S[1], : S[2]]
 
 
-def _c_points(yy: torch.Tensor, k: int, n: int, gen=None) -> tuple:
+def _c_points(yy: torch.Tensor, k: int, n: int, gen=None, region: torch.Tensor | None = None) -> tuple:
     """Stratified voxels of a label tile (255 ignored): strata class x boundary (a 6-neighbour differs), n / (2 k) per
-    stratum, uniform within it -> flat indices [P], weights [P] (voxels each point stands for: unbiased sums)."""
+    stratum, uniform within it -> flat indices [P], weights [P] (voxels each point stands for: unbiased sums).
+    region [*S] bool: only these voxels (the boundaries still those of the whole tile)."""
     dev, flat = yy.device, yy.flatten()
     a = yy.float()[None, None]
     edge = (F.max_pool3d(a, 3, 1, 1) != -F.max_pool3d(-a, 3, 1, 1)).flatten()
+    if region is not None:
+        flat = torch.where(region.flatten(), flat, torch.full_like(flat, 255))
     m, N = max(1, n // (2 * k)), flat.numel()
     idx, w = [], []
     for c in range(k):
@@ -760,7 +969,17 @@ def _c_points(yy: torch.Tensor, k: int, n: int, gen=None) -> tuple:
                 cand = nz[torch.randperm(cnt, device=dev, generator=gen)[:take]]
             idx.append(cand)
             w.append(torch.full((len(cand),), cnt / max(len(cand), 1), device=dev))
+    if not idx:
+        return torch.zeros(0, dtype=torch.long, device=dev), torch.zeros(0, device=dev)
     return torch.cat(idx), torch.cat(w)
+
+
+def _blocks(cell: torch.Tensor, g, k, S) -> torch.Tensor:
+    """A per-cell array [prod(g)] on the grid g of k-voxel cells -> per voxel [*S] (each voxel its cell's value)."""
+    v = cell.view(*g)
+    for d in range(3):
+        v = v.repeat_interleave(int(k[d]), d)
+    return v[: S[0], : S[1], : S[2]]
 
 
 def _c_field(f: torch.Tensor, g, k, pts: torch.Tensor) -> torch.Tensor:
@@ -932,7 +1151,13 @@ class SFC(Wrapper):
                      kernel_skip_mm=float(self.args.get("kernel_skip_mm") or 0.0), level2=bool(self.args.get("level2")),
                      decoder_c=bool(self.args.get("decoder_c")), c_points=int(self.args.get("c_points") or 32768),
                      c_local=bool(self.args.get("c_local")), c_unweighted=bool(self.args.get("c_unweighted")),
-                     c_wpow=float(self.args.get("c_wpow", 1.0)))
+                     c_wpow=float(self.args.get("c_wpow", 1.0)), cascade=bool(self.args.get("cascade")),
+                     cascade_g0=float(self.args.get("cascade_g0") or 16.0),
+                     cascade_gmin=float(self.args.get("cascade_gmin") or 4.0),
+                     cascade_r=float(self.args.get("cascade_r") or 0.995),
+                     cascade_eps=float(self.args.get("cascade_eps", 0.01)),
+                     cascade_rare=float(self.args.get("cascade_rare", 1e-3)),
+                     cascade_neg=float(self.args.get("cascade_neg") or 2.0))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

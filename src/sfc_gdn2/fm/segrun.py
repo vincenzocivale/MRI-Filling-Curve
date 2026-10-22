@@ -528,6 +528,8 @@ def train(job: dict) -> None:
             sched.step()
             if it % every == 0 or it == iters:
                 net.eval()
+                if getattr(net, "cascade", False):   # the levels' thresholds on val, then val Dice with them
+                    net.calibrate(val_v, k, amp)
                 ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).argmax(0).to(dev),
                               v["y"].to(dev), k) for v in val_v]
                 val = float(np.nanmean(ds))
