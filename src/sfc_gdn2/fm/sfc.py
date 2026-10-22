@@ -642,48 +642,67 @@ class SegNet(nn.Module):
             dense = dense.index_copy(0, keep, self.fine_mix([t], [xyzk], [gft], i)[0].to(dense.dtype))
         return dense, kf, gf, pidx
 
-    def _cascade(self, z16, k16, g16, vol, sp, cur, n_out, yy=None, train=False, upto=None):
-        """One tile / scan down the levels. -> dense tokens of the levels read (c_logits), per decided level (j, candidate
-        cells, head logits there, label counts there or None), the cells still mixed at the last level read, its dims
-        and grid, and the cells filled per level [(j, cells, class)]."""
+    def _cstart(self, z16, k16, g16, vol, sp, cur, yy=None) -> dict:
+        """A tile / scan's state at the top of the cascade (its 16 mm tokens)."""
         self._cur = cur
         L = 1 + sum(1 for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
         jmin = min(self.cjmin, L - 1)
-        j0 = min(self.cj0, jmin)
-        lv, info, fill = [(z16, k16, g16)], [], []
-        z, k, g = z16, k16, g16
-        cand = torch.ones(len(z), dtype=torch.bool, device=z.device)
-        j = 0
-        while True:
-            inside = (patchify_any(vol, k).abs().sum(1) > 0)[: len(z)]
-            fill.append((j, (cand & ~inside).nonzero()[:, 0], None))   # no signal: background
-            cand = cand & inside
-            hist = None if yy is None else self._hist(*self._cells(yy, k), n_out)
-            if j < j0:
-                S = cand
-            else:
-                ci = cand.nonzero()[:, 0]
-                lg = self.lhead[j](z[ci])
-                p = lg.detach().float().softmax(1)
-                s, a = p[:, :n_out].max(1)
-                mix = s < self.taus[j]
-                hc = None if hist is None else hist[ci]
-                if train:   # the true mixed cells + at most cneg x as many predicted mixed (hard negatives)
-                    tm = self._targets(hc, n_out) == n_out
-                    fp = mix & ~tm
-                    m = max(64, int(self.cneg * int(tm.sum())))
-                    if int(fp.sum()) > m:
-                        fp &= torch.rand(len(fp), device=fp.device) < m / int(fp.sum())
-                    mix = tm | fp
-                info.append((j, ci, lg, hc))
-                fill.append((j, ci[~mix], a[~mix]))
-                S = torch.zeros_like(cand)
-                S[ci[mix]] = True
-            if j == jmin or j == upto or not S.any():
-                return lv, info, S, k, g, fill
-            zf, kf, gf, pidx = self._level_sparse(z, k, g, vol, sp, j, self._dilate(S, g) & inside)
-            lv.append((zf, list(kf), gf))
-            cand, z, k, g, j = S[pidx], zf, kf, gf, j + 1
+        return {"vol": vol, "sp": sp, "cur": cur, "yy": yy, "j": 0, "jmin": jmin, "j0": min(self.cj0, jmin),
+                "z": z16, "k": k16, "g": g16, "lv": [(z16, k16, g16)], "info": [], "fill": [], "S": None, "done": False,
+                "cand": torch.ones(len(z16), dtype=torch.bool, device=z16.device)}
+
+    def _cheads(self, st: dict, n_out: int) -> None:
+        """The current level's head on its candidate cells (the cells without signal: background)."""
+        self._cur = st["cur"]
+        z, k, j = st["z"], st["k"], st["j"]
+        inside = (patchify_any(st["vol"], k).abs().sum(1) > 0)[: len(z)]
+        st["fill"].append((j, (st["cand"] & ~inside).nonzero()[:, 0], None))
+        st["cand"], st["inside"] = st["cand"] & inside, inside
+        st["hist"] = None if st["yy"] is None else self._hist(*self._cells(st["yy"], k), n_out)
+        st["ci"] = st["lg"] = None
+        if j >= st["j0"]:
+            st["ci"] = st["cand"].nonzero()[:, 0]
+            st["lg"] = self.lhead[j](z[st["ci"]])
+            st["s"], st["a"] = st["lg"].detach().float().softmax(1)[:, :n_out].max(1)
+
+    def _capply(self, st: dict, n_out: int, train: bool = False, upto=None) -> None:
+        """Pure / mixed with this level's threshold; the mixed cells' children read (the next level), or done."""
+        j, cand = st["j"], st["cand"]
+        if st["ci"] is None:   # above g0: every cell goes down
+            S = cand
+        else:
+            ci, hc = st["ci"], None if st["hist"] is None else st["hist"][st["ci"]]
+            mix = st["s"] < self.taus[j]
+            if train:   # the true mixed cells + at most cneg x as many predicted mixed (hard negatives)
+                tm = self._targets(hc, n_out) == n_out
+                fp = mix & ~tm
+                m = max(64, int(self.cneg * int(tm.sum())))
+                if int(fp.sum()) > m:
+                    fp &= torch.rand(len(fp), device=fp.device) < m / int(fp.sum())
+                mix = tm | fp
+            st["info"].append((j, ci, st["lg"], hc))
+            st["fill"].append((j, ci[~mix], st["a"][~mix]))
+            S = torch.zeros_like(cand)
+            S[ci[mix]] = True
+        st["S"] = S
+        if j == st["jmin"] or j == upto or not S.any():
+            st["done"] = True
+            return
+        self._cur = st["cur"]
+        zf, kf, gf, pidx = self._level_sparse(st["z"], st["k"], st["g"], st["vol"], st["sp"], j,
+                                              self._dilate(S, st["g"]) & st["inside"])
+        st["lv"].append((zf, list(kf), gf))
+        st.update(cand=S[pidx], z=zf, k=kf, g=gf, j=j + 1)
+
+    def _cascade(self, z16, k16, g16, vol, sp, cur, n_out, yy=None, train=False) -> dict:
+        """One tile / scan down the levels with the current thresholds -> its final state: lv (the levels' dense tokens,
+        c_logits), info [(j, candidate cells, head logits, their label counts)], S (the cells still mixed at the last
+        level read, dims k, grid g), fill [(j, cells, class or None = background)]."""
+        st = self._cstart(z16, k16, g16, vol, sp, cur, yy)
+        while not st["done"]:
+            self._cheads(st, n_out)
+            self._capply(st, n_out, train)
+        return st
 
     def _whole(self, x, ctx):
         """A whole scan's 16 mm tokens (the tile is the scan) -> z, k, g, cur, spacing."""
@@ -703,8 +722,9 @@ class SegNet(nn.Module):
             yy, vol = y[b, : V[b][0], : V[b][1], : V[b][2]], x[b, 0, : V[b][0], : V[b][1], : V[b][2]]
             ok = yy < n_out
             self.cfreq += torch.bincount(yy[ok].flatten().long(), minlength=n_out).float()
-            lv, info, S, kl, gl, _ = self._cascade(z, k, g, vol, sp[b], cur, n_out, yy=yy, train=True)
-            for j, ci, lg, hc in info:
+            c = self._cascade(z, k, g, vol, sp[b], cur, n_out, yy=yy, train=True)
+            lv, S, kl, gl = c["lv"], c["S"], c["k"], c["g"]
+            for j, ci, lg, hc in c["info"]:
                 keep = hc.sum(1) > 0
                 t = self._targets(hc[keep], n_out)
                 self.tcount += torch.bincount(t, minlength=n_out + 1).float()
@@ -726,17 +746,13 @@ class SegNet(nn.Module):
         return fin, [a for a in aux if a is not None]
 
     @torch.no_grad()
-    def cascade_predict(self, x, ctx, n_out):
-        """A whole scan -> probabilities [n_out, *S]: pure cells one-hot, the point head in the cells mixed at g_min."""
-        dev, S = x.device, tuple(x.shape[1:])
-        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
-        try:
-            z, k, g, cur, sp = self._whole(x, ctx)
-            lv, _, _, _, _, fill = self._cascade(z, k, g, x[0], sp, cur, n_out)
-        finally:
-            self.fine_seg = fs
+    def _cfinish(self, st: dict, n_out: int) -> torch.Tensor:
+        """A scan's final state -> probabilities [n_out, *S]: the filled cells one-hot (each voxel the first level that
+        decided it), the point head on the voxels of the cells still mixed."""
+        x0, lv = st["vol"], st["lv"]
+        dev, S = x0.device, tuple(x0.shape)
         lab = torch.full(S, -1, dtype=torch.long, device=dev)
-        for j, cells, cls in fill:   # coarse to fine: each voxel takes the first level that decided it
+        for j, cells, cls in st["fill"]:
             if not len(cells):
                 continue
             kj, gj = lv[j][1], lv[j][2]
@@ -754,43 +770,68 @@ class SegNet(nn.Module):
         for i in rest.split(1 << 19):
             if len(i):
                 pts = torch.stack([i // (S[1] * S[2]), i // S[2] % S[1], i % S[2]], 1)
-                out[:, i.to(out.device)] = self.c_logits(lv, x[0], pts).float().softmax(1).T.half().to(out.device)
+                out[:, i.to(out.device)] = self.c_logits(lv, x0, pts).float().softmax(1).T.half().to(out.device)
         self.last_refined = float(len(rest) / N)
         return out.view(n_out, *S)
 
     @torch.no_grad()
-    def calibrate(self, vols, n_out, amp):
-        """Each level's threshold on val (vols: segrun's val volumes), coarse to fine: the lowest tau (fewest cells read
-        further) at which every foreground class keeps a share r of its voxels at that level (lost: a cell filled with
-        another class)."""
-        L = self.cjmin + 1
-        tot = sum(torch.bincount(v["y"][v["y"] < n_out].flatten().long().to(self.taus.device), minlength=n_out).float()
-                  for v in vols)
+    def cascade_predict(self, x, ctx, n_out):
+        """A whole scan -> probabilities [n_out, *S] with the thresholds set on val."""
         fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
         try:
-            for j in range(self.cj0, L):
-                ss, lost = [], []
-                for v in vols:
-                    x, yy = v["x"].to(self.taus.device).float(), v["y"].to(self.taus.device)
+            z, k, g, cur, sp = self._whole(x, ctx)
+            return self._cfinish(self._cascade(z, k, g, x[0], sp, cur, n_out), n_out)
+        finally:
+            self.fine_seg = fs
+
+    @torch.no_grad()
+    def cascade_val(self, vols, n_out, amp) -> list:
+        """The val pass (segrun's val volumes): every volume down the levels together, each level's threshold set from
+        all of them before going on, then the predictions [*S] (argmax) for the val Dice: one pass, no separate
+        calibration. Threshold: the lowest (fewest cells read further) at which every foreground class keeps a share r
+        of its voxels at that level (lost: a cell filled with another class). States wait on the CPU between levels."""
+        dev = self.taus.device
+        mv = lambda o, d: o.to(d) if torch.is_tensor(o) else [mv(t, d) for t in o] if isinstance(o, (list, tuple)) else o
+        tot = sum(torch.bincount(v["y"][v["y"] < n_out].flatten().long(), minlength=n_out).float() for v in vols).to(dev)
+        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
+        try:
+            sts = []
+            for v in vols:
+                x = v["x"].to(dev).float()
+                with amp():
+                    z, k, g, cur, sp = self._whole(x, v["ctx"].to(dev))
+                sts.append({a: mv(b, "cpu") for a, b in self._cstart(z, k, g, x[0], sp, cur, v["y"].to(dev)).items()})
+            for j in range(self.cjmin + 1):
+                live = [i for i, st in enumerate(sts) if not st["done"] and st["j"] == j]
+                if not live:
+                    break
+                for i in live:
+                    st = {a: mv(b, dev) for a, b in sts[i].items()}
                     with amp():
-                        z, k, g, cur, sp = self._whole(x, v["ctx"].to(x.device))
-                        _, info, _, _, _, _ = self._cascade(z, k, g, x[0], sp, cur, n_out, yy=yy, upto=j)
-                    for jj, ci, lg, hc in info:
-                        if jj != j:
-                            continue
-                        s, a = lg.float().softmax(1)[:, :n_out].max(1)
-                        ls = hc.scatter(1, a[:, None], 0.0)   # the voxels of other classes than the filled one
-                        ss.append(s)
-                        lost.append(ls)
-                if not ss:
-                    continue
-                s, ls = torch.cat(ss), torch.cat(lost)
-                o = s.argsort(descending=True)
-                cum = ls[o].cumsum(0)[:, 1:]
-                okp = (cum <= (1 - self.cr) * tot[None, 1:]).all(1)
-                m = int(okp.long().cumprod(0).sum())   # the longest prefix (most confident cells) that may be filled
-                self.taus[j] = float(s[o[m - 1]]) if m else 1.01
-                print(f"[cascade] level {j}: tau {float(self.taus[j]):.4f}, filled {m}/{len(s)} cells", flush=True)
+                        self._cheads(st, n_out)
+                    sts[i] = {a: mv(b, "cpu") for a, b in st.items()}
+                if j >= self.cj0:
+                    ss = [sts[i]["s"] for i in live if sts[i]["ci"] is not None]
+                    if ss:
+                        s = torch.cat(ss).to(dev)
+                        ls = torch.cat([sts[i]["hist"][sts[i]["ci"]].scatter(1, sts[i]["a"][:, None], 0.0)
+                                        for i in live if sts[i]["ci"] is not None]).to(dev)
+                        o = s.argsort(descending=True)
+                        okp = (ls[o].cumsum(0)[:, 1:] <= (1 - self.cr) * tot[None, 1:]).all(1)
+                        m = int(okp.long().cumprod(0).sum())   # the longest prefix of most confident cells that may be filled
+                        self.taus[j] = float(s[o[m - 1]]) if m else 1.01
+                        print(f"[cascade] level {j}: tau {float(self.taus[j]):.4f}, filled {m}/{len(s)} cells", flush=True)
+                for i in live:
+                    st = {a: mv(b, dev) for a, b in sts[i].items()}
+                    with amp():
+                        self._capply(st, n_out)
+                    sts[i] = {a: mv(b, "cpu") for a, b in st.items()}
+            preds = []
+            for st in sts:
+                st = {a: mv(b, dev) for a, b in st.items()}
+                with amp():
+                    preds.append(self._cfinish(st, n_out).argmax(0).to(dev))
+            return preds
         finally:
             self.fine_seg = fs
 

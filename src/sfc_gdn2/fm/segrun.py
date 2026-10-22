@@ -528,10 +528,11 @@ def train(job: dict) -> None:
             sched.step()
             if it % every == 0 or it == iters:
                 net.eval()
-                if getattr(net, "cascade", False):   # the levels' thresholds on val, then val Dice with them
-                    net.calibrate(val_v, k, amp)
-                ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).argmax(0).to(dev),
-                              v["y"].to(dev), k) for v in val_v]
+                if getattr(net, "cascade", False):   # one pass: the levels' thresholds on val and the val predictions
+                    ds = [dice_on(p, v["y"].to(dev), k) for p, v in zip(net.cascade_val(val_v, k, amp), val_v)]
+                else:
+                    ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).argmax(0).to(dev),
+                                  v["y"].to(dev), k) for v in val_v]
                 val = float(np.nanmean(ds))
                 curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
                 print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} ({(time.time() - t0) / 60:.1f} min)",
