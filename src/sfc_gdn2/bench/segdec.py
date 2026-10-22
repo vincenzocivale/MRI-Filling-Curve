@@ -35,7 +35,7 @@ def task_items(tasks: dict, vols: pd.DataFrame, splits: pd.DataFrame, seed: int,
     for name, cfg in tasks.items():
         rows = task_rows(vols, splits, cfg, seed)
         sel = {s: idx[:sample] for s, idx in select(rows, cfg, np.random.default_rng(seed)).items()}
-        lm = {k: cfg[k] for k in ("classes", "ignore", "save_pred") if cfg.get(k)}   # multi-label maps (21/10)
+        lm = {k: cfg[k] for k in ("classes", "ignore", "save_pred", "select") if cfg.get(k)}   # multi-label maps (21/10)
         out[name] = [{"id": r["id"], "image": r["input"], "seg": r["seg"], "split": s, "subject": r["subject"]} | lm
                      for s, idx in sel.items() for _, r in rows.loc[idx].iterrows()]
     return out
@@ -77,7 +77,7 @@ def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init
             {"stage": "train", "val_only": val_only, "cache": str(Path(s["cache"]) / lead_of(bench["fm"], model)), "items": items,
              "k": k, "init": init, "iters": int(s["iters"]), "val_every": int(s["val_every"]), "batch": int(s["batch"]),
              "lr": float(s["lr"]), "seed": seed, "device": device, "out": str(out),
-             "save_pred": bool(items[0].get("save_pred"))})
+             "save_pred": bool(items[0].get("save_pred")), "select": items[0].get("select")})
     res = json.loads(out.read_text())
     if val_only:
         print(f"[segdec] {task} s{seed} {model} {init}: best val dice {res['val_dice']:.3f}", flush=True)

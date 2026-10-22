@@ -48,7 +48,7 @@ cmb_any:          {type: class, label: "cmb_count > 0", requires: [cmb_count],
                   # into T2* space by the organisers and carry NaN outside the field of view. 72 subjects, one volume each
 
 spine_seg:     {type: seg, label: seg, query: "dataset == 'SPIDER' and dense", classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 201, 202, 203, 204, 205, 206, 207, 208, 209]}
-fetal_landmarks: {type: seg, label: seg, query: "dataset == 'LFC'", classes: [1, 2, 3, 4, 5, 6], save_pred: true,
+fetal_landmarks: {type: seg, label: seg, query: "dataset == 'LFC'", classes: [1, 2, 3, 4, 5, 6], save_pred: true, select: mre,
                   extra_metric_note: "MRE mm: centroid of each predicted class vs derivatives/newtasks/LFC/landmarks.csv (in_benchmark)"}
 vs_seg:        {type: seg, label: seg, query: "dataset == 'crossMoDA' and site == 'Tilburg'", classes: [1, 2]}               # 1 = schwannoma, 2 = cochlea
 prostate_zones: {type: seg, label: seg, query: "dataset == 'Prostate158' and modality == 'T2w'", classes: [1, 2]}  # 1 = TZ, 2 = PZ

@@ -191,6 +191,24 @@ def dice_on(pred: torch.Tensor, y: torch.Tensor, k: int) -> float:
     return float(np.mean(ds)) if ds else float("nan")
 
 
+MISS_MM = 50.0   # a landmark not predicted at all counts as this radial error in the val selection
+
+
+def mre_on(pred: torch.Tensor, y: torch.Tensor, spacing, k: int) -> float:
+    """Landmarks: mean radial error (mm) between the GT and predicted centroid of each class present in the GT, on the
+    model grid (canonical: axis permutations / flips of the native voxels, so distances are the world's); a class not
+    predicted counts MISS_MM."""
+    sp = torch.as_tensor(spacing, dtype=torch.float, device=pred.device)
+    err = []
+    for c in range(1, k):
+        g = (y == c).nonzero().float()
+        if not len(g):
+            continue
+        q = (pred == c).nonzero().float()
+        err.append(float(((g.mean(0) - q.mean(0)) * sp).norm()) if len(q) else MISS_MM)
+    return float(np.mean(err)) if err else float("nan")
+
+
 @torch.no_grad()
 def dice_full_res(probs: torch.Tensor, grid_from_gt: np.ndarray, lab: np.ndarray, k: int,
                   dev: str | torch.device | None = None) -> tuple[float, list]:
@@ -529,16 +547,23 @@ def train(job: dict) -> None:
             if it % every == 0 or it == iters:
                 net.eval()
                 if getattr(net, "cascade", False):   # one pass: the levels' thresholds on val and the val predictions
-                    ds = [dice_on(p, v["y"].to(dev), k) for p, v in zip(net.cascade_val(val_v, k, amp), val_v)]
+                    preds = net.cascade_val(val_v, k, amp)
                 else:
-                    ds = [dice_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).argmax(0).to(dev),
-                                  v["y"].to(dev), k) for v in val_v]
+                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).argmax(0).to(dev)
+                             for v in val_v]
+                ds = [dice_on(p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
                 val = float(np.nanmean(ds))
-                curve.append({"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60})
-                print(f"[seg] it {it} loss {float(loss):.3f} val dice {val:.4f} ({(time.time() - t0) / 60:.1f} min)",
-                      flush=True)
-                if "state" not in best or val > best["val"]:
-                    best = {"val": val, "iter": it, "state": trained()}
+                rec = {"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60}
+                score, msg = val, f"val dice {val:.4f}"
+                if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
+                    mre = float(np.mean([mre_on(p, v["y"].to(dev), v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
+                    rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
+                del preds
+                curve.append(rec)
+                print(f"[seg] it {it} loss {float(loss):.3f} {msg} ({(time.time() - t0) / 60:.1f} min)", flush=True)
+                if "state" not in best or score > best.get("score", best["val"]):
+                    best = {"val": val, "iter": it, "score": score, "state": trained()} | \
+                        ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {})
                 set_mode()
             if time.time() - t_save > SAVE_S and it < iters:
                 save_last(it)
@@ -552,7 +577,8 @@ def train(job: dict) -> None:
                                      "best": best, "curve": curve, "val_dice": best["val"],
                                      "n": {s: len(v) for s, v in split.items() if s != "test"}}, indent=1))
         ckpt.unlink()
-        print(f"[seg] best val dice {best['val']:.4f} (iter {best['iter']}) -> {job['out']}", flush=True)
+        print(f"[seg] best val dice {best['val']:.4f}" + (f" val MRE {best['val_mre']:.2f} mm" if 'val_mre' in best else "") +
+              f" (iter {best['iter']}) -> {job['out']}", flush=True)
         return
     load_trained(best.pop("state"))
     net.eval()
