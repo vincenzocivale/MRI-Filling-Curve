@@ -390,6 +390,9 @@ def train(job: dict) -> None:
           f"{len(frozen_names - loaded)} frozen but not loaded {sorted(frozen_names - loaded)[:4]}, "
           f"{len(loaded - {n for n in names if is_frozen(n)})} loaded outside the prefixes (frozen too)", flush=True)
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
+    if getattr(net, "decoder_c", False):   # decoder C trains on large tiles (whole scans mostly): 16 cells of 16 mm per
+        global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
+        TILE_CELLS, TILE_MAX = 16, 3e8 * k
     # token cache (SegNet args.token_cache): tiles start on each volume's 16 mm grid and pass (volume, corner) in ctx
     tcache = getattr(net, "cache", None)
     vid = {it["id"]: n for n, it in enumerate(job["items"])}

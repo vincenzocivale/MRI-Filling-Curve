@@ -42,7 +42,10 @@ liver_lesion:     {type: class, label: liver_class, query: "dataset == 'LLDMMRI'
 liver_malignant:  {type: class, label: malignant, query: "dataset == 'LLDMMRI'"}      # optional: benign vs malignant
 edss:             {type: dex, label: edss, bin: 0.5, query: "dataset == 'MSLesSeg' and (session == 'T1' or session != session)"}  # first timepoint
 pcom_any:         {type: class, label: pcom_any, query: "dataset == 'TopCoW'"}         # any posterior communicating artery (78/47)
-cmb_any:          {type: class, label: "cmb_count > 0", requires: [cmb_count], query: "dataset == 'VALDO' and session == 'task2'"}
+cmb_any:          {type: class, label: "cmb_count > 0", requires: [cmb_count],
+                   query: "dataset == 'VALDO' and session == 'task2' and modality == 'T2star'"}
+                  # T2* only (user, 22/10): the labels are defined on it, native space; the task-2 T1/T2 are resampled
+                  # into T2* space by the organisers and carry NaN outside the field of view. 72 subjects, one volume each
 
 spine_seg:     {type: seg, label: seg, query: "dataset == 'SPIDER' and dense", classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 201, 202, 203, 204, 205, 206, 207, 208, 209]}
 fetal_landmarks: {type: seg, label: seg, query: "dataset == 'LFC'", classes: [1, 2, 3, 4, 5, 6], save_pred: true,

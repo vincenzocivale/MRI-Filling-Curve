@@ -62,7 +62,7 @@ class SegNet(nn.Module):
                  refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
                  adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0,
                  rand_dec: float = 0.02, test_all: bool = False, kernel_skip: int = 0, kernel_skip_mm: float = 0.0,
-                 level2: bool = False):
+                 level2: bool = False, decoder_c: bool = False, c_points: int = 32768):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -139,6 +139,19 @@ class SegNet(nn.Module):
         # cells: each child = its parent's token + its own voxels through the encoder's frozen kernel at 2 mm (the
         # B-spline refinement of the 4 mm basis), mixed along the curve by 2 GDN-2 blocks (the fine cells see each
         # other), then decoded at the native voxels; the encoder itself never reads 2 mm
+        # decoder C (22/10, notes/adaptive_decoding.md "decoder C"): the 16 / 8 / 4 mm levels on every cell of a large tile
+        # (the whole scan at test), each level's tokens spread as a continuous field (quadratic B-splines over the 27
+        # nearest cells: smooth across cell borders, nothing resampled), and a point head: per voxel [the three fields,
+        # the voxel's and its 6 neighbours' intensities] -> logits. Trained on stratified points (class x boundary,
+        # importance-weighted: unbiased CE and soft-Dice sums) + the cell heads; no per-cell coefficient output.
+        self.decoder_c, self.c_points = bool(decoder_c), int(c_points)
+        if self.decoder_c:
+            CF = 32
+            self.cfield = nn.ModuleList([nn.Linear(encoder.dim, CF), nn.Linear(128, CF), nn.Linear(128, CF)])
+            self.chead = nn.Sequential(nn.Linear(3 * CF + 7, 128), nn.GELU(), nn.Linear(128, 128), nn.GELU(),
+                                       nn.Linear(128, n_out))
+            if hasattr(self, "coef"):   # the per-cell coefficient output is not used (n_out x rank^3 per cell)
+                del self.coef
         self.level2 = bool(level2)
         if self.level2:
             from ..model import Encoder
@@ -237,6 +250,7 @@ class SegNet(nn.Module):
             out.append(m[0, :, : v[0], : v[1], : v[2]])
         if self.kernel:
             self._z16 = [(a[0], a[1], a[2]) for a in st]   # the 16 mm tokens (matryoshka decoding's coarse head)
+            self._lv = [[(a[0], a[1], a[2])] for a in st]   # every level's tokens, dims, grid (decoder C)
             for i in range(self.refine if stop is None else stop):   # the finer levels while their cells hold >= 8 voxels
                 act, inp = [], []
                 for b, (z, k, g, _, cur) in enumerate(st):
@@ -250,6 +264,7 @@ class SegNet(nn.Module):
                 ts = self.fine_mix([a[0] for a in inp], [a[1] for a in inp], [a[2] for a in inp], i)
                 for b, t, (_, _, gf, kf) in zip(act, ts, inp):
                     st[b] = [t, kf, gf.tolist(), self.fine[i][0].patch_embed, st[b][4]]
+                    self._lv[b].append((t, list(kf), gf.tolist()))
             if levels:   # adaptive decoding: each tile's finest tokens [z, k, g, emb, cur], its scan part V, spacing
                 return st, V, spacing
             out = [self.kernel_decode(z, emb, spacing[b], k, g)[:, : V[b][0], : V[b][1], : V[b][2]]
@@ -511,6 +526,57 @@ class SegNet(nn.Module):
         o = out.shape[1]
         return out.view(len(z), *r, o, *k2).permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(len(z), o, *k)
 
+    # ------------------------------------------------------------------------------------- decoder C (22/10)
+    def c_logits(self, lv, vol, pts):
+        """Point head at voxels pts [P, 3] of this tile / scan: the three levels' fields + the local intensities."""
+        fs = []
+        for j in range(3):
+            if j < len(lv):
+                z, k, g = lv[j]
+                fs.append(_c_field(self.cfield[j](z.float()), g, k, pts))
+            else:   # no 4 mm level (coarse voxels): zeros
+                fs.append(torch.zeros(len(pts), self.cfield[j].out_features, device=pts.device))
+        return self.chead(torch.cat(fs + [_c_image(vol, pts)], -1))
+
+    def c_sums(self, x, y, ctx, n_out):
+        """Training (decoder C): every level on every cell of the tiles, the cell heads' exact sums and the point head's
+        importance-weighted sums on stratified voxels."""
+        _, V, _ = self(x, ctx, levels=True)
+        fin, aux = None, [None, None, None]
+        add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
+        heads = (self.head16, self.head8, self.head4)
+        for b, lv in enumerate(self._lv):
+            yy, vol = y[b, : V[b][0], : V[b][1], : V[b][2]], x[b, 0, : V[b][0], : V[b][1], : V[b][2]]
+            for j, (z, k, _) in enumerate(lv):
+                lab, val = self._cells(yy, k)
+                aux[j] = add(aux[j], self._cell_sums(heads[j](z), self._hist(lab, val, n_out)))
+            idx, w = _c_points(yy, n_out, self.c_points)
+            S = yy.shape
+            pts = torch.stack([idx // (S[1] * S[2]), idx // S[2] % S[1], idx % S[2]], 1)
+            lg = self.c_logits(lv, vol, pts)
+            fin = add(fin, wsums(lg, yy.flatten()[idx].long(), w, n_out))
+        return fin, [a for a in aux if a is not None]
+
+    @torch.no_grad()
+    def c_predict(self, x, ctx, n_out):
+        """A whole scan [C, *S] -> probabilities [n_out, *S]: every level on the whole scan, the point head on every
+        voxel (chunks)."""
+        dev, S = x.device, tuple(x.shape[1:])
+        c = torch.cat([ctx[:7].float().cpu(), torch.zeros(3)]).to(dev)
+        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
+        try:
+            self(x[None].float(), c[None], levels=True)
+        finally:
+            self.fine_seg = fs
+        lv, vol, N = self._lv[0], x[0], math.prod(S)
+        fits = n_out * N * 2 <= torch.cuda.mem_get_info(dev)[0] / 4
+        out = torch.empty(n_out, N, dtype=torch.half, device=dev if fits else "cpu")
+        for a in range(0, N, 1 << 19):
+            i = torch.arange(a, min(a + (1 << 19), N), device=dev)
+            pts = torch.stack([i // (S[1] * S[2]), i // S[2] % S[1], i % S[2]], 1)
+            out[:, a: a + len(i)] = self.c_logits(lv, vol, pts).float().softmax(1).T.half().to(out.device)
+        return out.view(n_out, *S)
+
     # --------------------------------------------------------------------------------- matryoshka decoding (21/10)
     def _hist(self, lab, val, n_out):
         return torch.zeros(len(lab), n_out, device=lab.device).scatter_add_(1, lab, val.float())
@@ -555,6 +621,8 @@ class SegNet(nn.Module):
         """A batch of tiles -> (sums of the final prediction, [sums of the 16, 8, 4 mm heads]), each summed over the
         batch (segrun.sums_loss on each, added). Final: the 8 mm head where the 4 mm level is not read, the 4 mm head in
         its cells, the native voxels decoded in a subset of them (GT edges, predicted edges, unsure, random)."""
+        if self.decoder_c:
+            return self.c_sums(x, y, ctx, n_out)
         st, V, sp = self(x, ctx, levels=True, stop=1)
         rand = self.rand_dec if rand is None else rand
         add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
@@ -611,6 +679,8 @@ class SegNet(nn.Module):
         """A whole scan [C, *S] in one pass -> probabilities [n_out, *S]: 16 -> 8 mm on the whole scan, the 8 mm head
         everywhere, the 4 mm level in the quota of cells with the most varying intensities (its head there), the native
         voxels decoded in the 4 mm cells on the predicted boundary or unsure (max probability < tau)."""
+        if self.decoder_c:
+            return self.c_predict(x, ctx, n_out)
         dev, S = x.device, tuple(x.shape[1:])
         c = torch.cat([ctx[:7].float().cpu(), torch.zeros(3)]).to(dev)
         fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
@@ -652,6 +722,60 @@ class SegNet(nn.Module):
         return out[:, : S[0], : S[1], : S[2]]
 
 
+def _c_points(yy: torch.Tensor, k: int, n: int, gen=None) -> tuple:
+    """Stratified voxels of a label tile (255 ignored): strata class x boundary (a 6-neighbour differs), n / (2 k) per
+    stratum, uniform within it -> flat indices [P], weights [P] (voxels each point stands for: unbiased sums)."""
+    dev, flat = yy.device, yy.flatten()
+    a = yy.float()[None, None]
+    edge = (F.max_pool3d(a, 3, 1, 1) != -F.max_pool3d(-a, 3, 1, 1)).flatten()
+    m, N = max(1, n // (2 * k)), flat.numel()
+    idx, w = [], []
+    for c in range(k):
+        for e in (False, True):
+            mask = (flat == c) & (edge == e)
+            cnt = int(mask.sum())
+            if not cnt:
+                continue
+            take = min(cnt, m)
+            if cnt / N > 0.01:   # large stratum: uniform draws, kept if inside (no nonzero of ~1e8 voxels)
+                cand = torch.randint(N, (int(4 * take * N / cnt) + 16,), device=dev, generator=gen)
+                cand = cand[mask[cand]][:take]
+            else:
+                nz = mask.nonzero()[:, 0]
+                cand = nz[torch.randperm(cnt, device=dev, generator=gen)[:take]]
+            idx.append(cand)
+            w.append(torch.full((len(cand),), cnt / max(len(cand), 1), device=dev))
+    return torch.cat(idx), torch.cat(w)
+
+
+def _c_field(f: torch.Tensor, g, k, pts: torch.Tensor) -> torch.Tensor:
+    """Tokens' features f [N, C] on grid g of k-voxel cells -> the continuous field at voxels pts [P, 3]: quadratic
+    B-spline weights over the 27 nearest cell centres (partition of unity, C1 across cell borders)."""
+    dev = f.device
+    kk, gg = torch.tensor(k, device=dev, dtype=torch.float), torch.tensor(g, device=dev)
+    u = (pts.float() + 0.5) / kk - 0.5                     # position in cell-centre units
+    c = u.round()
+    d = u - c                                              # [-0.5, 0.5]
+    wts = torch.stack([0.5 * (0.5 - d) ** 2, 0.75 - d ** 2, 0.5 * (0.5 + d) ** 2], -1)   # [P, 3 axes, 3]
+    out = 0
+    for i in range(3):
+        for j in range(3):
+            for l in range(3):
+                n = (c.long() + torch.tensor([i - 1, j - 1, l - 1], device=dev)).clamp_min(0)
+                n = torch.minimum(n, gg - 1)
+                ww = wts[:, 0, i] * wts[:, 1, j] * wts[:, 2, l]
+                out = out + ww[:, None] * f[(n[:, 0] * g[1] + n[:, 1]) * g[2] + n[:, 2]]
+    return out
+
+
+def _c_image(vol: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
+    """The voxel's intensity and its 6 face neighbours' (clamped at the border) -> [P, 7]."""
+    S = torch.tensor(vol.shape, device=vol.device)
+    off = torch.tensor([[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], device=vol.device)
+    q = torch.minimum((pts[:, None] + off[None]).clamp_min(0), S - 1)
+    return vol[q[..., 0], q[..., 1], q[..., 2]].float()
+
+
 def windows(vol, k, m, idx) -> torch.Tensor:
     """Cells idx (raster on the grid of k-voxel cells, as patchify) with m voxels of margin per side (zeros past the
     scan) -> [n, prod(k + 2m)]."""
@@ -665,6 +789,14 @@ def windows(vol, k, m, idx) -> torch.Tensor:
 def patchify_any(vol, k):
     from ..data.volume import patchify
     return patchify(vol.float(), k)
+
+def wsums(logits: torch.Tensor, lab: torch.Tensor, w: torch.Tensor, k: int) -> list:
+    """sums() with a weight per point (decoder C's importance weights)."""
+    lp = logits.float().log_softmax(1)
+    p, oh = lp.exp(), F.one_hot(lab, k).float()
+    return [-(lp.gather(1, lab[:, None])[:, 0] * w).sum(), w.sum(), (w[:, None] * p * oh).sum(0),
+            (w[:, None] * p).sum(0), (w[:, None] * oh).sum(0)]
+
 
 def sums(logits: torch.Tensor, lab: torch.Tensor, w, k: int) -> list:
     """Points' logits [M, k] and labels [M], each point standing for w voxels -> [CE sum, voxels, per class: soft
@@ -773,7 +905,8 @@ class SFC(Wrapper):
                      quota=float(self.args.get("refine_quota") or 0.5), head_w=float(self.args.get("head_w") or 1.0),
                      rand_dec=float(self.args.get("rand_dec") or 0.02), test_all=bool(self.args.get("test_decode_all")),
                      kernel_skip=int(self.args.get("kernel_skip") or 0),
-                     kernel_skip_mm=float(self.args.get("kernel_skip_mm") or 0.0), level2=bool(self.args.get("level2")))
+                     kernel_skip_mm=float(self.args.get("kernel_skip_mm") or 0.0), level2=bool(self.args.get("level2")),
+                     decoder_c=bool(self.args.get("decoder_c")), c_points=int(self.args.get("c_points") or 32768))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
