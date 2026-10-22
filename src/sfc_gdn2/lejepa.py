@@ -368,18 +368,29 @@ class LeJEPA(nn.Module):
         xyz = grid_coords(grid, n_patch)                                                  # [B,N,3]
         fg = per_patch(vols, n_patch, lambda x: x.mean(-1)) > self.fg_threshold            # [B,N]
         vols = {**vols, "k_list": vols["k"].tolist(), "spacing_list": vols["spacing"].tolist()}
-        memo = {}                                          # one kernel weight matrix per distinct (spacing, k)
-        for sp, k in zip(vols["spacing_list"], vols["k_list"]):
-            if (key := (*sp, *k)) not in memo:
-                memo[key] = self.encoder.patch_embed.weights(torch.tensor(sp, device=grid.device), k)
-        ws = [memo[(*sp, *k)] for sp, k in zip(vols["spacing_list"], vols["k_list"])]
-        if self.rec is not None:  # sub-patch targets: each patch's native voxels in rec_cells^3 cells, normalised per patch
+        memo, pe = {}, self.encoder.patch_embed     # one kernel weight matrix per distinct (spacing, k, cell mm)
+        mm0 = pe.patch_mm
+        mms = vols.get("patch_mm") or [mm0] * b    # per scan (repatch with max_patches_per_scan): its own cell size
+        for sp, k, m in zip(vols["spacing_list"], vols["k_list"], mms):
+            if (key := (*sp, *k, m)) not in memo:
+                pe.patch_mm = m
+                memo[key] = pe.weights(torch.tensor(sp, device=grid.device), k)
+        pe.patch_mm = mm0
+        ws = [memo[(*sp, *k, m)] for sp, k, m in zip(vols["spacing_list"], vols["k_list"], mms)]
+        def rec_target(scan, pid):
+            """Sub-patch targets of the rows (scan [R], patch [R]): each patch's native voxels in rec_cells^3 cells,
+            normalised per patch. Only the rows a loss uses (22/10: all patches of the batch held a copy of every voxel
+            at 4 mm cells, ~10 GB and OOM)."""
+            out = None
             with torch.no_grad(), torch.autocast(grid.device.type, enabled=False):
-                rt = torch.cat([nn.functional.adaptive_avg_pool3d(x.view(-1, 1, *k), self.rec_cells).flatten(1)
-                                for x, k in zip(vols["patches"], vols["k_list"])])
-                rt = (rt - rt.mean(1, keepdim=True)) / (rt.var(1, keepdim=True, unbiased=False) + self.rec_eps).sqrt()
-            roff = torch.tensor([len(x) for x in vols["patches"]], device=grid.device)
-            roff = roff.cumsum(0) - roff                                                   # first row of each scan
+                for b in scan.unique().tolist():
+                    s = (scan == b).nonzero()[:, 0]
+                    x, k = vols["patches"][b], vols["k_list"][b]
+                    t = nn.functional.adaptive_avg_pool3d(x[pid[s]].view(-1, 1, *k), self.rec_cells).flatten(1)
+                    t = (t - t.mean(1, keepdim=True)) / (t.var(1, keepdim=True, unbiased=False) + self.rec_eps).sqrt()
+                    out = t.new_empty(len(scan), t.shape[1]) if out is None else out
+                    out[s] = t
+            return out
         rec, recv = [], []
         corner, edge = self.jittered(*self.boxes(fg, xyz, grid, gen), grid, gen)           # [B,G,2,3]
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
@@ -448,7 +459,8 @@ class LeJEPA(nn.Module):
             for w, r, acc in ((self.rec_weight, mask, rec), (self.rec_visible, fgv & (tv % 2 == 1), recv)):
                 if w:
                     r = r.nonzero()[:, 0]
-                    acc.append((self.rec(bi.index_select(0, r)).float() - rt[roff[v[tv[r]]] + idx[r]]).square().mean(1))
+                    if len(r):
+                        acc.append((self.rec(bi.index_select(0, r)).float() - rec_target(v[tv[r]], idx[r])).square().mean(1))
         zg = torch.cat(zg, 1)                                                              # [B,G,2,D]
         inv_g = (zg - zg.mean(2, keepdim=True)).square().mean()
         # symmetric, as LeJEPA: both tokens pulled to their mean, no stop-grad (with a stop-grad target and

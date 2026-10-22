@@ -62,7 +62,8 @@ def to_device(batch: dict, device) -> dict:
     patches = []
     for v, (a, c), k in zip(batch["volumes"], batch["affine"].tolist(), batch["k"].tolist()):
         patches.append(patchify(v.to(device, non_blocking=True).float() * a + c, k))
-    return {"patches": patches, **{k: batch[k].to(device) for k in ("grid", "k", "spacing")}}
+    return {"patches": patches, **{k: batch[k].to(device) for k in ("grid", "k", "spacing")},
+            **({"patch_mm": batch["patch_mm"].tolist()} if "patch_mm" in batch else {})}   # per scan (repatch)
 
 
 def per_patch(vols: dict, n_patch: int, reduce) -> torch.Tensor:

@@ -32,15 +32,23 @@ def pretrain_rows(cfg: dict) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def repatch(batch: dict, mm: float) -> dict:
+def repatch(batch: dict, mm: float, max_patches: int | None = None) -> dict:
     """The batch's scans cut into patches of `mm` (data.patch_mm_choices, 18/10: one model at every resolution).
     The objective's geometry stays in tokens (views, masks, cell levels), so its physical size scales with the patch,
     as FlexiViT's; the kernel takes the patch size (`KernelEmbed.patch_mm`) and, with basis bspline, the cell's own
     coordinate."""
     from .data.volume import patch_dims, patch_grid
-    k = [patch_dims(s, mm) for s in batch["spacing"].tolist()]
-    grid = torch.stack([patch_grid(tuple(v.shape[:3]), kk) for v, kk in zip(batch["volumes"], k)])
-    return batch | {"k": torch.tensor(k), "grid": grid}
+    k, grid, mms = [], [], []
+    for s, v in zip(batch["spacing"].tolist(), batch["volumes"]):
+        m = mm   # max_patches (data.max_patches_per_scan, 22/10): a scan whose grid would pass it (whole-body at 4 mm:
+        while True:   # ~6e6 patches; the objective's [views x patches] tables of the batch's largest grid: OOM) gets
+            kk = patch_dims(s, m)   # the smallest larger cells that fit
+            g = patch_grid(tuple(v.shape[:3]), kk)
+            if max_patches is None or int(g.prod()) <= max_patches:
+                break
+            m *= 1.25
+        k.append(kk), grid.append(g), mms.append(m)
+    return batch | {"k": torch.tensor(k), "grid": torch.stack(grid), "patch_mm": torch.tensor(mms)}
 
 
 def fp32_forward(f):
@@ -233,7 +241,7 @@ class Pretrainer:
             wait += time.time() - t_w
             if choices := self.cfg["data"].get("patch_mm_choices"):  # one patch size per step, the same on every rank
                 mm = float(choices[(self.seed * 1_000_003 + step) % len(choices)])
-                batch = repatch(batch, mm)
+                batch = repatch(batch, mm, self.cfg["data"].get("max_patches_per_scan"))
                 self.net.encoder.patch_embed.patch_mm = mm
                 # data.view_tokens_by_mm {mm: cap} (22/10 screens): fewer tokens per view at small cells, so a 4 mm step
                 # holds about as many tokens as a 16 mm one (the same views in mm would hold up to 64x more: OOM)
