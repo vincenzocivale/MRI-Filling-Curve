@@ -62,7 +62,7 @@ class SegNet(nn.Module):
                  refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
                  adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0,
                  rand_dec: float = 0.02, test_all: bool = False, kernel_skip: int = 0, kernel_skip_mm: float = 0.0,
-                 level2: bool = False, decoder_c: bool = False, c_points: int = 32768):
+                 level2: bool = False, decoder_c: bool = False, c_points: int = 32768, c_local: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -144,11 +144,15 @@ class SegNet(nn.Module):
         # nearest cells: smooth across cell borders, nothing resampled), and a point head: per voxel [the three fields,
         # the voxel's and its 6 neighbours' intensities] -> logits. Trained on stratified points (class x boundary,
         # importance-weighted: unbiased CE and soft-Dice sums) + the cell heads; no per-cell coefficient output.
-        self.decoder_c, self.c_points = bool(decoder_c), int(c_points)
+        # c_local (C2, 22/10: C lost the sub-cell detail of R4 -- fetal landmarks, MS lesions, cochlea): per level also the
+        # containing cell's own features and the voxel's position relative to that cell's centre (local implicit
+        # function, relative only), and the intensities at +-1 and +-2 voxels per axis (13)
+        self.decoder_c, self.c_points, self.c_local = bool(decoder_c), int(c_points), bool(c_local)
         if self.decoder_c:
             CF = 32
             self.cfield = nn.ModuleList([nn.Linear(encoder.dim, CF), nn.Linear(128, CF), nn.Linear(128, CF)])
-            self.chead = nn.Sequential(nn.Linear(3 * CF + 7, 128), nn.GELU(), nn.Linear(128, 128), nn.GELU(),
+            self.chead = nn.Sequential(nn.Linear(3 * (2 * CF + 3) + 13 if self.c_local else 3 * CF + 7, 128),
+                                       nn.GELU(), nn.Linear(128, 128), nn.GELU(),
                                        nn.Linear(128, n_out))
             if hasattr(self, "coef"):   # the per-cell coefficient output is not used (n_out x rank^3 per cell)
                 del self.coef
@@ -531,12 +535,16 @@ class SegNet(nn.Module):
         """Point head at voxels pts [P, 3] of this tile / scan: the three levels' fields + the local intensities."""
         fs = []
         for j in range(3):
+            C = self.cfield[j].out_features
             if j < len(lv):
                 z, k, g = lv[j]
-                fs.append(_c_field(self.cfield[j](z.float()), g, k, pts))
+                f = self.cfield[j](z.float())
+                fs.append(_c_field(f, g, k, pts))
+                if self.c_local:
+                    fs += list(_c_local(f, g, k, pts))
             else:   # no 4 mm level (coarse voxels): zeros
-                fs.append(torch.zeros(len(pts), self.cfield[j].out_features, device=pts.device))
-        return self.chead(torch.cat(fs + [_c_image(vol, pts)], -1))
+                fs.append(torch.zeros(len(pts), (2 * C + 3) if self.c_local else C, device=pts.device))
+        return self.chead(torch.cat(fs + [_c_image(vol, pts, 2 if self.c_local else 1)], -1))
 
     def c_sums(self, x, y, ctx, n_out):
         """Training (decoder C): every level on every cell of the tiles, the cell heads' exact sums and the point head's
@@ -768,10 +776,19 @@ def _c_field(f: torch.Tensor, g, k, pts: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _c_image(vol: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
-    """The voxel's intensity and its 6 face neighbours' (clamped at the border) -> [P, 7]."""
+def _c_local(f: torch.Tensor, g, k, pts: torch.Tensor) -> tuple:
+    """The containing cell's features [P, C] and the voxel's offset from that cell's centre, in cells [P, 3]."""
+    kk, gg = torch.tensor(k, device=f.device, dtype=torch.float), torch.tensor(g, device=f.device)
+    u = (pts.float() + 0.5) / kk
+    n = torch.minimum(u.floor().long(), gg - 1)
+    return f[(n[:, 0] * g[1] + n[:, 1]) * g[2] + n[:, 2]], u - n.float() - 0.5
+
+
+def _c_image(vol: torch.Tensor, pts: torch.Tensor, r: int = 1) -> torch.Tensor:
+    """The voxel's intensity and the voxels at +-1 .. +-r along each axis (clamped at the border) -> [P, 1 + 6 r]."""
     S = torch.tensor(vol.shape, device=vol.device)
-    off = torch.tensor([[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], device=vol.device)
+    off = torch.tensor([[0, 0, 0]] + [[s * d * (a == 0), s * d * (a == 1), s * d * (a == 2)]
+                                      for d in range(1, r + 1) for a in range(3) for s in (1, -1)], device=vol.device)
     q = torch.minimum((pts[:, None] + off[None]).clamp_min(0), S - 1)
     return vol[q[..., 0], q[..., 1], q[..., 2]].float()
 
@@ -906,7 +923,8 @@ class SFC(Wrapper):
                      rand_dec=float(self.args.get("rand_dec") or 0.02), test_all=bool(self.args.get("test_decode_all")),
                      kernel_skip=int(self.args.get("kernel_skip") or 0),
                      kernel_skip_mm=float(self.args.get("kernel_skip_mm") or 0.0), level2=bool(self.args.get("level2")),
-                     decoder_c=bool(self.args.get("decoder_c")), c_points=int(self.args.get("c_points") or 32768))
+                     decoder_c=bool(self.args.get("decoder_c")), c_points=int(self.args.get("c_points") or 32768),
+                     c_local=bool(self.args.get("c_local")))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
