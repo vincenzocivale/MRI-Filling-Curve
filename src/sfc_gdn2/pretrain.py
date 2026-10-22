@@ -246,6 +246,9 @@ class Pretrainer:
                 # data.view_tokens_by_mm {mm: cap} (22/10 screens): fewer tokens per view at small cells, so a 4 mm step
                 # holds about as many tokens as a 16 mm one (the same views in mm would hold up to 64x more: OOM)
                 caps = self.cfg["data"].get("view_tokens_by_mm") or {}
+                # an override without spaces ({4:768}) is one YAML scalar "4:768" -> None: no cap at all (22/10, OOM)
+                if any(not isinstance(a, (int, float)) or not isinstance(b, int) for a, b in caps.items()):
+                    raise ValueError(f"data.view_tokens_by_mm {caps}: write it as {{4: 768, 8: 1024}} (spaces)")
                 base = self.cfg["objective"].get("max_view_tokens")
                 cap = caps.get(mm, caps.get(int(mm), base))
                 self.net.max_view_tokens = float("inf") if cap is None else cap
