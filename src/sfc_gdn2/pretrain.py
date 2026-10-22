@@ -235,6 +235,12 @@ class Pretrainer:
                 mm = float(choices[(self.seed * 1_000_003 + step) % len(choices)])
                 batch = repatch(batch, mm)
                 self.net.encoder.patch_embed.patch_mm = mm
+                # data.view_tokens_by_mm {mm: cap} (22/10 screens): fewer tokens per view at small cells, so a 4 mm step
+                # holds about as many tokens as a 16 mm one (the same views in mm would hold up to 64x more: OOM)
+                caps = self.cfg["data"].get("view_tokens_by_mm") or {}
+                base = self.cfg["objective"].get("max_view_tokens")
+                cap = caps.get(mm, caps.get(int(mm), base))
+                self.net.max_view_tokens = float("inf") if cap is None else cap
             patches += int(batch["grid"].prod(1).sum())
             gen.manual_seed((self.seed * 1_000_003 + step) * 4096 + self.rank)  # resumable on any number of GPUs
             with torch.autocast("cuda", dtype=torch.bfloat16):
