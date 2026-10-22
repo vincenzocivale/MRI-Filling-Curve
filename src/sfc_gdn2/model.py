@@ -70,6 +70,55 @@ def _fla_host_fixes() -> None:
     _FLA_FIXED.append(True)
 
 
+class Rope3D(nn.Module):
+    """3D rotary position (22/10 screens): each of a head's hd/2 channel pairs rotates by <w_j, p>, p the token's
+    coordinates on its patch grid (patch units), w_j = 2 pi / lambda_j along a fixed random unit direction (any direction,
+    as RoPE-Mixed's), lambda log-spaced over 2..64 patches. In attention the score depends on p_q - p_k only: relative,
+    no absolute position reaches the values."""
+
+    def __init__(self, hd: int, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        d = torch.randn(hd // 2, 3, generator=g)
+        lam = torch.logspace(math.log10(2.0), math.log10(64.0), hd // 2)
+        self.register_buffer("w", d / d.norm(dim=1, keepdim=True) * (2 * math.pi / lam)[:, None], persistent=False)
+
+    def forward(self, t: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """t [..., T, H, hd] (T aligned with pos [T, 3])."""
+        a = pos.float() @ self.w.T                                                       # [T, hd/2]
+        cos, sin = a.cos()[:, None].to(t.dtype), a.sin()[:, None].to(t.dtype)
+        x, y = t[..., ::2], t[..., 1::2]
+        return torch.stack([x * cos - y * sin, x * sin + y * cos], -1).flatten(-2)
+
+
+class TokenConv3D(nn.Module):
+    """Depthwise 3x3x3 over each packed sequence's tokens on their patch grid (22/10 screens): neighbours found by
+    coordinate within the same sequence (absent ones count as 0); residual, zero-initialised (the encoder starts as
+    without it). Gives each token its true 3D neighbours, which the curve order only partly keeps."""
+
+    def __init__(self, d: int):
+        super().__init__()
+        self.w, self.b = nn.Parameter(torch.zeros(27, d)), nn.Parameter(torch.zeros(d))
+        off = torch.stack(torch.meshgrid(*(torch.arange(-1, 2),) * 3, indexing="ij"), -1).view(-1, 3)
+        self.register_buffer("off", off, persistent=False)
+
+    def forward(self, x: torch.Tensor, pos: torch.Tensor, cu: torch.Tensor) -> torch.Tensor:
+        """x [T, d], pos [T, 3] integer patch coordinates, cu int32 [n+1] -> the update [T, d]."""
+        T, dev = len(x), x.device
+        seq = torch.searchsorted(cu[1:].long(), torch.arange(T, device=dev), right=True)
+        p = pos.long() + 1
+        M = int(p.max()) + 2
+        key = lambda q: ((seq * M + q[:, 0]) * M + q[:, 1]) * M + q[:, 2]
+        sk, order = key(p).sort()
+        out = self.b.to(x.dtype).expand_as(x).clone()
+        for j, o in enumerate(self.off):
+            nk = key(p + o)
+            i = torch.searchsorted(sk, nk).clamp(max=T - 1)
+            hit = (sk[i] == nk)[:, None].to(x.dtype)
+            out = out + x[order[i]] * hit * self.w[j].to(x.dtype)
+        return out
+
+
 class GDN2Block(nn.Module):
     """Pre-norm causal GDN-2 token mixer + MLP."""
 
@@ -81,15 +130,34 @@ class GDN2Block(nn.Module):
         self.ffn_norm = nn.LayerNorm(d)
         self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
 
+    rope3d: Rope3D | None = None   # set by Encoder (rope3d "all"): q and k rotated after the short convolutions
+    _p: torch.Tensor | None = None
+
+    def add_rope(self, rope: Rope3D) -> None:
+        self.rope3d = rope
+        hd = self.mix.head_k_dim
+
+        def hook(mod, inp, out, blk=self):
+            if blk._p is None:
+                return out
+            t, st = out
+            return blk.rope3d(t.unflatten(-1, (-1, hd)), blk._p).flatten(-2), st
+        for conv in (self.mix.q_conv1d, self.mix.k_conv1d):
+            conv.register_forward_hook(hook)
+
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, rev: torch.Tensor | None = None,
-                both: bool = False) -> torch.Tensor:
-        """rev (index reversing each packed sequence): the mixer reads backwards; both: the mean of both ways."""
+                both: bool = False, pos: torch.Tensor | None = None) -> torch.Tensor:
+        """rev (index reversing each packed sequence): the mixer reads backwards; both: the mean of both ways.
+        pos [T, 3]: patch coordinates of the tokens (rope3d)."""
         y = self.norm(x)
         if torch.is_autocast_enabled(y.device.type):    # cast once, not once per projection (~6 per block)
             y = y.to(torch.get_autocast_dtype(y.device.type))
+        self._p = pos if self.rope3d is not None else None
         m = self.mix(y, cu_seqlens=cu_seqlens)[0] if rev is None or both else 0
         if rev is not None:                             # index_select: its backward is an index_add, no sort
+            self._p = pos.index_select(0, rev) if self._p is not None else None
             m = (m + self.mix(y.index_select(1, rev), cu_seqlens=cu_seqlens)[0].index_select(1, rev)) / (2 if both else 1)
+        self._p = None
         x = x + m
         return x + self.ffn(self.ffn_norm(x))
 
@@ -115,7 +183,10 @@ class AttnBlock(nn.Module):
                 nn.init.zeros_(m.bias)
         return self
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, rev=None, both=False) -> torch.Tensor:
+    rope3d: Rope3D | None = None   # set by Encoder (rope3d "attn" / "all")
+
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, rev=None, both=False,
+                pos: torch.Tensor | None = None) -> torch.Tensor:
         from flash_attn import flash_attn_varlen_func
 
         y = self.norm(x[0])                                                               # [T, d] (x: [1, T, d])
@@ -134,6 +205,8 @@ class AttnBlock(nn.Module):
                 a, b = t[..., ::2], t[..., 1::2]
                 return torch.stack([a * cos - b * sin, a * sin + b * cos], -1).flatten(-2)
             q, k = rot(q), rot(k)
+        if self.rope3d is not None and pos is not None:
+            q, k = self.rope3d(q, pos), self.rope3d(k, pos)
         a = flash_attn_varlen_func(q, k, v, cu, cu, int((cu[1:] - cu[:-1]).max()), int((cu[1:] - cu[:-1]).max()))
         x = x + self.o(torch.sigmoid(self.g(y)) * a.reshape(T, -1))[None]
         return x + self.ffn(self.ffn_norm(x))
@@ -308,7 +381,7 @@ class Encoder(nn.Module):
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
                  grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, bidir: str = "late",
                  long_mem: dict | None = None, attn_every: int = 0, attn_rope: bool = False, attn_insert: int = 0,
-                 norm: str = "layer", hc: int = 0, **embed):
+                 norm: str = "layer", hc: int = 0, rope3d: str = "", dwconv: bool = False, **embed):
         super().__init__()
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
@@ -341,6 +414,19 @@ class Encoder(nn.Module):
         if self.hc:
             self.blocks = nn.ModuleList(HyperConnection(b, d_model, self.hc) for b in self.blocks)
         self.norm = nn.RMSNorm(d_model) if norm == "rms" else nn.LayerNorm(d_model)
+        # rope3d (22/10 screens): "attn" 3D RoPE on the patch-grid coordinates in the attention blocks, "all" also in the
+        # GDN-2 blocks; dwconv: TokenConv3D on the input tokens. Both need `pos` in run / flat / packed (else off).
+        assert rope3d in ("", "attn", "all"), rope3d
+        self.rope3d_mode = rope3d
+        if rope3d:
+            self.rope3d = Rope3D(head_dim)
+            for b in self.blocks:
+                b = getattr(b, "block", b)
+                if isinstance(b, AttnBlock):
+                    b.rope3d = self.rope3d
+                elif rope3d == "all":
+                    b.add_rope(self.rope3d)
+        self.dw = TokenConv3D(d_model) if dwconv else None
 
     @classmethod
     def from_config(cls, cfg: dict) -> Encoder:
@@ -348,49 +434,55 @@ class Encoder(nn.Module):
         return cls(m["d_model"], m["depth"], m["head_dim"], m["num_heads"], m.get("use_short_conv", True),
                    m.get("grad_checkpoint", False), cfg["data"]["patch_mm"], m.get("view_pos", False),
                    m.get("bidir", "late"), m.get("long_mem"), m.get("attn_every", 0), m.get("attn_rope", False),
-                   m.get("attn_insert", 0), m.get("norm", "layer"), m.get("hc", 0),
-                   **m.get("embed", {}))
+                   m.get("attn_insert", 0), m.get("norm", "layer"), m.get("hc", 0), m.get("rope3d", ""),
+                   m.get("dwconv", False), **m.get("embed", {}))
 
     def apply_mask(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
         """[...,N,d] tokens, masked ones replaced by the learned mask token."""
         return x if mask is None else torch.where(mask[..., None], self.mask_token.to(x.dtype), x)
 
     def run(self, x: torch.Tensor, cu_seqlens: torch.Tensor | None = None, ckpt: bool | None = None,
-            rev: torch.Tensor | None = None) -> torch.Tensor:
+            rev: torch.Tensor | None = None, pos: torch.Tensor | None = None) -> torch.Tensor:
         """[B,S,d] curve-ordered tokens -> [B,S,d] hidden states (pre final norm). With `cu_seqlens`
         (int32 [n+1] offsets), x is [1,T,d]: n sequences packed back to back, no padding. rev: see `bidir`."""
         ckpt = self.grad_checkpoint if ckpt is None else ckpt
+        if self.dw is not None and pos is not None:
+            cu = cu_seqlens if cu_seqlens is not None else torch.tensor([0, x.shape[1]], device=x.device, dtype=torch.int32)
+            x = x + checkpoint(self.dw, x[0], pos, cu, use_reentrant=False)[None]   # 27 gathers: recomputed in backward
         taps = [x] * self.taps.count(-1)  # -1: the input tokens (patch embedding)
         if self.hc:                                       # n identical residual streams (mHC); read out as their mean
             x = x.unsqueeze(-2).expand(*x.shape[:-1], self.hc, x.shape[-1]).contiguous()
         for i, block in enumerate(self.blocks):
             r = rev if self.bidir == "block" or self.reads_back[i] else None
-            x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", use_reentrant=False) if ckpt and self.training
-                 else block(x, cu_seqlens, r, self.bidir == "block"))
+            x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", pos, use_reentrant=False) if ckpt and self.training
+                 else block(x, cu_seqlens, r, self.bidir == "block", pos))
             taps += [x.mean(-2) if self.hc else x] * self.taps.count(i)  # a repeated index: same width, no new block
         x = x.mean(-2) if self.hc else x
         return torch.cat([x, *taps], -1) if taps else x
 
-    def packed(self, x: torch.Tensor, valid: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
+    def packed(self, x: torch.Tensor, valid: torch.Tensor, ckpt: bool | None = None,
+               pos: torch.Tensor | None = None) -> torch.Tensor:
         """[V,L,d] curve-ordered tokens, [V,L] valid (a prefix of each row) -> [V,L,d] normed hidden
         states, zero at padding. Only valid tokens are run, packed into one sequence (views differ ~10x
         in length: padding was ~3x the work)."""
         cu = nn.functional.pad(valid.sum(1).cumsum(0), (1, 0)).int()
-        out = self.flat(x[valid], cu, ckpt)
+        out = self.flat(x[valid], cu, ckpt, None if pos is None else pos[valid])
         return out.new_zeros(*valid.shape, out.shape[-1]).index_put((valid,), out)
 
-    def flat(self, x: torch.Tensor, cu_seqlens: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
+    def flat(self, x: torch.Tensor, cu_seqlens: torch.Tensor, ckpt: bool | None = None,
+             pos: torch.Tensor | None = None) -> torch.Tensor:
         """[T,d] curve-ordered tokens of n sequences back to back (int32 offsets cu_seqlens [n+1]) -> [T,d] normed
         hidden states. A dummy sequence pads T <= 64: GDN-2 switches to its recurrent kernel there in eval."""
         total = len(x)
         if pad := max(65 - total, 0):
             x, cu_seqlens = nn.functional.pad(x, (0, 0, 0, pad)), torch.cat([cu_seqlens, cu_seqlens[-1:] + pad])
+            pos = None if pos is None else torch.cat([pos, pos.new_zeros(pad, 3)])
         rev = None
         if self.bidir != "late":                           # index reversing each sequence in place
             k, cu = torch.arange(len(x), device=x.device), cu_seqlens.long()
             s = torch.searchsorted(cu[1:], k, right=True)
             rev = cu[s] + cu[s + 1] - 1 - k
-        h = self.run(x[None], cu_seqlens, ckpt, rev)[0, :total]
+        h = self.run(x[None], cu_seqlens, ckpt, rev, pos if (self.rope3d_mode or self.dw is not None) else None)[0, :total]
         if not self.taps:
             return self.norm(h)
         h = h.split(self.dim, -1)  # the last block's output (final norm) ++ the taps' (plain layer norm)
@@ -457,13 +549,16 @@ def encoder_extractor(encoder: Encoder, curves: list[str], level: str, seed: int
                                  for c, d, m in zip(local, dims, inside)])  # per volume: no batch-dependent curve
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s = t.gather(1, order[..., None].expand(-1, -1, encoder.dim))
+                ps = local.gather(1, order[..., None].expand(-1, -1, 3))   # patch coordinates along the curve
                 if encoder.bidir == "late":
-                    h = encoder.packed(torch.cat([s, s.gather(1, rev[..., None].expand_as(s))]), valid.repeat(2, 1)).float()
+                    h = encoder.packed(torch.cat([s, s.gather(1, rev[..., None].expand_as(s))]), valid.repeat(2, 1),
+                                       pos=torch.cat([ps, ps.gather(1, rev[..., None].expand_as(ps))])).float()
                     fb = torch.cat([h[: len(grid)], h[len(grid):].gather(1, rev[..., None].expand(-1, -1, h.shape[-1]))], -1)
                 else:                                                          # one stream: bi = h ++ h
-                    fb = encoder.packed(s, valid).float().repeat(1, 1, 2)
+                    fb = encoder.packed(s, valid, pos=ps).float().repeat(1, 1, 2)
                     if rv:                                                     # the curve from its other end
-                        hr = encoder.packed(s.gather(1, rev[..., None].expand_as(s)), valid).float()
+                        hr = encoder.packed(s.gather(1, rev[..., None].expand_as(s)), valid,
+                                            pos=ps.gather(1, rev[..., None].expand_as(ps))).float()
                         fr = hr.gather(1, rev[..., None].expand(-1, -1, hr.shape[-1])).repeat(1, 1, 2)
             back = order.argsort(1)[..., None]                                 # curve position -> raster
             fb = fb.gather(1, back.expand(-1, -1, fb.shape[-1]))

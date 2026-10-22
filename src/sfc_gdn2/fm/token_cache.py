@@ -138,7 +138,7 @@ def read(encoder, curves, seed, x, sp, k, mm, nmax, block, margin, taps: bool) -
                 xyz = grid_coords(g[None], int(g.prod()))[0]
                 cu = torch.tensor([0, len(t)], device=x.device, dtype=torch.int32)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    h = sum(encoder.flat(t[o], cu).float()[o.argsort()]
+                    h = sum(encoder.flat(t[o], cu, pos=xyz[o]).float()[o.argsort()]
                             for o in (keys(c, xyz, g, seed).argsort() for c in curves)) / len(curves)
                 h = (h if taps else h[:, : encoder.dim]).reshape(*g.tolist(), -1)
                 c0 = [o - a for o, a in zip((o0, o1, o2), lo)]

@@ -323,7 +323,7 @@ class SegNet(nn.Module):
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     x = pe(patchify(vol.float(), kf)[sel], pe.weights(sp.float(), kf))
                     cu1 = torch.tensor([0, len(sel)], device=z.device, dtype=torch.int32)
-                    bf = sum(self.encoder.flat(x[o], cu1).float()[o.argsort()]
+                    bf = sum(self.encoder.flat(x[o], cu1, pos=xyz[sel][o]).float()[o.argsort()]
                              for o in (keys(c, xyz[sel], gf, self.seed).argsort() for c in self.enc_curves)) / len(self.enc_curves)
                 pe.patch_mm = mm0
                 t = t.index_add(0, sel, self.fine_tok[i](self.proj(bf)))

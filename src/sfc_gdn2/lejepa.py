@@ -127,7 +127,7 @@ class LeJEPA(nn.Module):
                  coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False,
                  volume_locals: bool = True, child: int = 0, child_adaptive: bool = False,
                  child_frac: tuple = (0.25, 0.25), child_explore: float = 0.1, child_max: int = 216,
-                 coarse_view: bool = False):
+                 coarse_view: bool = False, tok_visible: float = 0.0, tok_self: float = 0.0):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -140,6 +140,12 @@ class LeJEPA(nn.Module):
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
         self.levels = [int(c) for c in levels]
+        # iBOT++ (TIPSv2, 22/10 screens): token supervision beyond A's masked tokens. tok_visible w: A's visible foreground
+        # tokens also pulled to the same patch in B (cheap; B differs in box, augmentation and curve); tok_self w: view A
+        # read a second time unmasked (same box, augmentation, curve: the generator replayed) and every foreground token of
+        # masked A pulled to its unmasked reading (TIPSv2's setting: same view, context removed). Weight w in the
+        # invariance mean, beside the masked-token term (1); logged as inv_token_vis / inv_token_self(_m, _v).
+        self.tok_visible, self.tok_self = float(tok_visible), float(tok_self)
         self.register_buffer("mask_cells", torch.tensor(mask_cells), persistent=False)
         self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim)
@@ -335,6 +341,7 @@ class LeJEPA(nn.Module):
         rev = 2 * off[tv] + n[tv] - 1 - torch.arange(tot, device=dev)                      # an involution
         late = self.encoder.bidir == "late"                # else one stream, both ways inside the blocks
         seqs, lens2 = (torch.cat([t, t.index_select(0, rev)]), lens + lens) if late else (t, lens)   # fwd, then bwd
+        pseq = torch.cat([vpos, vpos.index_select(0, rev)]) if late else vpos   # patch coordinates (rope3d, dwconv)
         cu = nn.functional.pad((torch.cat([n, n]) if late else n).cumsum(0), (1, 0))
         groups, cur, size = [], [], 0
         for r, ln in enumerate(lens2):     # packed calls of <= max_packed_tokens: GDN-2's backward peak follows the call
@@ -345,9 +352,10 @@ class LeJEPA(nn.Module):
             size += ln
         groups.append(cur)
         ckpt = self.encoder.grad_checkpoint and len(seqs) > self.checkpoint_tokens   # recompute only for big scans
-        parts = seqs.split([sum(lens2[g[0]:g[-1] + 1]) for g in groups])   # split: one cat in backward (slices:
-        h = torch.cat([self.encoder.flat(x, (cu[g[0]:g[-1] + 2] - cu[g[0]]).int(), ckpt)    # a zero-filled [2T,d]
-                       for x, g in zip(parts, groups)])                                   # gradient per call)
+        sizes = [sum(lens2[g[0]:g[-1] + 1]) for g in groups]
+        parts = seqs.split(sizes)                                          # split: one cat in backward (slices:
+        h = torch.cat([self.encoder.flat(x, (cu[g[0]:g[-1] + 2] - cu[g[0]]).int(), ckpt, p)   # a zero-filled [2T,d]
+                       for x, g, p in zip(parts, groups, pseq.split(sizes))])             # gradient per call)
         fwd, bwd = h.split(tot) if late else (h, h)
         bi = torch.cat([fwd, bwd.index_select(0, rev) if late else bwd], -1)   # index_select: backward index_add
         return tv, idx, pxyz, fgv, mask, bi, n, off, lens
@@ -376,12 +384,19 @@ class LeJEPA(nn.Module):
         corner, edge = self.jittered(*self.boxes(fg, xyz, grid, gen), grid, gen)           # [B,G,2,3]
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
         zg, pred, tgt, ztok, tvol, tfg, lens, tops, zc = [], [], [], [], [], [], [], [], []
+        vpred, vtgt, spred, stgt, smask = [], [], [], [], []
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
             c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
             nv, dev = len(c), c.device
             masked = torch.arange(nv, device=dev) % 2 == 0
+            if self.tok_self:   # the same draws again for the unmasked reading
+                gen_self = torch.Generator(gen.device)
+                gen_self.set_state(gen.get_state())
             tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(vols, ws, fg, n_patch, v, c, e, masked, gen)
+            if self.tok_self:   # the target reading, without gradient (TIPSv2's teacher pass; memory as one read)
+                with torch.no_grad():
+                    bi_u = self.read(vols, ws, fg, n_patch, v, c, e, torch.zeros_like(masked), gen_self)[5]
             has = torch.zeros(nv, device=dev).index_add_(0, tv, fgv.float()) > 0
             w = (fgv | ~has[tv]).float()                                                   # foreground (all if none)
             top = torch.zeros(nv, bi.shape[-1], device=dev).index_add_(0, tv, bi.float() * w[:, None]) \
@@ -414,6 +429,15 @@ class LeJEPA(nn.Module):
                 z_b, za = head(bi.index_select(0, ib)).float(), head(xa).float()   # and a perfect one scores > 0
             pred.append(za)
             tgt.append(z_b[j_b[pair]])
+            if self.tok_visible:   # A's visible foreground tokens, paired with B
+                vis = ~mask[ia] & fgv[ia] & (j_b >= 0)
+                vpred.append(head(bi.index_select(0, ia[vis])).float())
+                vtgt.append(z_b[j_b[vis]])
+            if self.tok_self:      # every foreground token of masked A against its unmasked reading
+                fa = fgv[ia]
+                spred.append(head(bi.index_select(0, ia[fa])).float())
+                stgt.append(head(bi_u.index_select(0, ia[fa])).float())
+                smask.append(mask[ia][fa])
             if self.child and part.start == self.gg:
                 child_out = self.sub_blocks(vols, ws, bi, tv, pxyz, ia[pair], c, e, v, gen)
             ztok.append(z_b)
@@ -485,12 +509,24 @@ class LeJEPA(nn.Module):
                 if score_loss is not None:
                     out[f"score_{name}"] = score_loss
                 ch.append(name)
+        extra, w_extra = [], []
+        if self.tok_visible:
+            out["inv_token_vis"] = (torch.cat(vpred) - torch.cat(vtgt)).square().mean() / 4
+            extra.append(out["inv_token_vis"]), w_extra.append(self.tok_visible)
+        if self.tok_self:
+            d = (torch.cat(spred) - torch.cat(stgt)).square().mean(1) / 4
+            m = torch.cat(smask)
+            out["inv_token_self"] = d.mean()
+            out["inv_token_self_m"], out["inv_token_self_v"] = d[m].mean() if m.any() else d.sum() * 0, \
+                d[~m].mean() if (~m).any() else d.sum() * 0
+            extra.append(out["inv_token_self"]), w_extra.append(self.tok_self)
         inv = [inv_g, inv_t, *(out[f"inv_cell{c}"] for c in self.levels), *(out[f"inv_{n}"] for n in [*self.top, *cov]),
-               *(out[f"inv_{n}"] for n in ch)]
+               *(out[f"inv_{n}"] for n in ch), *extra]
         sigs = [sig_g, sig_t, *(out[f"sigreg_cell{c}"] for c in self.levels),
                 *(out[f"sigreg_{n}"] for n in [*self.top, *cov]), *(out[f"sigreg_{n}"] for n in ch)]
-        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), *(self.w_top for _ in [*self.top, *cov]), *(1.0 for _ in ch)]
-        wmean = lambda xs: sum(a * x for a, x in zip(w, xs)) / sum(w)
+        w = [self.w_top, 1.0, *(1.0 for _ in self.levels), *(self.w_top for _ in [*self.top, *cov]), *(1.0 for _ in ch), *w_extra]
+        ws_ = w[: len(sigs)]   # the extra invariances add no SIGReg (their embeddings are the token head's)
+        wmean = lambda xs: sum(a * x for a, x in zip(w if len(xs) == len(w) else ws_, xs)) / sum(w if len(xs) == len(w) else ws_)
         for k, r in (("rec", rec), ("rec_visible", recv)):
             if r:
                 out[k] = (r := torch.cat(r)).sum() / max(len(r), 1)
