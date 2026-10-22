@@ -159,8 +159,9 @@ class SegNet(nn.Module):
         self.c_wpow = 0.0 if self.c_unweighted else float(c_wpow)
         if self.decoder_c:
             CF = 32
-            self.cfield = nn.ModuleList([nn.Linear(encoder.dim, CF), nn.Linear(128, CF), nn.Linear(128, CF)])
-            self.chead = nn.Sequential(nn.Linear(3 * (2 * CF + 3) + 13 if self.c_local else 3 * CF + 7, 128),
+            self.cfield = nn.ModuleList([nn.Linear(encoder.dim, CF)] + [nn.Linear(128, CF) for _ in range(max(2, self.refine))])
+            L = len(self.cfield)
+            self.chead = nn.Sequential(nn.Linear(L * (2 * CF + 3) + 13 if self.c_local else L * CF + 7, 128),
                                        nn.GELU(), nn.Linear(128, 128), nn.GELU(),
                                        nn.Linear(128, n_out))
             if hasattr(self, "coef"):   # the per-cell coefficient output is not used (n_out x rank^3 per cell)
@@ -203,18 +204,20 @@ class SegNet(nn.Module):
         # threshold is set on val (calibrate) so that every foreground class keeps a share r of its voxels per level.
         self.cascade = bool(cascade)
         if self.cascade:
-            assert decoder_c and matryoshka and refine == 2, "cascade: on decoder C2 (decoder_c, matryoshka, refine 2)"
+            # refine 3 (22/10 sera, user): a 2 mm level, read by the frozen encoder live under the mixed 4 mm cells (the
+            # token cache holds 16 / 8 / 4 mm) and kept sparse (a dense 2 mm grid of a 0.5 mm scan: ~1.6e7 cells)
+            assert decoder_c and matryoshka and refine in (2, 3), "cascade: on decoder C2 (decoder_c, matryoshka, refine 2 / 3)"
             lvl = [patch_mm] + self.fine_mm
             self.cj0, self.cjmin = lvl.index(float(cascade_g0)), lvl.index(float(cascade_gmin))
             self.cr, self.ceps, self.crare, self.cneg = float(cascade_r), float(cascade_eps), float(cascade_rare), float(cascade_neg)
-            self.lhead = nn.ModuleList([nn.Linear(encoder.dim, n_out + 1), nn.Linear(128, n_out + 1), nn.Linear(128, n_out + 1)])
+            self.lhead = nn.ModuleList([nn.Linear(encoder.dim, n_out + 1)] + [nn.Linear(128, n_out + 1) for _ in range(refine)])
             # buffers, saved with the trained state: the levels' thresholds (set on val), the training tiles' voxel counts
             # per class (rare classes) and cell-target counts (class weights, frequency^-0.5)
-            self.register_buffer("taus", torch.full((3,), 0.5))
+            self.register_buffer("taus", torch.full((refine + 1,), 0.5))
             self.register_buffer("cfreq", torch.zeros(n_out))
             self.register_buffer("tcount", torch.zeros(n_out + 1))
         if self.matryoshka:
-            assert (self.cache is not None or self.cascade) and self.kernel and self.refine == 2, \
+            assert (self.cache is not None or self.cascade) and self.kernel and (self.refine == 2 or self.cascade), \
                 "matryoshka decoding: token cache, F, refine 2"
             self.head16, self.head8, self.head4 = nn.Linear(encoder.dim, n_out), nn.Linear(128, n_out), nn.Linear(128, n_out)
         if self.adaptive:
@@ -224,7 +227,8 @@ class SegNet(nn.Module):
             self.cache.levels = (16.0, 8.0, 4.0)
             if fine_pca:   # the fine levels' tokens on token_cache.project's PCA basis: fine_tok reads them directly
                 self.cache.pca = int(fine_pca)
-                self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) for _ in range(self.refine))
+                self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) if i < 2 else nn.Linear(encoder.dim, 128)
+                                              for i in range(self.refine))   # 2 mm: not cached, read live
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor, levels: bool = False, stop: int | None = None):
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
@@ -307,7 +311,9 @@ class SegNet(nn.Module):
     def fine_dims(self, sp, i) -> list:
         """Voxels per axis of a level-i fine cell: the cache's nested grids (k4 x 2^(1-i)), else the level's patch."""
         from ..data.volume import patch_dims
-        return [a * 2 ** (1 - i) for a in self._cur[2]] if self._cur else patch_dims(sp.tolist(), self.fine_mm[i])
+        if self._cur:
+            return [a * 2 ** (1 - i) for a in self._cur[2]] if i < 2 else [max(1, round(a / 2)) for a in self._cur[2]]
+        return patch_dims(sp.tolist(), self.fine_mm[i])
 
     def to_fine(self, z, vol, sp, k, g, i, keep=None, zmap=None):
         """Tokens [N, c] on grid g -> the fine level's inputs [Nf, 128] on the grid of half the patch (parent token +
@@ -325,7 +331,7 @@ class SegNet(nn.Module):
         pidx = (par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]
         t = self.up[i](z)[pidx if zmap is None else zmap[pidx]]
         sub = (lambda a: a) if keep is None else (lambda a: a[keep])
-        if self._cur is not None and self.fine_tok is not None:   # fine_encoder from the cache: the whole-scan reading
+        if self._cur is not None and self.fine_tok is not None and i < 2:   # fine_encoder from the cache: the whole-scan reading
             ci, corner, _ = self._cur                                 # of this level, last block ++ taps as at 16 mm
             tf = self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float()
             tf = sub(tf)
@@ -562,11 +568,11 @@ class SegNet(nn.Module):
     def c_logits(self, lv, vol, pts):
         """Point head at voxels pts [P, 3] of this tile / scan: the three levels' fields + the local intensities."""
         fs = []
-        for j in range(3):
+        for j in range(len(self.cfield)):
             C = self.cfield[j].out_features
             if j < len(lv):
                 z, k, g = lv[j]
-                f = self.cfield[j](z.float())
+                f = _Proj(z, self.cfield[j]) if isinstance(z, SparseLevel) else self.cfield[j](z.float())
                 fs.append(_c_field(f, g, k, pts))
                 if self.c_local:
                     fs += list(_c_local(f, g, k, pts))
@@ -635,11 +641,16 @@ class SegNet(nn.Module):
         par = torch.minimum(((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(kp, device=dev)).long(),
                             torch.tensor(gp, device=dev) - 1)
         pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
-        dense = self.up[i](zd)[pidx]
         keep = read[pidx].nonzero()[:, 0]
+        tk = None
         if len(keep):
             t, xyzk, gft, _ = self.to_fine(zd, vol, sp, kp, gp, i, keep=keep)
-            dense = dense.index_copy(0, keep, self.fine_mix([t], [xyzk], [gft], i)[0].to(dense.dtype))
+            tk = self.fine_mix([t], [xyzk], [gft], i)[0]
+        if i == 2:   # the last level (2 mm): only the read cells (their 27 neighbours are read too: the ring)
+            return SparseLevel(keep, tk if tk is not None else zd.new_zeros(0, 128), zd, pidx, self.up[i]), kf, gf, pidx
+        dense = self.up[i](zd)[pidx]
+        if tk is not None:
+            dense = dense.index_copy(0, keep, tk.to(dense.dtype))
         return dense, kf, gf, pidx
 
     def _cstart(self, z16, k16, g16, vol, sp, cur, yy=None) -> dict:
@@ -717,7 +728,7 @@ class SegNet(nn.Module):
         mixed + predicted ones), unweighted."""
         st, V, sp = self(x, ctx, levels=True, stop=0)
         add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
-        fin, aux = None, [None, None, None]
+        fin, aux = None, [None] * len(self.lhead)
         for b, (z, k, g, _, cur) in enumerate(st):
             yy, vol = y[b, : V[b][0], : V[b][1], : V[b][2]], x[b, 0, : V[b][0], : V[b][1], : V[b][2]]
             ok = yy < n_out
@@ -791,7 +802,8 @@ class SegNet(nn.Module):
         calibration. Threshold: the lowest (fewest cells read further) at which every foreground class keeps a share r
         of its voxels at that level (lost: a cell filled with another class). States wait on the CPU between levels."""
         dev = self.taus.device
-        mv = lambda o, d: o.to(d) if torch.is_tensor(o) else [mv(t, d) for t in o] if isinstance(o, (list, tuple)) else o
+        mv = lambda o, d: o.to(d) if torch.is_tensor(o) or isinstance(o, SparseLevel) else \
+            [mv(t, d) for t in o] if isinstance(o, (list, tuple)) else o
         tot = sum(torch.bincount(v["y"][v["y"] < n_out].flatten().long(), minlength=n_out).float() for v in vols).to(dev)
         fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
         try:
@@ -1013,6 +1025,40 @@ def _c_points(yy: torch.Tensor, k: int, n: int, gen=None, region: torch.Tensor |
     if not idx:
         return torch.zeros(0, dtype=torch.long, device=dev), torch.zeros(0, device=dev)
     return torch.cat(idx), torch.cat(w)
+
+
+class SparseLevel:
+    """A level's tokens kept only where read: rows `keep` (sorted dense indices on the level's grid) -> t [n, 128];
+    any other cell its parent's token through `up` (parent tokens zp dense, pidx: every cell's parent). Indexed like
+    the dense tensor (z[idx]), len = the grid's cells."""
+
+    def __init__(self, keep, t, zp, pidx, up):
+        self.keep, self.t, self.zp, self.pidx, self.up = keep, t, zp, pidx, up
+        self.device = t.device
+
+    def __len__(self):
+        return len(self.pidx)
+
+    def __getitem__(self, idx):
+        pos = torch.searchsorted(self.keep, idx).clamp_max(max(len(self.keep) - 1, 0))
+        hit = (self.keep[pos] == idx) if len(self.keep) else torch.zeros_like(idx, dtype=torch.bool)
+        out = self.up(self.zp[self.pidx[idx]]).to(self.t.dtype) if not bool(hit.all()) else None
+        if out is None:
+            return self.t[pos]
+        return torch.where(hit[:, None], self.t[pos] if len(self.t) else out, out) if len(self.t) else out
+
+    def to(self, d):
+        return SparseLevel(*(a.to(d) for a in (self.keep, self.t, self.zp, self.pidx)), self.up)
+
+
+class _Proj:
+    """cfield over a SparseLevel, gathered on demand (decoder C's fields index the cells they need)."""
+
+    def __init__(self, z, lin):
+        self.z, self.lin, self.device = z, lin, z.device
+
+    def __getitem__(self, idx):
+        return self.lin(self.z[idx].float())
 
 
 def _blocks(cell: torch.Tensor, g, k, S) -> torch.Tensor:
