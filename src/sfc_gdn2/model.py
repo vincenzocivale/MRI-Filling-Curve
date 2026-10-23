@@ -381,7 +381,7 @@ class Encoder(nn.Module):
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
                  grad_checkpoint: bool = False, patch_mm: float = 16.0, view_pos: bool = False, bidir: str = "late",
                  long_mem: dict | None = None, attn_every: int = 0, attn_rope: bool = False, attn_insert: int = 0,
-                 norm: str = "layer", hc: int = 0, rope3d: str = "", dwconv: bool = False, **embed):
+                 norm: str = "layer", hc: int = 0, rope3d: str = "", dwconv: bool | str = False, **embed):
         super().__init__()
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
@@ -426,7 +426,12 @@ class Encoder(nn.Module):
                     b.rope3d = self.rope3d
                 elif rope3d == "all":
                     b.add_rope(self.rope3d)
-        self.dw = TokenConv3D(d_model) if dwconv else None
+        # dwconv "attn" (23/10, user: CPE where PTv3 / CPVT put it): a TokenConv3D on the residual stream before each
+        # attention block instead of on the input tokens
+        assert dwconv in (False, True, "attn"), dwconv
+        self.dw = TokenConv3D(d_model) if dwconv is True else None
+        self.cpe = nn.ModuleDict({str(i): TokenConv3D(d_model) for i, b in enumerate(self.blocks)
+                                  if isinstance(getattr(b, "block", b), AttnBlock)}) if dwconv == "attn" else None
 
     @classmethod
     def from_config(cls, cfg: dict) -> Encoder:
@@ -452,7 +457,10 @@ class Encoder(nn.Module):
         taps = [x] * self.taps.count(-1)  # -1: the input tokens (patch embedding)
         if self.hc:                                       # n identical residual streams (mHC); read out as their mean
             x = x.unsqueeze(-2).expand(*x.shape[:-1], self.hc, x.shape[-1]).contiguous()
+        cu = cu_seqlens if cu_seqlens is not None else torch.tensor([0, x.shape[1]], device=x.device, dtype=torch.int32)
         for i, block in enumerate(self.blocks):
+            if self.cpe is not None and pos is not None and str(i) in self.cpe and not self.hc:
+                x = x + checkpoint(self.cpe[str(i)], x[0], pos, cu, use_reentrant=False)[None]
             r = rev if self.bidir == "block" or self.reads_back[i] else None
             x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", pos, use_reentrant=False) if ckpt and self.training
                  else block(x, cu_seqlens, r, self.bidir == "block", pos))
