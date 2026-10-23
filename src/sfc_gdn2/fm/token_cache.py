@@ -172,7 +172,7 @@ def main(path: str) -> None:
         x, sp = r["x"].cuda(), r["ctx"].float().cuda()
         k4 = patch_dims(sp.tolist(), 4.0)
         for mm, m in LEVELS:
-            if mm < 8 and not fine_ok([kk * m for kk in k4]):
+            if mm < float(job.get("min_mm", 4)) or mm < 8 and not fine_ok([kk * m for kk in k4]):   # min_mm 8: fine_live4
                 continue
             a = read(enc, curves, seed, x, sp, [kk * m for kk in k4], mm, job.get("nmax", 200_000),
                      job.get("block", 64), job.get("margin", 8), taps=True)

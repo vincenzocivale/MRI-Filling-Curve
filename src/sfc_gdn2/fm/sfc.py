@@ -66,7 +66,7 @@ class SegNet(nn.Module):
                  c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
                  cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2,
-                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_eval=(8, 8, 16, 16)):
+                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_eval=(8, 8, 16, 16), fine_live4: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -252,12 +252,16 @@ class SegNet(nn.Module):
         if self.adaptive:
             assert self.cache is not None and self.kernel and self.refine, "adaptive decoding: token cache and decoder F"
             self.cellhead = nn.Linear(128, n_out)   # one prediction per cell of the finest level
+        # fine_live4 (24/10, user: C2h dropped, the cascade reads 4 mm only under its chosen cells): the 4 mm level read by
+        # the frozen encoder live like 2 mm, the cache holding 16 / 8 mm only (no 4 mm files, no 4 mm PCA)
+        self.ncached = 1 if fine_live4 else 2
+        assert not fine_live4 or self.cascade, "fine_live4: the cascade only (C2h reads every 4 mm cell)"
         if self.cache is not None and getattr(self, "fine_tok", None) is not None:
-            self.cache.levels = (16.0, 8.0, 4.0)
+            self.cache.levels = (16.0, 8.0, 4.0)[: 1 + self.ncached]
             if fine_pca:   # the fine levels' tokens on token_cache.project's PCA basis: fine_tok reads them directly
                 self.cache.pca = int(fine_pca)
-                self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) if i < 2 else nn.Linear(encoder.dim, 128)
-                                              for i in range(self.refine))   # 2 mm: not cached, read live
+                self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) if i < self.ncached else nn.Linear(encoder.dim, 128)
+                                              for i in range(self.refine))   # not cached: read live
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor, levels: bool = False, stop: int | None = None):
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
@@ -362,7 +366,7 @@ class SegNet(nn.Module):
         t_par = t
         sub = (lambda a: a) if keep is None else (lambda a: a[keep])
         live = isinstance(self.cache, LiveCache)
-        if self._cur is not None and self.fine_tok is not None and (i < 2 or live):   # fine_encoder from the cache: the
+        if self._cur is not None and self.fine_tok is not None and (i < self.ncached or live):   # fine_encoder from the cache: the
             ci, corner, _ = self._cur                     # whole-scan reading of this level, last block ++ taps as at 16 mm
             if live:   # only the cells asked for, read (once) in their fixed blocks
                 tf = self.cache.tokens_at(ci, float(self.fine_mm[i]), corner, gf.tolist(), kf, keep).to(z.device).float()
@@ -1433,7 +1437,8 @@ class SFC(Wrapper):
                      cascade_topk=int(self.args.get("cascade_topk") or 2),
                      fine_split=bool(self.args.get("fine_split")), fine_head=self.args.get("fine_head") or "mix",
                      cascade_warm=int(self.args.get("cascade_warm") or 0),
-                     cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16))
+                     cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16),
+                     fine_live4=bool(self.args.get("fine_live4")))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
