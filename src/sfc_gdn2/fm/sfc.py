@@ -65,7 +65,7 @@ class SegNet(nn.Module):
                  level2: bool = False, decoder_c: bool = False, c_points: int = 32768, c_local: bool = False,
                  c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
-                 cascade_rare: float = 1e-3, cascade_neg: float = 2.0):
+                 cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -210,6 +210,9 @@ class SegNet(nn.Module):
             lvl = [patch_mm] + self.fine_mm
             self.cj0, self.cjmin = lvl.index(float(cascade_g0)), lvl.index(float(cascade_gmin))
             self.cr, self.ceps, self.crare, self.cneg = float(cascade_r), float(cascade_eps), float(cascade_rare), float(cascade_neg)
+            # landmarks (23/10, user: "si legge solo 8 celle a 2 mm"): segrun sets self.landmark; per level and landmark the
+            # head's top cascade_topk cells (+ the true one in training) go down, the point head maps the last ones
+            self.ctopk = int(cascade_topk)
             self.lhead = nn.ModuleList([nn.Linear(encoder.dim, n_out + 1)] + [nn.Linear(128, n_out + 1) for _ in range(refine)])
             # buffers, saved with the trained state: the levels' thresholds (set on val), the training tiles' voxel counts
             # per class (rare classes) and cell-target counts (class weights, frequency^-0.5)
@@ -847,6 +850,105 @@ class SegNet(nn.Module):
         finally:
             self.fine_seg = fs
 
+    # ------------------------------------------------------------- landmark cascade (23/10, heatmap regression)
+    def _lm_levels(self, z, k, g, vol, sp, cur, n_out, pts=None):
+        """A tile / scan down the levels for landmarks: at each level the head's logits [cells, landmarks] on the candidate
+        cells, the top ctopk cells per landmark (+ the true cell, pts [landmarks, 3] voxels or NaN, in training) go down:
+        their children are read with a ring of one cell. -> lv, [(logits, targets or None)], the last level's chosen cells
+        (dense mask), its dims and grid."""
+        self._cur = cur
+        L = 1 + sum(1 for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
+        jmin = min(self.cjmin, L - 1)
+        lv, info = [(z, k, g)], []
+        inside = (patchify_any(vol, k).abs().sum(1) > 0)[: len(z)]
+        cand = inside
+        for j in range(jmin + 1):
+            ci = cand.nonzero()[:, 0]
+            lg = self.lhead[j](z[ci])[:, 1:n_out].float()
+            sel = torch.zeros(len(z), dtype=torch.bool, device=ci.device)
+            tgt = None
+            if pts is not None:
+                kk, gg = torch.tensor(k, device=ci.device), torch.tensor(g, device=ci.device)
+                ok = ~pts.isnan().any(1)
+                cell = torch.minimum((pts[ok] // kk).long(), gg - 1)
+                cell = (cell[:, 0] * g[1] + cell[:, 1]) * g[2] + cell[:, 2]
+                row = torch.full((len(z),), -1, dtype=torch.long, device=ci.device)
+                row[ci] = torch.arange(len(ci), device=ci.device)
+                tgt = torch.zeros_like(lg)
+                for c, r in zip(ok.nonzero()[:, 0].tolist(), row[cell].tolist()):
+                    if r >= 0:
+                        tgt[r, c] = 1
+                sel[cell] = True
+            top = lg.detach().topk(min(self.ctopk, len(ci)), 0).indices.flatten()
+            sel[ci[top]] = True
+            info.append((lg, tgt))
+            if j == jmin:
+                return lv, info, sel, k, g
+            zf, kf, gf, pidx = self._level_sparse(z, k, g, vol, sp, j, self._dilate(sel, g) & inside)
+            lv.append((zf, list(kf), gf))
+            inside = (patchify_any(vol, kf).abs().sum(1) > 0)[: len(pidx)]
+            cand, z, k, g = sel[pidx] & inside, zf, kf, gf
+
+    def _lm_region(self, sel, k, g, S):
+        """The voxels [P, 3] of the chosen last-level cells and their ring of one cell."""
+        return _blocks(self._dilate(sel, g), g, k, S).nonzero()
+
+    @staticmethod
+    def _focal(logits, h):
+        """CenterNet's penalty-reduced focal loss (segrun.focal_heatmap) of logits against heatmap targets h."""
+        pos = h > 0.999
+        lp, ln = F.logsigmoid(logits), F.logsigmoid(-logits)
+        p = lp.exp()
+        neg = (p ** 2 * (1 - h) ** 4 * ln)[~pos]
+        if not pos.any():
+            return -neg.mean()
+        return -(((1 - p) ** 2 * lp)[pos].sum() + neg.sum()) / pos.sum()
+
+    def landmark_sums(self, x, h, ctx, n_out):
+        """Training on landmark heatmaps h [B, landmarks, *T] (segrun.heatmaps: 1 at each landmark's voxel): the level
+        heads (balanced BCE: the cell holding the landmark against the other candidates) and the point head's focal loss
+        on the voxels of the cells reached and their ring."""
+        st, V, sp = self(x, ctx, levels=True, stop=0)
+        loss = 0.0
+        for b, (z, k, g, _, cur) in enumerate(st):
+            vol, hb = x[b, 0, : V[b][0], : V[b][1], : V[b][2]], h[b, :, : V[b][0], : V[b][1], : V[b][2]].float()
+            pts = torch.full((hb.shape[0], 3), float("nan"), device=x.device)
+            for c in range(hb.shape[0]):
+                w = (hb[c] > 0.999).nonzero()
+                if len(w):
+                    pts[c] = w[0].float()
+            lv, info, sel, kl, gl = self._lm_levels(z, k, g, vol, sp[b], cur, n_out, pts)
+            for lg, tgt in info:
+                pos = tgt > 0
+                ll = -F.logsigmoid(-lg)[~pos].mean()
+                if pos.any():
+                    ll = ll - F.logsigmoid(lg)[pos].mean()
+                loss = loss + self.head_w * ll
+            q = self._lm_region(sel, kl, gl, vol.shape)
+            if len(q) > (1 << 16):
+                q = q[torch.randperm(len(q), device=q.device)[: 1 << 16]]
+            lg = self.c_logits(lv, vol, q)[:, 1:n_out].float()
+            loss = loss + self._focal(lg, hb[:, q[:, 0], q[:, 1], q[:, 2]].T)
+        return loss / len(st)
+
+    @torch.no_grad()
+    def landmark_predict(self, x, ctx, n_out):
+        """A whole scan -> heatmaps [n_out, *S] (sigmoid; 0 outside the cells reached): segrun.landmark takes each map's
+        maximum."""
+        dev, S = x.device, tuple(x.shape[1:])
+        fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
+        try:
+            z, k, g, cur, sp = self._whole(x, ctx)
+            lv, _, sel, kl, gl = self._lm_levels(z, k, g, x[0], sp, cur, n_out)
+            out = torch.zeros(n_out, *S, dtype=torch.half, device=dev)
+            q = self._lm_region(sel, kl, gl, S)
+            for qq in q.split(1 << 18):
+                out[1:, qq[:, 0], qq[:, 1], qq[:, 2]] = self.c_logits(lv, x[0], qq)[:, 1:n_out].float().sigmoid().T.half()
+            self.last_refined = float(len(q) / math.prod(S))
+            return out
+        finally:
+            self.fine_seg = fs
+
     # --------------------------------------------------------------------------------- matryoshka decoding (21/10)
     def _hist(self, lab, val, n_out):
         return torch.zeros(len(lab), n_out, device=lab.device).scatter_add_(1, lab, val.float())
@@ -1244,7 +1346,8 @@ class SFC(Wrapper):
                      cascade_r=float(self.args.get("cascade_r") or 0.995),
                      cascade_eps=float(self.args.get("cascade_eps", 0.01)),
                      cascade_rare=float(self.args.get("cascade_rare", 1e-3)),
-                     cascade_neg=float(self.args.get("cascade_neg") or 2.0))
+                     cascade_neg=float(self.args.get("cascade_neg") or 2.0),
+                     cascade_topk=int(self.args.get("cascade_topk") or 2))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

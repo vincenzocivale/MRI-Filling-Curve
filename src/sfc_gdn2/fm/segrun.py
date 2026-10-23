@@ -140,6 +140,9 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) 
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
     on that grid (token cache), the volume padded so that the last tile ends on it."""
     lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
+    if lm and getattr(net, "cascade", False) and ctx is not None:   # our landmark cascade: whole scan, coarse to fine
+        with amp():
+            return net.landmark_predict(x, ctx.to(x.device), n_out)
     if getattr(net, "matryoshka", False) and ctx is not None and not lm:   # the whole scan in one pass (no tiles)
         with amp():
             return net.matryoshka_predict(x, ctx.to(x.device), n_out)
@@ -227,8 +230,12 @@ def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
     tot = 0.0
     for xi, yi, ci in parts:
         with amp():
-            lg = call(net, xi.to(dev).float(), ci)
-        loss = focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) / len(parts)
+            if getattr(net, "cascade", False):   # our landmark cascade: levels + point head on the cells reached
+                loss = net.landmark_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), yi.shape[1] + 1) / len(parts)
+            else:
+                lg = call(net, xi.to(dev).float(), ci)
+        if not getattr(net, "cascade", False):
+            loss = focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) / len(parts)
         loss.backward()
         tot += float(loss)
     return torch.tensor(tot)
@@ -609,7 +616,7 @@ def train(job: dict) -> None:
             sched.step()
             if it % every == 0 or it == iters:
                 net.eval()
-                if getattr(net, "cascade", False):   # one pass: the levels' thresholds on val and the val predictions
+                if getattr(net, "cascade", False) and not LM:   # one pass: the levels' thresholds on val and the val predictions
                     preds = net.cascade_val(val_v, k, amp)
                 else:   # probabilities kept for the landmark tasks (a point per landmark from each class's map)
                     preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).to(dev)
