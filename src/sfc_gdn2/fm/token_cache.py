@@ -252,3 +252,113 @@ def project(path: str) -> None:
 
 if __name__ == "__main__":
     project(sys.argv[2]) if sys.argv[1] == "project" else main(sys.argv[1])
+
+
+class LiveCache:
+    """The TokenCache interface computed in the job, lazily (23/10, user: no separate cache job, the tokens read when
+    needed and kept). 16 mm: the whole scan read once per volume (as main()). Finer levels: in fixed blocks, the cells
+    owned by one 16 mm cell (those whose first voxel lies in it), read with a ring of one 16 mm cell of context (a ~48 mm
+    cube): a token depends only on its volume and block, the same in training, val and test, and is read once.
+    `inputs`: the segdec input cache (<id>.pt); `net`: the SegNet (its frozen encoder, curves, seed, taps)."""
+
+    def __init__(self, inputs: str | Path, net):
+        from collections import OrderedDict
+        self.inputs, self.net, self.ids, self.levels, self.pca = Path(inputs), net, [], (16.0,), None
+        self._vol, self._t16, self._blk, self._meta = {}, {}, OrderedDict(), {}
+        # blocks kept least recently used first, at most SFC_LIVE_GB (an untrained cascade asks for nearly every block:
+        # 4096-dim 2 mm tokens of every volume went past 120 GB of host memory, 23/10); evicted ones are read again
+        self._cap, self._bytes = float(os.environ.get("SFC_LIVE_GB", "40")) * 2 ** 30, 0
+
+    def _load(self, i: str):
+        if i not in self._vol:
+            r = torch.load(self.inputs / f"{i}.pt", map_location="cpu", weights_only=False)
+            self._vol[i] = (r["x"], r["ctx"].float())
+        return self._vol[i]
+
+    def meta(self, i: str) -> dict:
+        if i not in self._meta:
+            from ..data.volume import patch_dims
+            x, sp = self._load(i)
+            self._meta[i] = {"k4": list(patch_dims(sp[:3].tolist(), 4.0)), "shape": list(x.shape[1:])}
+        return self._meta[i]
+
+    def next_batch(self, keep: int = 1) -> None:
+        pass
+
+    def prefetch(self, ctx, T) -> None:
+        pass
+
+    def _read(self, i, x, mm, k):
+        enc = self.net.encoder
+        mm0 = enc.patch_embed.patch_mm
+        try:
+            dev = next(enc.parameters()).device
+            sp = self._load(i)[1][:3].to(dev)
+            return read(enc, self.net.enc_curves, self.net.seed, x.to(dev), sp, k, mm, 200_000, 64, 8, taps=True)
+        finally:
+            enc.patch_embed.patch_mm = mm0
+
+    def _block(self, i, mm, kf, b):
+        """The tokens [*owned, C] of the level-mm cells owned by 16 mm cell b (k16 voxels per axis), and their range."""
+        key = (i, mm, tuple(kf), b)
+        if key in self._blk:
+            self._blk.move_to_end(key)
+        else:
+            x, _ = self._load(i)
+            k16 = [4 * a for a in self.meta(i)["k4"]]
+            S = x.shape[1:]
+            G = [-(-s // k) for s, k in zip(S, kf)]
+            lo = [-(-bb * a // k) for bb, a, k in zip(b, k16, kf)]                    # owned cells [lo, hi)
+            hi = [min(-(-(bb + 1) * a // k), g) for bb, a, k, g in zip(b, k16, kf, G)]
+            ring = [-(-a // k) for a, k in zip(k16, kf)]
+            c0 = [max(0, l - r) for l, r in zip(lo, ring)]                             # context cells [c0, c1)
+            c1 = [min(g, h + r) for h, r, g in zip(hi, ring, G)]
+            box = x[(slice(None), *(slice(a * k, b_ * k) for a, b_, k in zip(c0, c1, kf)))]
+            t = self._read(i, box, mm, kf)
+            own = np.ascontiguousarray(t[tuple(slice(l - a, h - a) for l, h, a in zip(lo, hi, c0))])
+            self._blk[key] = (own, lo, hi)
+            self._bytes += own.nbytes
+            while self._bytes > self._cap and len(self._blk) > 1:
+                self._bytes -= self._blk.popitem(last=False)[1][0].nbytes
+        return self._blk[key]
+
+    def tokens_at(self, i: str, mm: float, corner, n, k, keep=None) -> torch.Tensor:
+        """The tile's level-mm cells (grid n from corner, raster), only rows `keep` if given -> [rows, C] float16."""
+        k = [int(a) for a in k]
+        if mm >= 16:
+            if i not in self._t16:
+                self._t16[i] = self._read(i, self._load(i)[0], 16.0, k)
+            full = self._t16[i]
+            c0 = [int(c) // kk for c, kk in zip(corner, k)]
+            out = np.zeros((*n, full.shape[-1]), np.float16)
+            c1 = [min(c + m, s) for c, m, s in zip(c0, n, full.shape[:3])]
+            if all(b > a for a, b in zip(c0, c1)):
+                out[: c1[0] - c0[0], : c1[1] - c0[1], : c1[2] - c0[2]] = full[c0[0]: c1[0], c0[1]: c1[1], c0[2]: c1[2]]
+            t = torch.from_numpy(out.reshape(-1, out.shape[-1]))
+            return t if keep is None else t[keep.cpu()]
+        k16 = [4 * a for a in self.meta(i)["k4"]]
+        n = [int(a) for a in n]
+        rows = torch.arange(int(np.prod(n))) if keep is None else keep.cpu()
+        g = torch.stack([rows // (n[1] * n[2]), rows // n[2] % n[1], rows % n[2]], 1)
+        g = g + torch.tensor([int(c) // kk for c, kk in zip(corner, k)])               # global cell coordinates
+        S = self.meta(i)["shape"]
+        G = torch.tensor([-(-s // kk) for s, kk in zip(S, k)])
+        inside = (g < G).all(1)
+        blk = (g * torch.tensor(k)) // torch.tensor(k16)                                 # owner: the first voxel's cell
+        C = None
+        out = None
+        for b in torch.unique(blk[inside], dim=0).tolist():
+            t, lo, _ = self._block(i, mm, k, tuple(b))
+            if out is None:
+                C = t.shape[-1]
+                out = np.zeros((len(rows), C), np.float16)
+            sel = (inside & (blk == torch.tensor(b)).all(1)).nonzero()[:, 0]
+            loc = g[sel] - torch.tensor(lo)
+            out[sel.numpy()] = t[loc[:, 0].numpy(), loc[:, 1].numpy(), loc[:, 2].numpy()]
+        if out is None:
+            C = self.net.encoder.dim * (1 + len(self.net.encoder.taps))
+            out = np.zeros((len(rows), C), np.float16)
+        return torch.from_numpy(out)
+
+    def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
+        return self.tokens_at(i, mm, corner, n, k)

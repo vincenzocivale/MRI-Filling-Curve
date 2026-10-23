@@ -29,7 +29,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .base import Image, Wrapper
-from .token_cache import TokenCache, fine_ok
+from .token_cache import LiveCache, TokenCache, fine_ok
 
 SEG_PATCH = (160, 160, 160)   # voxels, as the Primus / nnFoundation ViT runs
 MIX_MAX = 1 << 19   # tokens per refine-block call (fine_mix)
@@ -66,7 +66,7 @@ class SegNet(nn.Module):
                  c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
                  cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2,
-                 fine_split: bool = False, fine_head: str = "mix"):
+                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -187,7 +187,10 @@ class SegNet(nn.Module):
                 self.kgate.bias[: self.kskip] = 1.0   # a = 1, b = 0, g = 0
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
         # every decoder can read the cached whole-scan tokens (20/10)
-        self.cache, self._cur, self.width = (TokenCache(token_cache) if token_cache else None), None, width
+        # token_cache "live:<segdec inputs>" (23/10, user): LiveCache, the tokens read in the job when first needed and kept
+        self.cache = (LiveCache(token_cache[5:], self) if str(token_cache).startswith("live:") else TokenCache(token_cache)) \
+            if token_cache else None
+        self._cur, self.width = None, width
         # adaptive (21/10, notes/adaptive_decoding.md): a per-cell head on the whole scan's 16 mm tokens, the finer
         # levels only on the cells it is unsure of (+ GT edges and a random share in training), loss on points
         self.adaptive, self.tau = bool(adaptive), float(refine_tau)
@@ -214,6 +217,11 @@ class SegNet(nn.Module):
             # landmarks (23/10, user: "si legge solo 8 celle a 2 mm"): segrun sets self.landmark; per level and landmark the
             # head's top cascade_topk cells (+ the true one in training) go down, the point head maps the last ones
             self.ctopk = int(cascade_topk)
+            # cascade_warm W (23/10, user): the first W training iterations (and the val passes among them) stop at 4 mm;
+            # the 2 mm level is read once the heads choose the cells (an untrained head marks nearly every cell mixed)
+            self.cwarm = int(cascade_warm)
+            if self.cwarm:   # training calls, saved (a resume keeps it); only then: older saved states have no such key
+                self.register_buffer("it_seen", torch.zeros((), dtype=torch.long))
             self.lhead = nn.ModuleList([nn.Linear(encoder.dim, n_out + 1)] + [nn.Linear(128, n_out + 1) for _ in range(refine)])
             # buffers, saved with the trained state: the levels' thresholds (set on val), the training tiles' voxel counts
             # per class (rare classes) and cell-target counts (class weights, frequency^-0.5)
@@ -347,10 +355,13 @@ class SegNet(nn.Module):
         t = self.up[i](z)[pidx if zmap is None else zmap[pidx]]
         t_par = t
         sub = (lambda a: a) if keep is None else (lambda a: a[keep])
-        if self._cur is not None and self.fine_tok is not None and i < 2:   # fine_encoder from the cache: the whole-scan reading
-            ci, corner, _ = self._cur                                 # of this level, last block ++ taps as at 16 mm
-            tf = self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float()
-            tf = sub(tf)
+        live = isinstance(self.cache, LiveCache)
+        if self._cur is not None and self.fine_tok is not None and (i < 2 or live):   # fine_encoder from the cache: the
+            ci, corner, _ = self._cur                     # whole-scan reading of this level, last block ++ taps as at 16 mm
+            if live:   # only the cells asked for, read (once) in their fixed blocks
+                tf = self.cache.tokens_at(ci, float(self.fine_mm[i]), corner, gf.tolist(), kf, keep).to(z.device).float()
+            else:
+                tf = sub(self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float())
             t = t + self.fine_tok[i](tf if self.cache.pca else self.proj(tf))
         elif self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
             if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
@@ -693,11 +704,16 @@ class SegNet(nn.Module):
             dense = dense.index_copy(0, keep, tk.to(dense.dtype))
         return dense, kf, gf, pidx
 
+    def _jmin(self, sp) -> int:
+        """The last level read: g_min, the finest level whose cells hold >= 8 voxels, and 4 mm during the warm-up."""
+        L = 1 + sum(1 for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
+        j = min(self.cjmin, L - 1)
+        return min(j, 2) if self.cwarm and int(self.it_seen) <= self.cwarm else j
+
     def _cstart(self, z16, k16, g16, vol, sp, cur, yy=None) -> dict:
         """A tile / scan's state at the top of the cascade (its 16 mm tokens)."""
         self._cur = cur
-        L = 1 + sum(1 for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
-        jmin = min(self.cjmin, L - 1)
+        jmin = self._jmin(sp)
         return {"vol": vol, "sp": sp, "cur": cur, "yy": yy, "j": 0, "jmin": jmin, "j0": min(self.cj0, jmin),
                 "z": z16, "k": k16, "g": g16, "lv": [(z16, k16, g16)], "info": [], "fill": [], "S": None, "done": False,
                 "cand": torch.ones(len(z16), dtype=torch.bool, device=z16.device)}
@@ -766,6 +782,8 @@ class SegNet(nn.Module):
         """Training (encoder frozen): the level heads on their candidate cells (weighted CE + soft Dice, targets pure k /
         mixed, weights frequency^-0.5), the point head on stratified voxels of the cells still mixed at g_min (true
         mixed + predicted ones), unweighted."""
+        if self.cwarm:
+            self.it_seen += 1
         st, V, sp = self(x, ctx, levels=True, stop=0)
         add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
         fin, aux = None, [None] * len(self.lhead)
@@ -894,8 +912,7 @@ class SegNet(nn.Module):
         their children are read with a ring of one cell. -> lv, [(logits, targets or None)], the last level's chosen cells
         (dense mask), its dims and grid."""
         self._cur = cur
-        L = 1 + sum(1 for i in range(self.refine) if i == 0 or fine_ok(self.fine_dims(sp, i)))
-        jmin = min(self.cjmin, L - 1)
+        jmin = self._jmin(sp)
         lv, info = [(z, k, g)], []
         inside = (patchify_any(vol, k).abs().sum(1) > 0)[: len(z)]
         cand = inside
@@ -947,6 +964,8 @@ class SegNet(nn.Module):
         on the voxels of the cells reached and their ring."""
         if not self.cascade:   # decoder C2: every level on the whole tile, the point head near the landmarks + anywhere
             return self._lm_c_sums(x, h, ctx, n_out)
+        if self.cwarm:
+            self.it_seen += 1
         st, V, sp = self(x, ctx, levels=True, stop=0)
         loss = 0.0
         for b, (z, k, g, _, cur) in enumerate(st):
@@ -1405,7 +1424,8 @@ class SFC(Wrapper):
                      cascade_rare=float(self.args.get("cascade_rare", 1e-3)),
                      cascade_neg=float(self.args.get("cascade_neg") or 2.0),
                      cascade_topk=int(self.args.get("cascade_topk") or 2),
-                     fine_split=bool(self.args.get("fine_split")), fine_head=self.args.get("fine_head") or "mix")
+                     fine_split=bool(self.args.get("fine_split")), fine_head=self.args.get("fine_head") or "mix",
+                     cascade_warm=int(self.args.get("cascade_warm") or 0))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
