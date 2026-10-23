@@ -657,10 +657,10 @@ def train(job: dict) -> None:
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
                         ({"val_f1": rec["val_f1"]} if "val_f1" in rec else {})
                 set_mode()
-                n0 = int(job.get("stop_zero") or 0)   # screening: still 0 on val after n0 validations -> stop
-                if n0 and len(curve) >= n0 and job.get("select") != "mre" and \
-                        all(r["val_dice"] == 0 and not r.get("val_f1") for r in curve):
-                    print(f"[seg] val metric 0 after {len(curve)} validations: stopped (screening)", flush=True)
+                pat = int(job.get("patience") or 0)   # screening: once learning (> 0), no new best for `pat` validations
+                if pat and (job.get("select") == "mre" or best["score"] > 0) and \
+                        sum(r["iter"] > best["iter"] for r in curve) >= pat:
+                    print(f"[seg] no new val best since it {best['iter']}: stopped (screening)", flush=True)
                     break
             if time.time() - t_save > SAVE_S and it < iters:
                 save_last(it)

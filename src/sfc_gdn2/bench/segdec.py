@@ -66,7 +66,7 @@ def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init
     from its checkpoints, fm/segrun.py). `val_only` (pretraining tuning): the best val Dice, no test volume read."""
     s = bench["segdec"] | ({"iters": iters, "val_every": max(iters // 2, 1)} if iters else {})
     if s.get("screen"):   # exploratory: short, dead runs stopped, kept apart from the tables (bench.yaml)
-        s |= {"iters": 5000, "val_every": 1250, "out": str(s["out"]).rstrip("/") + "_screen"}
+        s |= {"val_every": 1250, "out": str(s["out"]).rstrip("/") + "_screen"}
     out = Path(s["out"]) / task / f"s{seed}" / f"{model}__{init}.json"
     done = "val_dice" if val_only else "test_ci95"
     if resume and out.exists() and done in (res := json.loads(out.read_text())) and res["iters"] == int(s["iters"]):
@@ -80,7 +80,7 @@ def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init
              "k": k, "init": init, "iters": int(s["iters"]), "val_every": int(s["val_every"]), "batch": int(s["batch"]),
              "lr": float(s["lr"]), "seed": seed, "device": device, "out": str(out),
              "save_pred": bool(items[0].get("save_pred")), "select": items[0].get("select"),
-             "stop_zero": 2 if s.get("screen") else 0})
+             "patience": 2 if s.get("screen") else 0})
     res = json.loads(out.read_text())
     if val_only:
         print(f"[segdec] {task} s{seed} {model} {init}: best val dice {res['val_dice']:.3f}", flush=True)

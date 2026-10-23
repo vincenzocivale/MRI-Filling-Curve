@@ -65,6 +65,7 @@ segdec:
   batch: 2
   lr: 1.0e-3         # AdamW on the non-frozen parameters, poly decay
   # screening (user, 23/10): exploratory runs (ablations, decoder variants) only to discard, never to fill the tables:
-  # --override segdec.screen=true -> 5000 iterations, a validation every 1250, stopped when the val metric is still 0 at
-  # the second; results in <out>_screen. The tables keep the full 12500 for every model.
+  # --override segdec.screen=true -> a validation every 1250 iterations, stopped once the val metric has risen above 0 and
+  # then not beaten its best for 2 validations in a row (at most the full 12500: CMB only starts after 7500-10000, 24/10);
+  # results in <out>_screen. The tables keep the full 12500 for every model.
   screen: false
