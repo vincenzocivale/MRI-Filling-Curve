@@ -1,0 +1,23 @@
+# APT (src/sfc_gdn2/apt.py) reading of a checkpoint: one octree of patches per arm, arms computed on the same scan.
+# `sfc bench-extract configs/bench/bench.yaml --group sfc_apt --tune --fm-set checkpoint=<run> --out <dir>`
+model: sfc_gdn2
+env: ${SFC_FM_ENVS}/sfc-gdn2
+repo: ${SFC_FM_REPOS}/MRI-Filling-Curve   # provenance only: the code is this repo's (PYTHONPATH)
+checkpoint: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune/p11_res/03/lejepa-8bbd5b3eca
+args:
+  apt:
+    base_mm: 16
+    levels: 2
+    bins: 16
+    # base 16 mm cells split once into 8 mm cells. tau = bits of the 16-bin histogram entropy of the 16 mm cell (tissue
+    # cells ~3.0 median, 3.6 at the 90th percentile, background 0: survey in notes of 19/10). rnd*: splits as many cells
+    # as ent* on the same scan, chosen at random (what the content criterion buys at equal token count).
+    arms:
+      uni16: {tau: [1.0e9]}
+      uni8: {tau: [-1]}
+      ent25: {score: entropy, tau: [2.5]}
+      rnd25: {score: random, match: ent25}
+      ent30: {score: entropy, tau: [3.0]}
+      rnd30: {score: random, match: ent30}
+      ent34: {score: entropy, tau: [3.4]}
+      rnd34: {score: random, match: ent34}

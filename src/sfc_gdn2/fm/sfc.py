@@ -31,6 +31,7 @@ from .base import Image, Wrapper
 
 SEG_PATCH = (160, 160, 160)   # voxels, as the Primus / nnFoundation ViT runs
 DECODE = 16                   # PatchDecode cells per patch edge (a power of 2)
+CAP_STATS = {"tiles": 0, "capped": 0}   # SegNet.tile_mm: tiles read, and those read at a coarser patch than patch_mm
 
 
 class HeadErase(nn.Module):
@@ -56,8 +57,9 @@ class SegNet(nn.Module):
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
-                 refine_frac: float = 1.0):
+                 refine_frac: float = 1.0, decode: int = DECODE, max_tokens: int = 0):
         super().__init__()
+        self.max_tokens = int(max_tokens)
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
 
@@ -75,7 +77,8 @@ class SegNet(nn.Module):
         if neighbors:
             self.mix = nn.Sequential(nn.Conv3d(c, c, 3, padding=1, groups=c), LayerNormNd(c), nn.Conv3d(c, c, 1), nn.GELU())
             nn.init.zeros_(self.mix[2].weight), nn.init.zeros_(self.mix[2].bias)
-        self.decode = PatchDecode((DECODE,) * 3, min(width, encoder.dim), n_out, norm=LayerNormNd, activation=nn.GELU)
+        self.cells = int(decode)   # cells per token edge: the decoder's output resolution, a power of 2
+        self.decode = PatchDecode((self.cells,) * 3, min(width, encoder.dim), n_out, norm=LayerNormNd, activation=nn.GELU)
         self.decode.apply(InitWeights_He(1e-2))
         # kernel: the kernel embedding run backwards: each token gives the coefficients of a function in the basis
         # phi_x phi_y phi_z of a KernelEmbed, integrated over every native voxel (no 16^3 grid, nothing resampled).
@@ -121,6 +124,19 @@ class SegNet(nn.Module):
             del self.decode
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
 
+    def tile_mm(self, spacing, extent) -> float:
+        """The tile's patch (mm): `patch_mm`, raised in 1 mm steps until the tile has at most `max_tokens` patches (0: never).
+        The encoder's memory grows with the sequence and one token is the least a voxel can give: 4 mm on a 160^3 tile
+        of 4-5 mm voxels is 2e6 tokens, GPU OOM in GDN-2 (19/10 seg_res p4d16; 20 of 1290 TotalSeg scans > 5e5)."""
+        from ..data.volume import patch_dims, patch_grid
+
+        mm = self.patch_mm
+        while self.max_tokens and int(patch_grid(extent, patch_dims(spacing, mm)).prod()) > self.max_tokens:
+            mm += 1.0
+        CAP_STATS["tiles"] += 1
+        CAP_STATS["capped"] += mm > self.patch_mm
+        return mm
+
     def forward(self, x: torch.Tensor, spacing: torch.Tensor) -> torch.Tensor:
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
         -> logits [B, n_out, *T]. Only the scan's own voxels are read: segrun right-pads a tile up to SEG_PATCH voxels,
@@ -133,13 +149,21 @@ class SegNet(nn.Module):
         ext = spacing[:, 3:].long().tolist() if spacing.shape[1] > 3 else [T] * len(x)
         spacing = spacing[:, :3]
         V = [tuple(min(a, t) for a, t in zip(e, T)) for e in ext]                           # the scan's part of each tile
-        ks = [patch_dims(s, self.patch_mm) for s in spacing.tolist()]
+        mms = [self.tile_mm(s, v) for s, v in zip(spacing.tolist(), V)]
+        ks = [patch_dims(s, mm) for s, mm in zip(spacing.tolist(), mms)]
         grid = [patch_grid(v, k).to(x.device) for v, k in zip(V, ks)]
         xs = [x[b, 0, : v[0], : v[1], : v[2]].float() for b, v in enumerate(V)]
-        with torch.no_grad():   # one tile at a time
-            bi = [self.extract({"patches": [patchify(xs[b], k)], "grid": grid[b][None],
-                                "k": torch.tensor([k], device=x.device), "spacing": spacing[b:b + 1].float()})["bi"][0]
-                  for b, k in enumerate(ks)]
+        pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
+        bi = []
+        try:
+            with torch.no_grad():   # one tile at a time
+                for b, k in enumerate(ks):
+                    pe.patch_mm = mms[b] * mm0 / self.patch_mm   # the kernel's normalisation follows the tile's patch
+                    bi.append(self.extract({"patches": [patchify(xs[b], k)], "grid": grid[b][None],
+                                            "k": torch.tensor([k], device=x.device),
+                                            "spacing": spacing[b:b + 1].float()})["bi"][0])
+        finally:
+            pe.patch_mm = mm0
         out = []
         for b, k in enumerate(ks):
             g, v = grid[b].tolist(), V[b]
@@ -158,7 +182,7 @@ class SegNet(nn.Module):
                 out.append(self.kernel_decode(z, emb, spacing[b], k, g)[:, : v[0], : v[1], : v[2]])
                 continue
             # in slabs along the first axis: with coarse voxels a tile holds 10^4-10^5 tokens and 16^3 cells each
-            s = max(1, (1 << 25) // (DECODE ** 3 * g[1] * g[2] * max(self.decode.decode[-1].out_channels, 1)))
+            s = max(1, (1 << 25) // (self.cells ** 3 * g[1] * g[2] * max(self.decode.decode[-1].out_channels, 1)))
 
             def slab(zz, kk=k, gg=g):   # recomputed in backward
                 return F.interpolate(self.decode(zz), size=[zz.shape[2] * kk[0], gg[1] * kk[1], gg[2] * kk[2]],
@@ -274,7 +298,7 @@ class SFC(Wrapper):
         if self.args.get("patch_mm"):  # read at another patch size (18/10: a model trained at several resolutions)
             self.run_cfg["data"]["patch_mm"] = float(self.args["patch_mm"])
         self.curves = list(self.args.get("curves") or self.run_cfg["objective"]["view_curves"])
-        self._extract = None  # built on first use: preprocessing workers never load GDN-2
+        self._extract = self._apt = None  # built on first use: preprocessing workers never load GDN-2
 
     def preprocess(self, image: Image) -> dict:
         if not isinstance(image, str):
@@ -316,6 +340,7 @@ class SFC(Wrapper):
         if isinstance(taps, int):           # quarter points below the last block (2: n/2, 3n/4; 3: also n/4; 4: also
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
+        enc.chunk = int(self.args.get("chunk") or 0)   # tokens per piece of a long sequence (model.py `flat_chunked`), 0: whole
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
                      tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")),
@@ -324,7 +349,8 @@ class SFC(Wrapper):
                      zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
                      erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"),
                      image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")),
-                     refine_frac=float(self.args.get("refine_frac") or 1.0))
+                     refine_frac=float(self.args.get("refine_frac") or 1.0), decode=int(self.args.get("decode") or DECODE),
+                     max_tokens=int(self.args.get("max_tokens") or 0))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
@@ -343,10 +369,47 @@ class SFC(Wrapper):
                                               reverse=bool(self.args.get("tta")))  # also the *_tta readings
         return self._extract
 
+    def apt_reader(self):
+        """`args.apt` = {base_mm, levels, bins, arms: {name: {score, tau | frac | match}}}: the volume read as an octree of
+        patches (apt.py), one reading per arm, same encoder, curves and stored statistics as `features`."""
+        if self._apt is None:
+            from ..apt import APT
+
+            enc = self._encoder().to(self.device).eval().requires_grad_(False)
+            n = len(enc.blocks)
+            enc.taps = tuple(self.args.get("probe_taps") or (n // 2 - 1, 3 * n // 4 - 1))
+            self._taps, self._dim = enc.taps, enc.dim
+            a = self.args["apt"]
+            self._apt = APT(enc, self.curves, int(self.run_cfg["seed"]),
+                            self.run_cfg["objective"].get("fg_threshold", 0.05), a["base_mm"], a.get("levels", 2),
+                            a["arms"], a.get("bins", 16))
+        return self._apt
+
+    @torch.no_grad()
+    def features_apt(self, prepared: dict) -> dict:
+        """Per arm: mean / std (volume-weighted over the foreground leaves) and mean_tok / std_tok (one weight per
+        leaf), also per tapped block (`_b<block>`), as `<stat>__<arm>`; ntok = leaves per level, time = encoder seconds."""
+        from ..apt import block
+
+        a, c = prepared["value"]
+        vol = prepared["volume"].to(torch.device(self.device)).float() * a + c
+        res = self.apt_reader().read(vol, prepared["spacing"])
+        d, n = self._dim, len(self._taps) + 1
+        feats = {}
+        for arm, r in res.items():
+            for stat in ("mean", "std", "mean_tok", "std_tok"):
+                feats |= {f"{stat}{'' if j == 0 else f'_b{self._taps[j - 1] + 1}'}__{arm}": block(r[stat], j, d, n)
+                          for j in range(n)}
+            feats |= {f"ntok__{arm}": r["ntok"], f"time__{arm}": r["time"]}
+        return {"features": feats, "canonical": f"mean__{next(iter(res))}", "derived": list(feats),
+                "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt), "apt": self.args["apt"]}}
+
     @torch.no_grad()
     def features(self, prepared: dict) -> dict:
         from ..data.volume import patchify
 
+        if self.args.get("apt"):
+            return self.features_apt(prepared)
         dev = torch.device(self.device)
         a, c = prepared["value"]
         k, grid = prepared["k"], prepared["grid"]

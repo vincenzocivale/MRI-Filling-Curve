@@ -290,6 +290,25 @@ class HyperConnection(nn.Module):
         return (m.to(x.dtype) @ x) + post.unsqueeze(-1) * out.unsqueeze(-2)
 
 
+class _LayerState:
+    """The `past_key_values` of ONE GDN-2 layer for `flat_chunked`: what fla's `get_layer_cache` / `update_layer_cache`
+    read and write (`len`, `[layer]`, `update`). fla's own Cache is abstract in this environment's transformers.
+    `len` is large once a state is held: `get_layer_cache` compares it with the layer index, and a smaller value would
+    silently drop the state."""
+
+    def __init__(self):
+        self.state = None
+
+    def __len__(self) -> int:
+        return 0 if self.state is None else 1 << 30
+
+    def __getitem__(self, layer: int) -> dict:
+        return self.state
+
+    def update(self, layer_idx: int = 0, recurrent_state=None, conv_state=None, **_) -> None:
+        self.state = {"recurrent_state": recurrent_state, "conv_state": conv_state}
+
+
 class Encoder(nn.Module):
     """Causal GDN-2 over curve-ordered patch tokens.
 
@@ -313,6 +332,7 @@ class Encoder(nn.Module):
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
         self.taps: tuple = ()  # block indices whose outputs `flat` also returns (segmentation decoder input, fm/sfc.py)
+        self.chunk = 0         # > 0: `flat` reads a single long sequence `chunk` tokens at a time (`flat_chunked`)
         self.patch_embed = KernelEmbed(d_model, patch_mm, **embed)
         self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
         self.pos = ViewPos(d_model) if view_pos else None
@@ -382,6 +402,8 @@ class Encoder(nn.Module):
     def flat(self, x: torch.Tensor, cu_seqlens: torch.Tensor, ckpt: bool | None = None) -> torch.Tensor:
         """[T,d] curve-ordered tokens of n sequences back to back (int32 offsets cu_seqlens [n+1]) -> [T,d] normed
         hidden states. A dummy sequence pads T <= 64: GDN-2 switches to its recurrent kernel there in eval."""
+        if self.chunk and len(x) > self.chunk and len(cu_seqlens) == 2 and not torch.is_grad_enabled():
+            return self.flat_chunked(x, self.chunk)
         total = len(x)
         if pad := max(65 - total, 0):
             x, cu_seqlens = nn.functional.pad(x, (0, 0, 0, pad)), torch.cat([cu_seqlens, cu_seqlens[-1:] + pad])
@@ -395,6 +417,34 @@ class Encoder(nn.Module):
             return self.norm(h)
         h = h.split(self.dim, -1)  # the last block's output (final norm) ++ the taps' (plain layer norm)
         return torch.cat([self.norm(h[0]), *(nn.functional.layer_norm(t, t.shape[-1:]) for t in h[1:])], -1)
+
+    @torch.no_grad()
+    def flat_chunked(self, x: torch.Tensor, chunk: int) -> torch.Tensor:
+        """`flat` of ONE sequence [T,d] (no gradient), memory bounded by `chunk` tokens instead of T. The same function:
+        every block is run over the whole sequence in turn, in pieces of `chunk` tokens that pass on the mixer's
+        recurrent state and short-conv state (GDN-2's `past_key_values`); norms and MLPs are per token. A backwards
+        block (`bidir` alternate) takes the pieces from the end, each reversed. Only plain GDN-2 stacks of one stream:
+        no attention blocks, mHC, taps or `late` / `block` reading."""
+        assert self.bidir == "alternate" and not self.taps and not self.hc, (self.bidir, self.taps, self.hc)
+        assert all(isinstance(b, GDN2Block) for b in self.blocks), "flat_chunked: GDN-2 blocks only"
+        T = len(x)
+        edges = list(range(0, T, chunk)) + [T]
+        if len(edges) > 2 and edges[-1] - edges[-2] <= 64:   # a piece of <= 64 tokens would switch to the recurrent kernel
+            del edges[-2]
+        spans = list(zip(edges[:-1], edges[1:]))
+        amp = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else None
+        for i, block in enumerate(self.blocks):
+            back = self.reads_back[i]
+            cache, out = _LayerState(), torch.empty_like(x)
+            for lo, hi in (spans[::-1] if back else spans):
+                xc = x[lo:hi].flip(0) if back else x[lo:hi]
+                y = block.norm(xc)
+                m = block.mix((y if amp is None else y.to(amp))[None], past_key_values=cache, use_cache=True)[0][0]
+                xc = xc + m
+                xc = xc + block.ffn(block.ffn_norm(xc))
+                out[lo:hi] = xc.flip(0) if back else xc
+            x = out
+        return self.norm(x)
 
 
 # scans on the device (`dataset.to_device`) -> {"bi": [B,N,F] (patch level, N = the batch's largest grid),
