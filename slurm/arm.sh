@@ -33,7 +33,7 @@ Q="dataset in ['crossMoDA', 'TopCoW', 'UCSF-PDGM']"
 probe() {
   [ "${PROBE:-1}" = 1 ] || return 0
   [ -f $D/tune/tune.csv ] && { echo "[arm] probe done, skipped"; return 0; }
-  step probe bash -c "sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune --fm-set checkpoint=$D --query \"$Q\" --out $D/features --override out_dir=$MV && sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune --tasks idh koos pcom_any --out $D/tune --override fm.out_root=$D/features out_dir=$MV probe.tasks=$TV"
+  step probe bash -c "sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune --fm-set checkpoint=$D --query \"$Q\" --out $D/features --override out_dir=$MV && sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune --tasks idh --out $D/tune --override fm.out_root=$D/features out_dir=$MV probe.tasks=$TV"
 }
 cache() {
   [ "${CACHE:-1}" = 1 ] || return 0
