@@ -140,7 +140,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) 
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
     on that grid (token cache), the volume padded so that the last tile ends on it."""
     lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
-    if lm and getattr(net, "cascade", False) and ctx is not None:   # our landmark cascade: whole scan, coarse to fine
+    if lm and getattr(net, "decoder_c", False) and ctx is not None:   # our landmark cascade: whole scan, coarse to fine
         with amp():
             return net.landmark_predict(x, ctx.to(x.device), n_out)
     if getattr(net, "matryoshka", False) and ctx is not None and not lm:   # the whole scan in one pass (no tiles)
@@ -230,11 +230,11 @@ def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
     tot = 0.0
     for xi, yi, ci in parts:
         with amp():
-            if getattr(net, "cascade", False):   # our landmark cascade: levels + point head on the cells reached
+            if getattr(net, "decoder_c", False):   # ours (decoder C2 / cascade): the point head on points, no dense map
                 loss = net.landmark_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), yi.shape[1] + 1) / len(parts)
             else:
                 lg = call(net, xi.to(dev).float(), ci)
-        if not getattr(net, "cascade", False):
+        if not getattr(net, "decoder_c", False):
             loss = focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) / len(parts)
         loss.backward()
         tot += float(loss)

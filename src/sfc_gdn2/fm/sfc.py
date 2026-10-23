@@ -603,7 +603,7 @@ class SegNet(nn.Module):
         return fin, [a for a in aux if a is not None]
 
     @torch.no_grad()
-    def c_predict(self, x, ctx, n_out):
+    def c_predict(self, x, ctx, n_out, sigmoid=False):
         """A whole scan [C, *S] -> probabilities [n_out, *S]: every level on the whole scan, the point head on every
         voxel (chunks)."""
         dev, S = x.device, tuple(x.shape[1:])
@@ -619,7 +619,8 @@ class SegNet(nn.Module):
         for a in range(0, N, 1 << 19):
             i = torch.arange(a, min(a + (1 << 19), N), device=dev)
             pts = torch.stack([i // (S[1] * S[2]), i // S[2] % S[1], i % S[2]], 1)
-            out[:, a: a + len(i)] = self.c_logits(lv, vol, pts).float().softmax(1).T.half().to(out.device)
+            lg = self.c_logits(lv, vol, pts).float()
+            out[:, a: a + len(i)] = (lg.sigmoid() if sigmoid else lg.softmax(1)).T.half().to(out.device)
         return out.view(n_out, *S)
 
     # ------------------------------------------------------------------------- cascade decoding (22/10, variant A)
@@ -908,6 +909,8 @@ class SegNet(nn.Module):
         """Training on landmark heatmaps h [B, landmarks, *T] (segrun.heatmaps: 1 at each landmark's voxel): the level
         heads (balanced BCE: the cell holding the landmark against the other candidates) and the point head's focal loss
         on the voxels of the cells reached and their ring."""
+        if not self.cascade:   # decoder C2: every level on the whole tile, the point head near the landmarks + anywhere
+            return self._lm_c_sums(x, h, ctx, n_out)
         st, V, sp = self(x, ctx, levels=True, stop=0)
         loss = 0.0
         for b, (z, k, g, _, cur) in enumerate(st):
@@ -931,11 +934,29 @@ class SegNet(nn.Module):
             loss = loss + self._focal(lg, hb[:, q[:, 0], q[:, 1], q[:, 2]].T)
         return loss / len(st)
 
+    def _lm_c_sums(self, x, h, ctx, n_out):
+        """Decoder C2 on landmark heatmaps: its levels on the whole tile; the focal loss on every voxel where any heatmap
+        is above 1e-3 (~3.7 sigma around each landmark) and on as many random voxels."""
+        _, V, _ = self(x, ctx, levels=True)
+        loss = 0.0
+        for b, lv in enumerate(self._lv):
+            vol, hb = x[b, 0, : V[b][0], : V[b][1], : V[b][2]], h[b, :, : V[b][0], : V[b][1], : V[b][2]].float()
+            near = (hb.amax(0) > 1e-3).nonzero()
+            if len(near) > (1 << 16):
+                near = near[torch.randperm(len(near), device=near.device)[: 1 << 16]]
+            S = torch.tensor(vol.shape, device=x.device)
+            q = torch.cat([near, (torch.rand(max(len(near), 4096), 3, device=x.device) * S).long()])
+            lg = self.c_logits(lv, vol, q)[:, 1:n_out].float()
+            loss = loss + self._focal(lg, hb[:, q[:, 0], q[:, 1], q[:, 2]].T)
+        return loss / len(self._lv)
+
     @torch.no_grad()
     def landmark_predict(self, x, ctx, n_out):
         """A whole scan -> heatmaps [n_out, *S] (sigmoid; 0 outside the cells reached): segrun.landmark takes each map's
         maximum."""
         dev, S = x.device, tuple(x.shape[1:])
+        if not self.cascade:   # decoder C2: its sigmoid maps on every voxel
+            return self.c_predict(x, ctx, n_out, sigmoid=True)
         fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
         try:
             z, k, g, cur, sp = self._whole(x, ctx)
