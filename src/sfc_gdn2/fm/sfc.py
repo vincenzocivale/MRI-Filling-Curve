@@ -65,7 +65,8 @@ class SegNet(nn.Module):
                  level2: bool = False, decoder_c: bool = False, c_points: int = 32768, c_local: bool = False,
                  c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
-                 cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2):
+                 cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2,
+                 fine_split: bool = False, fine_head: str = "mix"):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -219,6 +220,17 @@ class SegNet(nn.Module):
             self.register_buffer("taus", torch.full((refine + 1,), 0.5))
             self.register_buffer("cfreq", torch.zeros(n_out))
             self.register_buffer("tcount", torch.zeros(n_out + 1))
+        # decoder D (23/10, user, notes/decoder_cascade.md): fine_split: the encoder's live 2 mm reading as one sequence
+        # per connected group of the cells read (no jump between far regions read as neighbours along one sequence);
+        # fine_head "mlp": the cascade's levels without the refine blocks along the curve, a per-token MLP on [parent,
+        # encoder token, image kernel] added to the parent (child = parent + detail; zero at init)
+        self.fine_split, self.fine_head = bool(fine_split), str(fine_head)
+        assert self.fine_head in ("mix", "mlp"), fine_head
+        if self.fine_head == "mlp":
+            self.fhead = nn.ModuleList(nn.Sequential(nn.Linear(3 * 128, 128), nn.GELU(), nn.Linear(128, 128))
+                                       for _ in range(max(self.refine, 1)))
+            for m in self.fhead:
+                nn.init.zeros_(m[-1].weight), nn.init.zeros_(m[-1].bias)
         if self.matryoshka:
             assert (self.cache is not None or self.cascade) and self.kernel and (self.refine == 2 or self.cascade), \
                 "matryoshka decoding: token cache, F, refine 2"
@@ -333,6 +345,7 @@ class SegNet(nn.Module):
         par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
         pidx = (par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]
         t = self.up[i](z)[pidx if zmap is None else zmap[pidx]]
+        t_par = t
         sub = (lambda a: a) if keep is None else (lambda a: a[keep])
         if self._cur is not None and self.fine_tok is not None and i < 2:   # fine_encoder from the cache: the whole-scan reading
             ci, corner, _ = self._cur                                 # of this level, last block ++ taps as at 16 mm
@@ -352,11 +365,18 @@ class SegNet(nn.Module):
                 pe.patch_mm = self.fine_mm[i]
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     x = pe(sub(patchify(vol.float(), kf))[sel], pe.weights(sp.float(), kf))
-                    cu1 = torch.tensor([0, len(sel)], device=z.device, dtype=torch.int32)
-                    bf = sum(self.encoder.flat(x[o], cu1, pos=xyz[sel][o]).float()[o.argsort()]
-                             for o in (keys(c, xyz[sel], gf, self.seed).argsort() for c in self.enc_curves)) / len(self.enc_curves)
+                    q = xyz[sel]
+                    lab = self._groups(q, gf) if self.fine_split and i == 2 else torch.zeros(len(sel), dtype=torch.long, device=z.device)
+                    cu1 = F.pad(torch.bincount(lab).cumsum(0), (1, 0)).to(torch.int32)   # one sequence per group
+                    bf = 0
+                    for c in self.enc_curves:   # within each group along the curve
+                        kk = keys(c, q, gf, self.seed)
+                        o = (lab * (int(kk.max()) + 1) + kk).argsort()
+                        bf = bf + self.encoder.flat(x[o], cu1, pos=q[o]).float()[o.argsort()]
+                    bf = bf / len(self.enc_curves)
                 pe.patch_mm = mm0
                 t = t.index_add(0, sel, self.fine_tok[i](self.proj(bf)))
+        t_enc = t - t_par   # the encoder's part (decoder D's MLP reads the parts apart)
         if self.image and self.enc_img is not None:
             pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
             pe.patch_mm = self.fine_mm[i]
@@ -372,7 +392,19 @@ class SegNet(nn.Module):
         elif self.image:
             e = self.fine[i][0].patch_embed
             t = t + e(sub(patchify(vol.float(), kf)), e.weights(sp.float(), kf))
+        self._parts = (t_par, t_enc, t - t_par - t_enc)
         return t, xyz, gf, kf
+
+    @staticmethod
+    def _groups(q, gf) -> torch.Tensor:
+        """Cells q [n, 3] on grid gf -> the label of each one's 26-connected group (0 ..), groups in raster order."""
+        from scipy import ndimage
+        g = [int(a) for a in gf.tolist()]
+        m = np.zeros(g, dtype=bool)
+        qc = q.cpu().numpy()
+        m[qc[:, 0], qc[:, 1], qc[:, 2]] = True
+        lab = ndimage.label(m, structure=np.ones((3, 3, 3), dtype=bool))[0]
+        return torch.as_tensor(lab[qc[:, 0], qc[:, 1], qc[:, 2]].astype(np.int64) - 1, device=q.device)
 
     def fine_mix(self, ts: list, xyzs: list, gfs: list, i: int, encs=None) -> list:
         """Level i's refine blocks along each curve of fine_curves in turn, the tiles' sequences packed in one call
@@ -649,7 +681,11 @@ class SegNet(nn.Module):
         tk = None
         if len(keep):
             t, xyzk, gft, _ = self.to_fine(zd, vol, sp, kp, gp, i, keep=keep)
-            tk = self.fine_mix([t], [xyzk], [gft], i)[0]
+            if self.fine_head == "mlp":   # decoder D: child = parent + MLP(parent, encoder token, image kernel)
+                p_, e_, m_ = self._parts
+                tk = (p_ + self.fhead[i](torch.cat([p_, e_, m_], -1))).float()
+            else:
+                tk = self.fine_mix([t], [xyzk], [gft], i)[0]
         if i == 2:   # the last level (2 mm): only the read cells (their 27 neighbours are read too: the ring)
             return SparseLevel(keep, tk if tk is not None else zd.new_zeros(0, 128), zd, pidx, self.up[i]), kf, gf, pidx
         dense = self.up[i](zd)[pidx]
@@ -1368,7 +1404,8 @@ class SFC(Wrapper):
                      cascade_eps=float(self.args.get("cascade_eps", 0.01)),
                      cascade_rare=float(self.args.get("cascade_rare", 1e-3)),
                      cascade_neg=float(self.args.get("cascade_neg") or 2.0),
-                     cascade_topk=int(self.args.get("cascade_topk") or 2))
+                     cascade_topk=int(self.args.get("cascade_topk") or 2),
+                     fine_split=bool(self.args.get("fine_split")), fine_head=self.args.get("fine_head") or "mix")
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
