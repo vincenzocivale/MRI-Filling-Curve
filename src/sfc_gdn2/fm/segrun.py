@@ -195,15 +195,25 @@ def dice_on(pred: torch.Tensor, y: torch.Tensor, k: int) -> float:
 MISS_MM = 50.0   # a landmark not predicted at all counts as this radial error in the val selection
 
 
+def landmark(p: torch.Tensor) -> torch.Tensor:
+    """One point per landmark, always (user, 23/10): the centroid of the voxels at the maximum of the class's
+    probability map p [*S] (ties of the uint8 saves included)."""
+    return (p >= p.max()).nonzero().float().mean(0)
+
+
 def mre_on(pred: torch.Tensor, y: torch.Tensor, spacing, k: int) -> float:
-    """Landmarks: mean radial error (mm) between the GT and predicted centroid of each class present in the GT, on the
-    model grid (canonical: axis permutations / flips of the native voxels, so distances are the world's); a class not
-    predicted counts MISS_MM."""
+    """Landmarks: mean radial error (mm) between the GT centroid of each class present in the GT and the predicted point,
+    on the model grid (canonical: axis permutations / flips of the native voxels, so distances are the world's).
+    pred: class probabilities [k, *S] -> landmark() (every landmark gets a point); labels [*S] (the cascade's val
+    pass) -> centroid of the class, a class not predicted counts MISS_MM."""
     sp = torch.as_tensor(spacing, dtype=torch.float, device=pred.device)
     err = []
     for c in range(1, k):
         g = (y == c).nonzero().float()
         if not len(g):
+            continue
+        if pred.dim() == y.dim() + 1:
+            err.append(float(((g.mean(0) - landmark(pred[c])) * sp).norm()))
             continue
         q = (pred == c).nonzero().float()
         err.append(float(((g.mean(0) - q.mean(0)) * sp).norm()) if len(q) else MISS_MM)
@@ -549,10 +559,12 @@ def train(job: dict) -> None:
                 net.eval()
                 if getattr(net, "cascade", False):   # one pass: the levels' thresholds on val and the val predictions
                     preds = net.cascade_val(val_v, k, amp)
-                else:
-                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).argmax(0).to(dev)
+                else:   # probabilities kept for the landmark tasks (a point per landmark from each class's map)
+                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).to(dev)
                              for v in val_v]
-                ds = [dice_on(p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
+                    if job.get("select") != "mre":
+                        preds = [p.argmax(0) for p in preds]
+                ds = [dice_on(p.argmax(0) if p.dim() == 4 else p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
                 val = float(np.nanmean(ds))
                 rec = {"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
