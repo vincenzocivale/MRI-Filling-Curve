@@ -490,7 +490,7 @@ class Encoder(nn.Module):
             k, cu = torch.arange(len(x), device=x.device), cu_seqlens.long()
             s = torch.searchsorted(cu[1:], k, right=True)
             rev = cu[s] + cu[s + 1] - 1 - k
-        h = self.run(x[None], cu_seqlens, ckpt, rev, pos if (self.rope3d_mode or self.dw is not None) else None)[0, :total]
+        h = self.run(x[None], cu_seqlens, ckpt, rev, pos if (self.rope3d_mode or self.dw is not None or self.cpe is not None) else None)[0, :total]
         if not self.taps:
             return self.norm(h)
         h = h.split(self.dim, -1)  # the last block's output (final norm) ++ the taps' (plain layer norm)
