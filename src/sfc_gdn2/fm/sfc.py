@@ -66,7 +66,7 @@ class SegNet(nn.Module):
                  c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
                  cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2,
-                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_menu=None):
+                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_eval=(8, 8, 16, 16)):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -217,9 +217,12 @@ class SegNet(nn.Module):
             # landmarks (23/10, user: "si legge solo 8 celle a 2 mm"): segrun sets self.landmark; per level and landmark the
             # head's top cascade_topk cells (+ the true one in training) go down, the point head maps the last ones
             self.ctopk = int(cascade_topk)
-            # cascade_topk_menu (24/10, user): the cells per landmark at inference chosen on the val MRE among these (a top
-            # cell missed at 8 mm sent a landmark 37 mm away; training keeps cascade_topk + the true cell)
-            self.ctopk_menu = [int(t) for t in cascade_topk_menu or []]
+            # cascade_topk_eval (24/10, user): the cells per landmark at inference, per level from g0 (the last value for the
+            # finer ones); p19 val, rank of the true cell: 16 mm <= 6, 8 mm 95% <= 6, 4 / 2 mm 90% <= 27 / 18 (the ring
+            # catches most of the rest). With 2 a cell 7th at 8 mm sent a landmark 37 mm away. segrun scales it on the
+            # val MRE of the best state; training keeps cascade_topk + the true cell
+            self.ctopk_eval = [int(t) for t in (cascade_topk_eval if isinstance(cascade_topk_eval, (list, tuple))
+                                                else str(cascade_topk_eval).split(","))]
             # cascade_warm W (23/10, user): the first W training iterations (and the val passes among them) stop at 4 mm;
             # the 2 mm level is read once the heads choose the cells (an untrained head marks nearly every cell mixed)
             self.cwarm = int(cascade_warm)
@@ -911,7 +914,7 @@ class SegNet(nn.Module):
     # ------------------------------------------------------------- landmark cascade (23/10, heatmap regression)
     def _lm_levels(self, z, k, g, vol, sp, cur, n_out, pts=None):
         """A tile / scan down the levels for landmarks: at each level the head's logits [cells, landmarks] on the candidate
-        cells, the top ctopk cells per landmark (+ the true cell, pts [landmarks, 3] voxels or NaN, in training) go down:
+        cells, the top ctopk (training) / ctopk_eval[level] cells per landmark (+ the true cell, pts [landmarks, 3] voxels or NaN, in training) go down:
         their children are read with a ring of one cell. -> lv, [(logits, targets or None)], the last level's chosen cells
         (dense mask), its dims and grid."""
         self._cur = cur
@@ -936,7 +939,8 @@ class SegNet(nn.Module):
                     if r >= 0:
                         tgt[r, c] = 1
                 sel[cell] = True
-            top = lg.detach().topk(min(self.ctopk, len(ci)), 0).indices.flatten()
+            tk = self.ctopk if pts is not None else self.ctopk_eval[min(j, len(self.ctopk_eval) - 1)]
+            top = lg.detach().topk(min(tk, len(ci)), 0).indices.flatten()
             sel[ci[top]] = True
             info.append((lg, tgt))
             if j == jmin:
@@ -1429,7 +1433,7 @@ class SFC(Wrapper):
                      cascade_topk=int(self.args.get("cascade_topk") or 2),
                      fine_split=bool(self.args.get("fine_split")), fine_head=self.args.get("fine_head") or "mix",
                      cascade_warm=int(self.args.get("cascade_warm") or 0),
-                     cascade_topk_menu=self.args.get("cascade_topk_menu"))
+                     cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

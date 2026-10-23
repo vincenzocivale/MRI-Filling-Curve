@@ -645,17 +645,6 @@ def train(job: dict) -> None:
                 if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
                     mre = float(np.mean([mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
                     rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
-                    if getattr(net, "ctopk_menu", None):   # landmark cascade: the cells per landmark chosen on the val MRE
-                        t0k, by = net.ctopk, {net.ctopk: mre}
-                        for tk in net.ctopk_menu:
-                            if tk not in by:
-                                net.ctopk = tk
-                                by[tk] = float(np.mean([mre_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).to(dev),
-                                                               v["y"].to(dev), v["sp"], k) for v in val_v]))
-                        net.ctopk = t0k
-                        tk = min(by, key=lambda t: (by[t], t))
-                        rec |= {"val_mre": by[tk], "lm_topk": tk, "mre_by_topk": {str(t): m for t, m in sorted(by.items())}}
-                        score, msg = -by[tk], msg + f", top {tk}: {by[tk]:.2f} mm ({' '.join(f'{t}:{m:.2f}' for t, m in sorted(by.items()))})"
                 if job.get("select") == "f1":   # small lesions (CMB, user 23/10): chosen on the val lesion-wise F1
                     f1v = float(np.nanmean([_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), True)
                                                      for p, v in zip(preds, val_v)], True) for c in range(1, k)]))
@@ -666,7 +655,6 @@ def train(job: dict) -> None:
                 if "state" not in best or score > best.get("score", best["val"]):
                     best = {"val": val, "iter": it, "score": score, "state": trained()} | \
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
-                        ({"lm_topk": rec["lm_topk"]} if "lm_topk" in rec else {}) | \
                         ({"val_f1": rec["val_f1"]} if "val_f1" in rec else {})
                 set_mode()
                 n0 = int(job.get("stop_zero") or 0)   # screening: still 0 on val after n0 validations -> stop
@@ -680,6 +668,25 @@ def train(job: dict) -> None:
         del val_v, data
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
         last.unlink(missing_ok=True)
+    if LM and getattr(net, "ctopk_eval", None) and "lm_topk" not in best:
+        # landmark cascade (user, 24/10): the cells per landmark scaled on the val MRE of the best state, once (x1 is the
+        # selection's own pass; x0.5 and x2 two more), kept for the test
+        load_trained(best["state"])
+        net.eval()
+        val_v, t0k = [load(it) for it in split["val"]], list(net.ctopk_eval)
+        by = {1.0: best["val_mre"]}
+        for f in (0.5, 2.0):
+            net.ctopk_eval = [max(1, round(t * f)) for t in t0k]
+            by[f] = float(np.mean([mre_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).to(dev),
+                                          v["y"].to(dev), v["sp"], k) for v in val_v]))
+        f = min(by, key=lambda t: (by[t], t))
+        best |= {"lm_topk": [max(1, round(t * f)) for t in t0k], "val_mre": by[f],
+                 "mre_by_topk": {"x" + str(t): m for t, m in sorted(by.items())}}
+        net.ctopk_eval = best["lm_topk"]
+        print(f"[seg] landmark cells per level {best['lm_topk']}: val MRE {by[f]:.2f} mm "
+              f"({' '.join(f'x{t}:{m:.2f}' for t, m in sorted(by.items()))})", flush=True)
+        del val_v
+        torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     if job.get("val_only"):  # pretraining tuning: the best val Dice, no test volume read
         best.pop("state")
         out_p.write_text(json.dumps({"model": job["cfg"]["model"], "init": job["init"], "iters": iters,
@@ -692,7 +699,7 @@ def train(job: dict) -> None:
     load_trained(best.pop("state"))
     net.eval()
     if "lm_topk" in best:   # the val-chosen cells per landmark for the test and the saved val predictions
-        net.ctopk = best["lm_topk"]
+        net.ctopk_eval = best["lm_topk"]
     rule, f1 = {}, job.get("select") == "f1"
     pv = out_p.with_suffix(".pred_val")
     if not LM:   # val predictions of the best state -> the post-processing rule (chosen on val only)
