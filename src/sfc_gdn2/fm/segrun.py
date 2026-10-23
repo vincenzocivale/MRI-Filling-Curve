@@ -452,6 +452,21 @@ def train(job: dict) -> None:
     dev = torch.device(job["device"])
     rng = np.random.default_rng(job["seed"])
     k, cache = int(job["k"]), Path(job["cache"])
+    args = job["cfg"].get("args") or {}
+    if args.get("cascade") and "auto" in (str(args.get("cascade_g0")), str(args.get("cascade_gmin"))):
+        # the cascade's plan from the train / val labels and cached tokens, once per task (<out>.plan.json, reused)
+        pp = Path(job["out"]).with_suffix(".plan.json")
+        if pp.exists():
+            pl = json.loads(pp.read_text())
+        else:
+            from .cascade_plan import plan
+            pl = plan(job["items"], cache, args["token_cache"])
+            pp.parent.mkdir(parents=True, exist_ok=True)
+            pp.write_text(json.dumps(pl, indent=1))
+        for a in ("g0", "gmin"):
+            if str(args.get(f"cascade_{a}")) == "auto":
+                args[f"cascade_{a}"] = pl[a]
+        print(f"[seg] cascade plan {pp.name}: g0 {pl['g0']:.0f} mm, g_min {pl['gmin']:.0f} mm, {pl['per_g0']}", flush=True)
     w = build(job["cfg"], job["device"])
     torch.manual_seed(job["seed"])
     ref, frozen, patch = w.seg_net(k, pretrained=False)
@@ -630,12 +645,17 @@ def train(job: dict) -> None:
                 if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
                     mre = float(np.mean([mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
                     rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
+                if job.get("select") == "f1":   # small lesions (CMB, user 23/10): chosen on the val lesion-wise F1
+                    f1v = float(np.nanmean([_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), True)
+                                                     for p, v in zip(preds, val_v)], True) for c in range(1, k)]))
+                    rec["val_f1"], score, msg = f1v, f1v, msg + f" val F1 {f1v:.3f}"
                 del preds
                 curve.append(rec)
                 print(f"[seg] it {it} loss {float(loss):.3f} {msg} ({(time.time() - t0) / 60:.1f} min)", flush=True)
                 if "state" not in best or score > best.get("score", best["val"]):
                     best = {"val": val, "iter": it, "score": score, "state": trained()} | \
-                        ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {})
+                        ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
+                        ({"val_f1": rec["val_f1"]} if "val_f1" in rec else {})
                 set_mode()
             if time.time() - t_save > SAVE_S and it < iters:
                 save_last(it)
@@ -654,7 +674,33 @@ def train(job: dict) -> None:
         return
     load_trained(best.pop("state"))
     net.eval()
-    tkey = key | {"best_iter": best["iter"]}
+    rule, f1 = {}, job.get("select") == "f1"
+    pv = out_p.with_suffix(".pred_val")
+    if not LM:   # val predictions of the best state -> the post-processing rule (chosen on val only)
+        vals = []
+        for it in split["val"]:
+            f = pv / f"{it['id']}.npz"
+            if not f.exists():
+                v = load(it)
+                save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]),
+                          v["grid_from_gt"])
+                del v
+            z = np.load(f)
+            y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
+            y = y[0] if y.ndim == 4 else y
+            vals.append((z["pred"], z["prob"] if len(z["prob"]) == k else None, np.where(y == 255, 0, y)))
+        sizes = {}   # train components' sizes (voxels on the model grid): 1st / 5th percentile per class
+        for it in split["train"][:20]:
+            y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
+            y = y[0] if y.ndim == 4 else y
+            for c in range(1, k):
+                cc, n = _components(y == c)
+                if n:
+                    sizes.setdefault(c, []).extend(np.bincount(cc.ravel())[1:].tolist())
+        sizes = {c: [int(np.percentile(v, 1)), int(np.percentile(v, 5))] for c, v in sizes.items()}
+        rule = choose_postproc(vals, k, sizes, f1)
+        del vals
+    tkey = key | {"best_iter": best["iter"], "postproc": {str(c): r for c, r in rule.items()}}
     done = json.loads(part.read_text()) if part.exists() else {}
     res = done["res"] if done.get("key") == tkey else {"per_volume": [], "per_class": [], "test_ids": []}
     if res["test_ids"]:
@@ -666,8 +712,13 @@ def train(job: dict) -> None:
         v = load(it)
         probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"])
         lab, _, _ = gt_labels(it["seg"], it.get("classes"), it.get("ignore"))
-        d, per = dice_full_res(probs, v["grid_from_gt"], lab, k, dev)
-        save_pred(out_p.with_suffix(".pred"), it["id"], probs, v["grid_from_gt"])
+        pl = None
+        if rule:   # the val-chosen post-processing, then scored as the argmax of its one-hot
+            q = (probs.float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy() if k <= 8 else None
+            pl = postproc(probs.argmax(0).to(torch.uint8).cpu().numpy(), q, rule)
+            probs_s = F.one_hot(torch.from_numpy(pl).long(), k).permute(3, 0, 1, 2).half()
+        d, per = dice_full_res(probs_s if rule else probs, v["grid_from_gt"], lab, k, dev)
+        save_pred(out_p.with_suffix(".pred"), it["id"], probs, v["grid_from_gt"], lab=pl)
         res["per_volume"].append(d)
         res["per_class"].append(per)
         res["test_ids"].append(it["id"])
@@ -679,27 +730,106 @@ def train(job: dict) -> None:
     out = {"model": job["cfg"]["model"], "init": job["init"], "lr": job["lr"], "iters": iters, "patch": patch,
            "frozen_prefixes": frozen, "params_frozen": n_frozen, "params_trained": n_train, "best": best,
            "curve": curve, "n": {s: len(v) for s, v in split.items()},
-           "test_dice": float(np.nanmean(res["per_volume"])), **res}
+           "test_dice": float(np.nanmean(res["per_volume"])), "postproc": {str(c): r for c, r in rule.items()}, **res}
     out_p.write_text(json.dumps(out, indent=1))
-    pv = out_p.with_suffix(".pred_val")
-    for it in split["val"]:   # the val predictions of the best state: thresholds / filters chosen on val later
+    for it in split["val"]:   # the val predictions of the best state (landmarks: not done above)
         if (pv / f"{it['id']}.npz").exists():
             continue
         v = load(it)
         save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]), v["grid_from_gt"])
         del v
-    provenance(job, split, out_p, ckpt, {"best": best, "test_dice": out["test_dice"]})
+    provenance(job, split, out_p, ckpt, {"best": best, "test_dice": out["test_dice"], "postproc": out["postproc"]})
     part.unlink(missing_ok=True)   # the decoder checkpoint (.best.pt) is kept (user, 23/10)
     print(f"[seg] test dice {out['test_dice']:.4f} on {len(res['per_volume'])} volumes -> {job['out']}", flush=True)
 
 
-def save_pred(d: Path, i: str, probs: torch.Tensor, grid_from_gt) -> None:
+TAUS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)   # post-processing: probability thresholds tried per class (k <= 8)
+
+
+def _components(m: np.ndarray):
+    from scipy import ndimage
+    return ndimage.label(m, np.ones((3, 3, 3)))
+
+
+def _pp_class(lab: np.ndarray, q: np.ndarray | None, c: int, tau, smin: int, largest: bool, comp=None) -> np.ndarray:
+    """Class c's mask after its rule: threshold tau on its probability (uint8 q) instead of the argmax, components under
+    smin voxels removed, only the largest kept. comp: the mask's components if already computed."""
+    m = (q[c] >= round(tau * 255)) if tau is not None else lab == c
+    if smin or largest:
+        cc, n = comp if comp is not None else _components(m)
+        if n:
+            sz = np.bincount(cc.ravel())[1:]
+            keep = (sz >= smin) if not largest else (np.arange(n) == sz.argmax())
+            m = keep[cc - 1] & (cc > 0)
+    return m
+
+
+def postproc(lab: np.ndarray, q: np.ndarray | None, rule: dict) -> np.ndarray:
+    """Labels [*S] (argmax) -> labels with each class's val-chosen rule applied (classes in order)."""
+    out = lab.copy()
+    for c, (tau, smin, largest) in sorted(rule.items()):
+        m = _pp_class(lab, q, c, tau, smin, largest)
+        out[(out == c) & ~m] = 0
+        out[m] = c
+    return out
+
+
+def _score(m: np.ndarray, t: np.ndarray, f1: bool, gt=None) -> tuple:
+    """A class on one volume -> sums: Dice (tp, pred, true) or lesion F1 (hit lesions, lesions, false components);
+    gt: the true mask's components if already computed."""
+    if not f1:
+        return float((m & t).sum()), float(m.sum()), float(t.sum())
+    gl, ng = gt if gt is not None else _components(t)
+    pl, npred = _components(m)
+    hit = len(set(np.unique(gl[m])) - {0})
+    return float(hit), float(ng), float(npred - len(set(np.unique(pl[t])) - {0}))
+
+
+def _metric(sums, f1: bool) -> float:
+    a, b, c = (sum(x[i] for x in sums) for i in range(3))
+    if not f1:
+        return 2 * a / (b + c) if b + c else float("nan")
+    p, r = a / max(a + c, 1), a / max(b, 1)
+    return 2 * p * r / max(p + r, 1e-9)
+
+
+def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
+    """Per foreground class, on the val volumes [(argmax, uint8 probs or None, labels)], the rule (tau, min size,
+    largest only) that improves the task's metric (Dice, or lesion F1); no rule if nothing does (user, 23/10:
+    nnU-Net-style post-processing chosen on val, the same for every task)."""
+    rule = {}
+    for c in range(1, k):
+        t = [(y == c) for _, _, y in vals]
+        if not any(x.any() for x in t):
+            continue
+        gts = [_components(tt) if f1 else None for tt in t]
+        base = _metric([_score(lab == c, tt, f1, g) for (lab, _, _), tt, g in zip(vals, t, gts)], f1)
+        best, br = base, None
+        taus = (None,) + (TAUS if vals[0][1] is not None else ())
+        for tau in taus:   # the thresholded masks' components once per tau, the filters on top of them
+            comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, _ in vals]
+            for smin in sorted({0, *sizes.get(c, ())}):
+                for largest in (False, True):
+                    if tau is None and not smin and not largest:
+                        continue
+                    sc = _metric([_score(_pp_class(lab, q, c, tau, smin, largest, cp), tt, f1, g)
+                                  for (lab, q, _), tt, g, cp in zip(vals, t, gts, comps)], f1)
+                    if sc > best + 1e-4:
+                        best, br = sc, (tau, int(smin), largest)
+        if br is not None:
+            rule[c] = br
+            print(f"[seg] post-processing class {c}: tau {br[0]}, min {br[1]} voxels, largest {br[2]}: val "
+                  f"{base:.4f} -> {best:.4f}", flush=True)
+    return rule
+
+
+def save_pred(d: Path, i: str, probs: torch.Tensor, grid_from_gt, lab=None) -> None:
     """Prediction of one volume on the model grid (user, 23/10: always kept, val and test, to choose thresholds and
     filters after the run): argmax, class probabilities as uint8 (p * 255; all classes up to 8, else the argmax's
     probability only) and the GT mapping (LFC landmark error, CMB lesion F1)."""
     d.mkdir(parents=True, exist_ok=True)
     q = (probs.float().clamp(0, 1) * 255).round().to(torch.uint8)
-    np.savez_compressed(d / f"{i}.npz", pred=probs.argmax(0).to(torch.uint8).cpu().numpy(),
+    np.savez_compressed(d / f"{i}.npz", pred=(probs.argmax(0).to(torch.uint8).cpu().numpy() if lab is None else lab),
                         prob=(q if len(q) <= 8 else q.max(0).values[None]).cpu().numpy(),
                         grid_from_gt=np.asarray(grid_from_gt))
 

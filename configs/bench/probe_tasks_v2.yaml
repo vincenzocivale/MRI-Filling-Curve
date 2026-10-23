@@ -54,7 +54,7 @@ vs_seg:        {type: seg, label: seg, query: "dataset == 'crossMoDA' and site =
 prostate_zones: {type: seg, label: seg, query: "dataset == 'Prostate158' and modality == 'T2w'", classes: [1, 2]}  # 1 = TZ, 2 = PZ
 prostate_lesion: {type: seg, label: seg, query: "dataset == 'Prostate158' and modality == 'ADC' and pca == 1"}
 wmh_seg:       {type: seg, label: seg, query: "dataset == 'WMH2017'", classes: [1], ignore: [2]}   # 2 = other pathology
-cmb_seg:       {type: seg, label: seg, query: "dataset == 'VALDO' and session == 'task2' and modality == 'T2star'", save_pred: true,
+cmb_seg:       {type: seg, label: seg, query: "dataset == 'VALDO' and session == 'task2' and modality == 'T2star'", save_pred: true, select: f1,
                 extra_metric_note: "lesion-wise F1 (Dice is unstable on 2-10 mm dots)"}
 # lacune_seg removed (21/10, user): Dice 0 for all 13 models, 28 train volumes and 4 test volumes with lacunes
 heart_seg:     {type: seg, label: seg, query: "dataset == 'HVSMR' and official_split == 'no'", classes: [1, 2, 3, 4, 5, 6, 7, 8]}  # without the 20 HVSMR 2016 cases
