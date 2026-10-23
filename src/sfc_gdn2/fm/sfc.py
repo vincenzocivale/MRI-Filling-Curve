@@ -66,7 +66,7 @@ class SegNet(nn.Module):
                  c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
                  cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2,
-                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0):
+                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_menu=None):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -217,6 +217,9 @@ class SegNet(nn.Module):
             # landmarks (23/10, user: "si legge solo 8 celle a 2 mm"): segrun sets self.landmark; per level and landmark the
             # head's top cascade_topk cells (+ the true one in training) go down, the point head maps the last ones
             self.ctopk = int(cascade_topk)
+            # cascade_topk_menu (24/10, user): the cells per landmark at inference chosen on the val MRE among these (a top
+            # cell missed at 8 mm sent a landmark 37 mm away; training keeps cascade_topk + the true cell)
+            self.ctopk_menu = [int(t) for t in cascade_topk_menu or []]
             # cascade_warm W (23/10, user): the first W training iterations (and the val passes among them) stop at 4 mm;
             # the 2 mm level is read once the heads choose the cells (an untrained head marks nearly every cell mixed)
             self.cwarm = int(cascade_warm)
@@ -1425,7 +1428,8 @@ class SFC(Wrapper):
                      cascade_neg=float(self.args.get("cascade_neg") or 2.0),
                      cascade_topk=int(self.args.get("cascade_topk") or 2),
                      fine_split=bool(self.args.get("fine_split")), fine_head=self.args.get("fine_head") or "mix",
-                     cascade_warm=int(self.args.get("cascade_warm") or 0))
+                     cascade_warm=int(self.args.get("cascade_warm") or 0),
+                     cascade_topk_menu=self.args.get("cascade_topk_menu"))
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
