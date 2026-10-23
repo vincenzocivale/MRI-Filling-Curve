@@ -35,6 +35,7 @@ import json
 import math
 import os
 import resource
+import subprocess
 import sys
 import time
 import traceback
@@ -576,7 +577,7 @@ def train(job: dict) -> None:
         out_p.write_text(json.dumps({"model": job["cfg"]["model"], "init": job["init"], "iters": iters,
                                      "best": best, "curve": curve, "val_dice": best["val"],
                                      "n": {s: len(v) for s, v in split.items() if s != "test"}}, indent=1))
-        ckpt.unlink()
+        provenance(job, split, out_p, ckpt, {"best": best})
         print(f"[seg] best val dice {best['val']:.4f}" + (f" val MRE {best['val_mre']:.2f} mm" if 'val_mre' in best else "") +
               f" (iter {best['iter']}) -> {job['out']}", flush=True)
         return
@@ -595,11 +596,7 @@ def train(job: dict) -> None:
         probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"])
         lab, _, _ = gt_labels(it["seg"], it.get("classes"), it.get("ignore"))
         d, per = dice_full_res(probs, v["grid_from_gt"], lab, k, dev)
-        if job.get("save_pred"):   # the argmax on the model grid + the GT mapping (LFC landmark error, CMB lesion F1)
-            pd_ = out_p.with_suffix(".pred")
-            pd_.mkdir(exist_ok=True)
-            np.savez_compressed(pd_ / f"{it['id']}.npz", pred=probs.argmax(0).to(torch.uint8).cpu().numpy(),
-                                grid_from_gt=np.asarray(v["grid_from_gt"]))
+        save_pred(out_p.with_suffix(".pred"), it["id"], probs, v["grid_from_gt"])
         res["per_volume"].append(d)
         res["per_class"].append(per)
         res["test_ids"].append(it["id"])
@@ -613,9 +610,46 @@ def train(job: dict) -> None:
            "curve": curve, "n": {s: len(v) for s, v in split.items()},
            "test_dice": float(np.nanmean(res["per_volume"])), **res}
     out_p.write_text(json.dumps(out, indent=1))
-    ckpt.unlink()
-    part.unlink(missing_ok=True)
+    pv = out_p.with_suffix(".pred_val")
+    for it in split["val"]:   # the val predictions of the best state: thresholds / filters chosen on val later
+        if (pv / f"{it['id']}.npz").exists():
+            continue
+        v = load(it)
+        save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]), v["grid_from_gt"])
+        del v
+    provenance(job, split, out_p, ckpt, {"best": best, "test_dice": out["test_dice"]})
+    part.unlink(missing_ok=True)   # the decoder checkpoint (.best.pt) is kept (user, 23/10)
     print(f"[seg] test dice {out['test_dice']:.4f} on {len(res['per_volume'])} volumes -> {job['out']}", flush=True)
+
+
+def save_pred(d: Path, i: str, probs: torch.Tensor, grid_from_gt) -> None:
+    """Prediction of one volume on the model grid (user, 23/10: always kept, val and test, to choose thresholds and
+    filters after the run): argmax, class probabilities as uint8 (p * 255; all classes up to 8, else the argmax's
+    probability only) and the GT mapping (LFC landmark error, CMB lesion F1)."""
+    d.mkdir(parents=True, exist_ok=True)
+    q = (probs.float().clamp(0, 1) * 255).round().to(torch.uint8)
+    np.savez_compressed(d / f"{i}.npz", pred=probs.argmax(0).to(torch.uint8).cpu().numpy(),
+                        prob=(q if len(q) <= 8 else q.max(0).values[None]).cpu().numpy(),
+                        grid_from_gt=np.asarray(grid_from_gt))
+
+
+def provenance(job: dict, split: dict, out_p: Path, ckpt: Path, extra: dict) -> None:
+    """<out>.provenance.json: where the run's files come from (code commit, encoder checkpoint, job, split ids)."""
+    repo = Path(__file__).resolve().parents[3]
+    try:
+        commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=False,
+                                timeout=30).stdout.strip()
+        dirty = bool(subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "src"], capture_output=True, check=False,
+                                    text=True, timeout=30).stdout.strip())
+    except Exception:  # noqa: BLE001
+        commit, dirty = "?", None
+    out_p.with_suffix(".provenance.json").write_text(json.dumps({
+        "result": str(out_p), "decoder_checkpoint": str(ckpt), "pred_test": str(out_p.with_suffix(".pred")),
+        "pred_val": str(out_p.with_suffix(".pred_val")), "commit": commit, "uncommitted_src_changes": dirty,
+        "host": os.uname().nodename, "slurm_job": os.environ.get("SLURM_JOB_ID"),
+        "written": time.strftime("%Y-%m-%d %H:%M:%S"), "encoder_checkpoint": job["cfg"].get("checkpoint"),
+        "job": {k: v for k, v in job.items() if k != "items"},
+        "split_ids": {s: [it["id"] for it in v] for s, v in split.items()}} | extra, indent=1, default=str))
 
 
 def main(job_path: str) -> None:
