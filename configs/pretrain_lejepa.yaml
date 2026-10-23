@@ -66,6 +66,8 @@ objective:
   fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
   proj_hidden: 1024
   proj_dim: 64                # every head (view mean, patch, each cube level); LeJEPA Tab. 1d: small is better
+  proj_norm: layer           # (23/10, user) LayerNorm in every projector, not BatchNorm (no batch statistics); runs before
+                              # 23/10 used batch (their saved config.yaml has no key: the code default "batch")
   tokens_per_volume: 32       # B foreground tokens (and cells) per volume fed to their SIGReg: the estimate's sample
                               # count only (4 GPUs x 36 vols x 32 = 4608), not its weight (sigreg_samples); <32 also
                               # biases vol_share up (within-volume variance from too few tokens: floor 0.2 at 5)

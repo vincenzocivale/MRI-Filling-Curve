@@ -105,9 +105,9 @@ class Projector(nn.Sequential):
     statistics in training, so evaluating with running ones would score a different function
     (it inflated val SIGReg ~1.4x at equal train/val data)."""
 
-    def __init__(self, d_in: int, hidden: int, d_out: int):
-        def bn():
-            return nn.BatchNorm1d(hidden, track_running_stats=False)
+    def __init__(self, d_in: int, hidden: int, d_out: int, norm: str = "batch"):
+        def bn():   # norm "layer" (23/10, user): per-sample LayerNorm, no batch statistics (small batches per update)
+            return nn.LayerNorm(hidden) if norm == "layer" else nn.BatchNorm1d(hidden, track_running_stats=False)
         super().__init__(nn.Linear(d_in, hidden), bn(), nn.GELU(),
                          nn.Linear(hidden, hidden), bn(), nn.GELU(), nn.Linear(hidden, d_out))
 
@@ -122,6 +122,7 @@ class LeJEPA(nn.Module):
                  shift: float = 0.05, noise: float = 0.02, fg_threshold: float = 0.05, proj_hidden: int = 1024,
                  proj_dim: int = 128, tokens_per_volume: int = 64, lam: float = 0.05, sigreg_slices: int = 256,
                  sigreg_knots: int = 17, levels: tuple = (), mask_cells: tuple = (1,), sigreg_samples: int = 768,
+                 proj_norm: str = "batch", sigreg_queue: int = 0,
                  w_top: float = 1.0, w_tok: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
                  coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False,
@@ -137,6 +138,9 @@ class LeJEPA(nn.Module):
         self.thick_prob, self.thick_mm = thick_prob, tuple(float(t) for t in thick_mm)
         self.coarse_max, self.coarse_prob = int(coarse_max), coarse_prob
         self.tokens_per_volume, self.sigreg_samples, self.w_top = tokens_per_volume, sigreg_samples, w_top
+        # sigreg_queue K (23/10, user: small updates, statistics of a larger batch): every SIGReg also sees the last K
+        # steps' embeddings of the same term (detached, MoCo-style), the gradient only through the current ones
+        self.sigreg_queue, self._sq = int(sigreg_queue), {}
         self.w_tok = w_tok   # weight of the token (masked patch) term in both means; 0: its ablation (22/10)
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
@@ -148,10 +152,10 @@ class LeJEPA(nn.Module):
         # invariance mean, beside the masked-token term (1); logged as inv_token_vis / inv_token_self(_m, _v).
         self.tok_visible, self.tok_self = float(tok_visible), float(tok_self)
         self.register_buffer("mask_cells", torch.tensor(mask_cells), persistent=False)
-        self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim)
-        self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim)
-        self.cell = nn.ModuleList(Projector(2 * encoder.dim, proj_hidden, proj_dim) for _ in self.levels)
-        self.top = nn.ModuleDict({n: Projector(2 * encoder.dim, proj_hidden, proj_dim) for n in top_levels})
+        self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim, proj_norm)
+        self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim, proj_norm)
+        self.cell = nn.ModuleList(Projector(2 * encoder.dim, proj_hidden, proj_dim, proj_norm) for _ in self.levels)
+        self.top = nn.ModuleDict({n: Projector(2 * encoder.dim, proj_hidden, proj_dim, proj_norm) for n in top_levels})
         self.rec_weight, self.rec_cells, self.rec_eps, self.rec_visible = rec_weight, rec_cells, rec_eps, rec_visible
         self.rec = nn.Sequential(nn.Linear(2 * encoder.dim, proj_hidden), nn.GELU(),
                                  nn.Linear(proj_hidden, rec_cells ** 3)) if rec_weight or rec_visible else None
@@ -472,11 +476,15 @@ class LeJEPA(nn.Module):
         # volume whose B views hold no foreground (boxes are centred on it, so only after jitter) falls back to all
         keep = self._sample(tvol, tfg, b, gen)
 
-        def sig(z):  # every rank's samples (differentiable gather), weighed as sigreg_samples whatever their count
+        def sig(z, key=None):  # every rank's samples (differentiable gather), weighed as sigreg_samples whatever their count
             z = gather_rows(z) if torch.distributed.is_initialized() else z
+            if self.sigreg_queue and key is not None and self.training:   # + the last steps' samples of this term
+                q = [t for t in self._sq.get(key, []) if t.shape[:-2] == z.shape[:-2] and t.shape[-1] == z.shape[-1]]
+                self._sq[key] = (q + [z.detach()])[-self.sigreg_queue:]
+                z = torch.cat([z, *q], -2)
             return self.sigreg(z, gen) * (self.sigreg_samples / z.shape[-2])
 
-        sig_g, sig_t = sig(zg.permute(2, 0, 1, 3).reshape(2, -1, zg.shape[-1])), sig(ztok[keep][None])
+        sig_g, sig_t = sig(zg.permute(2, 0, 1, 3).reshape(2, -1, zg.shape[-1]), "global"), sig(ztok[keep][None], "token")
         out = {}
         if zc:
             zc = torch.cat(zc, 1)
@@ -485,7 +493,7 @@ class LeJEPA(nn.Module):
         for cs, p, q, z, vb in zip(self.levels, cpred, ctgt, cz, cvol):
             p, q, z, vb = torch.cat(p), torch.cat(q), torch.cat(z), torch.cat(vb)
             out[f"inv_cell{cs}"] = (p - q).square().mean(-1).sum() / max(len(p), 1) / 4
-            out[f"sigreg_cell{cs}"] = sig(z[self._sample(vb, torch.ones_like(vb, dtype=torch.bool), b, gen)][None])
+            out[f"sigreg_cell{cs}"] = sig(z[self._sample(vb, torch.ones_like(vb, dtype=torch.bool), b, gen)][None], f"cell{cs}")
             out[f"pairs_cell{cs}"] = torch.tensor(float(len(p)), device=z.device)
         if self.coarse_view:   # scans too finely sampled for the coarse block keep their fine view (one more copy)
             ct, big = self.coarse_tops(vols, fg, corner, edge)
@@ -505,7 +513,7 @@ class LeJEPA(nn.Module):
             centre = z.new_zeros(n, z.shape[-1]).index_add_(0, grp, z[:, : 2 * self.gg].mean(1)) / cnt
             out[f"inv_{name}"] = (z - centre[grp][:, None]).square().mean()
             per = z.new_zeros(n, *z.shape[1:]).index_add_(0, grp, z) / cnt[..., None]      # one sample per group
-            out[f"sigreg_{name}"] = sig(per.transpose(0, 1))                               # [V,n,D]: per view slot
+            out[f"sigreg_{name}"] = sig(per.transpose(0, 1), name)                         # [V,n,D]: per view slot
         with torch.no_grad():                                   # between-volume share of token-embedding variance
             zt, tv = ztok[keep], tvol[keep]
             means = torch.zeros(b, zt.shape[1], device=zt.device).index_add_(0, tv, zt)
