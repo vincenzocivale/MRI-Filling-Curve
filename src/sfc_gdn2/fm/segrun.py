@@ -139,10 +139,11 @@ def tile_of(patch, align, k: int = 2):
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
     on that grid (token cache), the volume padded so that the last tile ends on it."""
-    if getattr(net, "matryoshka", False) and ctx is not None:   # the whole scan in one pass (no tiles)
+    lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
+    if getattr(net, "matryoshka", False) and ctx is not None and not lm:   # the whole scan in one pass (no tiles)
         with amp():
             return net.matryoshka_predict(x, ctx.to(x.device), n_out)
-    if getattr(net, "adaptive", False) and ctx is not None:
+    if getattr(net, "adaptive", False) and ctx is not None and not lm:
         with amp():
             return net.adaptive_predict(x, ctx.to(x.device), n_out)
     S = tuple(x.shape[1:])
@@ -176,7 +177,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) 
                                                        torch.cat([ctx, torch.tensor(co, dtype=ctx.dtype)]) for co in cs])
             logits = call(net, torch.stack([xp[(slice(None), *sl)] for sl in sls]), cx)
         for lg, sl in zip(logits, sls):
-            out[(slice(None), *sl)] += (lg.float().softmax(0) * g).to(out)
+            out[(slice(None), *sl)] += ((lg.float().sigmoid() if lm else lg.float().softmax(0)) * g).to(out)
             wsum[sl] += g
     wsum = wsum.to(out.device)
     for c in range(n_out):  # one class at a time: dividing the whole fp16 accumulator by an fp32 tensor made an fp32
@@ -193,6 +194,44 @@ def dice_on(pred: torch.Tensor, y: torch.Tensor, k: int) -> float:
 
 
 MISS_MM = 50.0   # a landmark not predicted at all counts as this radial error in the val selection
+
+
+LANDMARK_SIGMA_MM = 3.0   # landmark heatmaps (user, 23/10: landmarks are a regression, not a segmentation)
+
+
+def heatmaps(lm, start, P) -> torch.Tensor:
+    """[n, *P] Gaussian heatmaps of a tile at `start`: lm = (landmark voxels [n, 3] on the model grid, rounded, NaN
+    if absent; grid spacing [3] in mm); exactly 1 at each landmark's voxel."""
+    xyz, sp = lm
+    ax = [((torch.arange(p) + int(s))[None] - xyz[:, a:a + 1]) * float(sp[a]) for a, (s, p) in enumerate(zip(start, P))]
+    g = [torch.exp(-0.5 * (d / LANDMARK_SIGMA_MM) ** 2).nan_to_num(0.0) for d in ax]
+    return (g[0][:, :, None, None] * g[1][:, None, :, None] * g[2][:, None, None, :]).half()
+
+
+def focal_heatmap(logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    """CenterNet's penalty-reduced focal loss of heatmap logits [B, n, *P] against targets h (1 at the landmark)."""
+    pos = h > 0.999
+    lp, ln = F.logsigmoid(logits), F.logsigmoid(-logits)
+    p = lp.exp()
+    neg = (p ** 2 * (1 - h) ** 4 * ln)[~pos]
+    if not pos.any():   # no landmark in the tile: the mean, not a sum over millions of voxels divided by 1
+        return -neg.mean()
+    return -(((1 - p) ** 2 * lp)[pos].sum() + neg.sum()) / pos.sum()
+
+
+def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
+    """Landmark tasks: channels 1.. of the decoder are heatmaps (sigmoid), y the tiles' target heatmaps; one scan
+    at a time, every model's decoder as it is."""
+    parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
+        [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
+    tot = 0.0
+    for xi, yi, ci in parts:
+        with amp():
+            lg = call(net, xi.to(dev).float(), ci)
+        loss = focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) / len(parts)
+        loss.backward()
+        tot += float(loss)
+    return torch.tensor(tot)
 
 
 def landmark(p: torch.Tensor) -> torch.Tensor:
@@ -256,8 +295,9 @@ class Patches:
     """Random training patches from volumes held in RAM; 1/3 centred on a voxel of a random present class."""
 
     def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator):
-        self.vols, self.ctx, self.patch, self.rng, self.align = [], [], [], rng, []
+        self.vols, self.ctx, self.patch, self.rng, self.align, self.lm = [], [], [], rng, [], []
         for v in vols:
+            self.lm.append(v.get("lm"))
             pv = tile_of(patch, v.get("align"), k)
             x, y = pad_to(v["x"], v["y"], pv) if pv else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
@@ -291,7 +331,7 @@ class Patches:
                 cs[-1] = torch.cat([cs[-1], torch.tensor(start, dtype=torch.float)])
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
-            ys.append(y[sl])
+            ys.append(y[sl] if self.lm[j] is None else heatmaps(self.lm[j], start, P))
         if len({t.shape for t in xs}) > 1:
             return [t[None] for t in xs], [t[None] for t in ys], None if cs[0] is None else [t[None] for t in cs]
         return torch.stack(xs), torch.stack(ys), None if cs[0] is None else torch.stack(cs)
@@ -419,6 +459,8 @@ def train(job: dict) -> None:
           f"{len(frozen_names - loaded)} frozen but not loaded {sorted(frozen_names - loaded)[:4]}, "
           f"{len(loaded - {n for n in names if is_frozen(n)})} loaded outside the prefixes (frozen too)", flush=True)
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
+    LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
+    net.landmark = LM
     if getattr(net, "decoder_c", False):   # decoder C trains on large tiles (whole scans mostly): 16 cells of 16 mm per
         global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
         TILE_CELLS, TILE_MAX = 16, 3e8 * k
@@ -447,8 +489,15 @@ def train(job: dict) -> None:
             ctx = torch.cat([ctx.float(), torch.tensor(r["x"].shape[1:], dtype=torch.float)])
         if tcache is not None:   # + the volume's index in the token cache; tiles append their corner
             ctx = torch.cat([ctx, torch.tensor([float(vid[it["id"]])])])
-        return {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx,
-                "align": None if tcache is None else [4 * a for a in tcache.meta(it["id"])["k4"]]}
+        v = {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx,
+             "align": None if tcache is None else [4 * a for a in tcache.meta(it["id"])["k4"]]}
+        if LM:   # model-grid spacing (mm: GT zooms through the grid mapping) and each landmark's voxel on the grid
+            A = np.linalg.inv(np.asarray(r["grid_from_gt"], dtype=float)[:3, :3])
+            sp = np.linalg.norm(A * np.asarray(nib.load(it["seg"]).header.get_zooms()[:3], dtype=float)[:, None], axis=0)
+            y = r["y"][0] if r["y"].dim() == 4 else r["y"]
+            xyz = torch.stack([(y == c).nonzero().float().mean(0).round() for c in range(1, k)])   # NaN if absent
+            v["sp"], v["lm"] = sp, (xyz, sp)
+        return v
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
@@ -530,7 +579,10 @@ def train(job: dict) -> None:
             # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
             # of ~1e7 voxels x 50 classes: then micro_step (the two graphs of joint_step went OOM)
             vox = sum(t.numel() for t in x) if isinstance(x, list) else x.numel()
-            if getattr(net, "matryoshka", False):
+            if LM:
+                loss = landmark_step(net, x, y, c, amp, dev)
+                logits = torch.zeros(1, device=dev)
+            elif getattr(net, "matryoshka", False):
                 loss = matryoshka_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             elif getattr(net, "adaptive", False):
@@ -569,7 +621,7 @@ def train(job: dict) -> None:
                 rec = {"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
                 if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
-                    mre = float(np.mean([mre_on(p, v["y"].to(dev), v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
+                    mre = float(np.mean([mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
                     rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
                 del preds
                 curve.append(rec)
