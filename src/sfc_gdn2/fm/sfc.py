@@ -390,12 +390,16 @@ class SegNet(nn.Module):
                     q = xyz[sel]
                     lab = self._groups(q, gf) if self.fine_split and i == 2 else torch.zeros(len(sel), dtype=torch.long, device=z.device)
                     cu1 = F.pad(torch.bincount(lab).cumsum(0), (1, 0)).to(torch.int32)   # one sequence per group
-                    bf = 0
+                    bf, keep_ = 0, (self.encoder.depth, self.encoder.taps)
+                    if getattr(self, "blocks_lv", None):   # this level's blocks (block_plan), the encoder that deep
+                        from .block_plan import apply
+                        apply(self.encoder, self.blocks_lv.get(float(self.fine_mm[i]), self.blocks_lv[16.0]))
                     for c in self.enc_curves:   # within each group along the curve
                         kk = keys(c, q, gf, self.seed)
                         o = (lab * (int(kk.max()) + 1) + kk).argsort()
                         bf = bf + self.encoder.flat(x[o], cu1, pos=q[o]).float()[o.argsort()]
                     bf = bf / len(self.enc_curves)
+                    self.encoder.depth, self.encoder.taps = keep_
                 pe.patch_mm = mm0
                 t = t.index_add(0, sel, self.fine_tok[i](self.proj(bf)))
         t_enc = t - t_par   # the encoder's part (decoder D's MLP reads the parts apart)
@@ -1411,10 +1415,14 @@ class SFC(Wrapper):
         if isinstance(taps, int):           # quarter points below the last block (2: n/2, 3n/4; 3: also n/4; 4: also
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
-        blocks = self.args.get("blocks")   # fm/block_plan (24/10): these blocks only, the encoder run as deep as the last
+        blocks = self.args.get("blocks")   # fm/block_plan (24/10): these blocks only, the encoder run as deep as the last;
+        lv = None                           # a dict {mm: blocks} (as many per level): each level its own (16 mm at build)
         if blocks:
             from .block_plan import apply
-            apply(enc, blocks)
+            if isinstance(blocks, dict):
+                lv = {float(m): [int(b) for b in v] for m, v in blocks.items()}
+                assert len({len(v) for v in lv.values()}) == 1, f"blocks per level: as many at each level {lv}"
+            apply(enc, lv[16.0] if lv else blocks)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
                      tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")),
@@ -1445,9 +1453,11 @@ class SFC(Wrapper):
                      cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16),
                      fine_live4=bool(self.args.get("fine_live4")))
         bj = Path(str(self.args.get("token_cache") or "")) / "blocks.json"
+        net.blocks_lv = lv
         if blocks and isinstance(net.cache, TokenCache) and bj.exists():   # a cache of more blocks: the decoder's columns
             from .block_plan import columns
-            net.cache.cols = columns(json.loads(bj.read_text())["cache"], blocks, enc.dim)
+            cb = json.loads(bj.read_text())["cache"]
+            net.cache.cols = {m: columns(cb, v, enc.dim) for m, v in lv.items() if m >= 8} if lv else columns(cb, blocks, enc.dim)
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

@@ -92,7 +92,8 @@ class TokenCache:
         return self._recent[key]
 
     def _cols(self, t: torch.Tensor, mm: float) -> torch.Tensor:
-        return t if self.cols is None or (self.pca and mm < 16) else t[..., self.cols]
+        c = self.cols.get(float(mm)) if isinstance(self.cols, dict) else self.cols   # per level: {mm: columns}
+        return t if c is None or (self.pca and mm < 16) else t[..., c]
 
     def _read(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
         fd, shape, dt, off = self._open(i, mm, self.pca if mm < 16 else None)

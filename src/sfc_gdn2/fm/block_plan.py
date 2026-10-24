@@ -105,8 +105,14 @@ def main(path: str) -> None:
     feats = {}   # (task, split, level) -> [X [cells, n + 1, d] fp16, Y]
     for task, sp_ids in job["tasks"].items():
         for split, ids in sp_ids.items():
+            used = 0   # volumes holding the target (CMB: many scans have no lesion), up to n[split] of the ids given
             for i in ids:
+                if used >= int(job.get("n", {}).get(split, len(ids))):
+                    break
                 r = torch.load(Path(job["inputs"]) / f"{i}.pt", map_location="cpu", weights_only=False)
+                if not bool((r["y"] > 0).any()) or bool((r["y"] == 255).all()):
+                    continue
+                used += 1
                 x, sp = r["x"].cuda(), r["ctx"][:3].float().cuda()
                 y = (r["y"][0] if r["y"].dim() == 4 else r["y"]).cuda()
                 K = int(job["k"][task])
@@ -146,8 +152,8 @@ def main(path: str) -> None:
             while len(chosen) < max_blocks:
                 cand = {b: score(chosen + [b]) for b in order if b not in chosen}
                 b = max(cand, key=cand.get)
-                if chosen and cand[b] - best < min_gain:
-                    break
+                if chosen and cand[b] - best < min_gain and job.get("min_gain") is not None:
+                    break   # (default: exactly max_blocks per level, the decoder's width the same at every level)
                 chosen, best = chosen + [b], cand[b]
                 steps.append({"block": b, "val_auroc": round(best, 4)})
             res["tasks"][task][str(int(mm))] = sorted(chosen)
@@ -156,6 +162,11 @@ def main(path: str) -> None:
             print(f"[blocks] {task} {mm:g} mm: " + " ".join(f"{b}:{v:.3f}" for b, v in sorted(single.items())) +
                   f" -> {sorted(chosen)} ({best:.3f})", flush=True)
             D.clear()
+    for task, tl in res["tasks"].items():   # levels not scored (cells under 8 voxels, no target): the nearest one's
+        have = sorted(float(m) for m in tl)
+        for mm in LEVELS:
+            if have and str(int(mm)) not in tl:
+                tl[str(int(mm))] = tl[str(int(min(have, key=lambda h: (abs(h - mm), -h))))]
     res["cache"] = sorted({b for v in res["tasks"].values() for mm, bl in v.items() if float(mm) >= 8 for b in bl})
     res["layout"] = layout(res["cache"])
     out.mkdir(parents=True, exist_ok=True)
