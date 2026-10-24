@@ -5,7 +5,7 @@ last block and miss 4-6. Per encoder, once, from a few train / val volumes of ea
   every block's tokens (and the patch embedding, -1) at 16 / 8 / 4 mm -> per cell its classes' voxel fractions;
   a ridge readout fitted on the train cells, scored on the val cells (mean AUROC over the classes and levels);
   greedy: per task and level the block that adds most to the val score, up to `max_blocks`, a second one only if it
-  improves it (else the first repeated: the same width at every level); at the live levels (4 / 2 mm) only blocks up
+  improves it (1 or 2 blocks per level: SegNet projects each level's width on its own); at the live levels (4 / 2 mm) only blocks up
   to the shallowest depth within live_tol (0.01) of the best single block, at most live_cap (9).
 
 -> <out>/blocks.json: per task its blocks (the decoder: its last block = the deepest, the others its taps, the
@@ -31,7 +31,7 @@ WIN = 16
 
 def layout(blocks) -> list[int]:
     """The order of a token row's blocks: the deepest (the encoder's last, final norm) ++ the others ascending."""
-    b = sorted(int(x) for x in blocks)   # a repeated block: its output twice (Encoder taps), same width
+    b = sorted({int(x) for x in blocks})
     return [b[-1]] + b[:-1]
 
 
@@ -166,7 +166,6 @@ def main(path: str) -> None:
                     break
                 chosen, best = chosen + [b], cand[b]
                 steps.append({"block": b, "val_auroc": round(best, 4)})
-            chosen += [chosen[-1]] * (max_blocks - len(chosen))   # repeated: the same width at every level
             res["tasks"][task][str(int(mm))] = sorted(chosen)
             res["scores"][task][str(int(mm))] = {"single": {str(b): round(v, 4) for b, v in single.items()},
                                                  "greedy": steps, "cells": [len(D["train"][1]), len(D["val"][1])]}

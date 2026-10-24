@@ -373,7 +373,7 @@ class SegNet(nn.Module):
                 tf = self.cache.tokens_at(ci, float(self.fine_mm[i]), corner, gf.tolist(), kf, keep).to(z.device).float()
             else:
                 tf = sub(self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float())
-            t = t + self.fine_tok[i](tf if self.cache.pca else self.proj(tf))
+            t = t + self.fine_tok[i](tf if self.cache.pca else self._fproj(i, tf))
         elif self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
             if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
                 sel = torch.arange(len(xyz), device=z.device)   # TotalSeg's 4 mm level, ~2e5 tokens, did not fit)
@@ -401,7 +401,7 @@ class SegNet(nn.Module):
                     bf = bf / len(self.enc_curves)
                     self.encoder.depth, self.encoder.taps = keep_
                 pe.patch_mm = mm0
-                t = t.index_add(0, sel, self.fine_tok[i](self.proj(bf)))
+                t = t.index_add(0, sel, self.fine_tok[i](self._fproj(i, bf)))
         t_enc = t - t_par   # the encoder's part (decoder D's MLP reads the parts apart)
         if self.image and self.enc_img is not None:
             pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
@@ -420,6 +420,11 @@ class SegNet(nn.Module):
             t = t + e(sub(patchify(vol.float(), kf)), e.weights(sp.float(), kf))
         self._parts = (t_par, t_enc, t - t_par - t_enc)
         return t, xyz, gf, kf
+
+    def _fproj(self, i, t):
+        """Level i's tokens (its blocks) -> d: its own projection under per-level blocks, else the shared one."""
+        lp, key = getattr(self, "lproj", None), str(int(float(self.fine_mm[i]) * 10))
+        return lp[key](t) if lp is not None and key in lp else self.proj(t)
 
     @staticmethod
     def _groups(q, gf) -> torch.Tensor:
@@ -1427,7 +1432,6 @@ class SFC(Wrapper):
             from .block_plan import apply
             if isinstance(blocks, dict):
                 lv = {float(m): [int(b) for b in v] for m, v in blocks.items()}
-                assert len({len(v) for v in lv.values()}) == 1, f"blocks per level: as many at each level {lv}"
             apply(enc, lv[16.0] if lv else blocks)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
@@ -1460,6 +1464,10 @@ class SFC(Wrapper):
                      fine_live4=bool(self.args.get("fine_live4")))
         bj = Path(str(self.args.get("token_cache") or "")) / "blocks.json"
         net.blocks_lv = lv
+        if lv:   # each finer level its own projection of its blocks to d (1 or 2 blocks per level, block_plan)
+            u = 1 if net.unique else 2
+            net.lproj = nn.ModuleDict({str(int(m * 10)): nn.Linear(len(v) * enc.dim * u, enc.dim) if len(v) * u > 1 else nn.Identity()
+                                       for m, v in lv.items() if m < 16})
         if blocks and isinstance(net.cache, TokenCache) and bj.exists():   # a cache of more blocks: the decoder's columns
             from .block_plan import columns
             cb = json.loads(bj.read_text())["cache"]
