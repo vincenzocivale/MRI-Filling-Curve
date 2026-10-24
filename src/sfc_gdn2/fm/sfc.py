@@ -394,11 +394,12 @@ class SegNet(nn.Module):
                     if getattr(self, "blocks_lv", None):   # this level's blocks (block_plan), the encoder that deep
                         from .block_plan import apply
                         apply(self.encoder, self.blocks_lv.get(float(self.fine_mm[i]), self.blocks_lv[16.0]))
-                    for c in self.enc_curves:   # within each group along the curve
+                    cl = (getattr(self, "curves_lv", None) or {}).get(float(self.fine_mm[i]), self.enc_curves)
+                    for c in cl:   # within each group along the curve (block_plan: one curve per live level)
                         kk = keys(c, q, gf, self.seed)
                         o = (lab * (int(kk.max()) + 1) + kk).argsort()
                         bf = bf + self.encoder.flat(x[o], cu1, pos=q[o]).float()[o.argsort()]
-                    bf = bf / len(self.enc_curves)
+                    bf = bf / len(cl)
                     self.encoder.depth, self.encoder.taps = keep_
                 pe.patch_mm = mm0
                 t = t.index_add(0, sel, self.fine_tok[i](self._fproj(i, bf)))
@@ -422,9 +423,8 @@ class SegNet(nn.Module):
         return t, xyz, gf, kf
 
     def _fproj(self, i, t):
-        """Level i's tokens (its blocks) -> d: its own projection under per-level blocks, else the shared one."""
-        lp, key = getattr(self, "lproj", None), str(int(float(self.fine_mm[i]) * 10))
-        return lp[key](t) if lp is not None and key in lp else self.proj(t)
+        """Level i's tokens for its fine_tok: as they are under per-level blocks (fine_tok reads them), else -> d."""
+        return t if i in getattr(self, "fine_direct", ()) else self.proj(t)
 
     @staticmethod
     def _groups(q, gf) -> torch.Tensor:
@@ -1464,10 +1464,15 @@ class SFC(Wrapper):
                      fine_live4=bool(self.args.get("fine_live4")))
         bj = Path(str(self.args.get("token_cache") or "")) / "blocks.json"
         net.blocks_lv = lv
-        if lv:   # each finer level its own projection of its blocks to d (1 or 2 blocks per level, block_plan)
-            u = 1 if net.unique else 2
-            net.lproj = nn.ModuleDict({str(int(m * 10)): nn.Linear(len(v) * enc.dim * u, enc.dim) if len(v) * u > 1 else nn.Identity()
-                                       for m, v in lv.items() if m < 16})
+        if lv and getattr(net, "fine_tok", None) is not None:   # each finer level reads its own blocks (1 or 2) straight
+            u = 1 if net.unique else 2                           # into its fine_tok (a projection to d first was a second
+            net.fine_direct = set()                              # linear map in a row: ~2M parameters for nothing)
+            for i, m in enumerate(net.fine_mm[: len(net.fine_tok)]):
+                if float(m) in lv and not (net.cache is not None and net.cache.pca and i < net.ncached):
+                    net.fine_tok[i] = nn.Linear(len(lv[float(m)]) * enc.dim * u, 128)
+                    net.fine_direct.add(i)
+        lc = self.args.get("live_curves")   # block_plan: one curve per live level (a third of the live reading)
+        net.curves_lv = {float(m): [c] for m, c in lc.items()} if lc else None
         if blocks and isinstance(net.cache, TokenCache) and bj.exists():   # a cache of more blocks: the decoder's columns
             from .block_plan import columns
             cb = json.loads(bj.read_text())["cache"]

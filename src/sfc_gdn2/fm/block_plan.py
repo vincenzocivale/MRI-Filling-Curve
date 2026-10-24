@@ -131,52 +131,71 @@ def main(path: str) -> None:
                             sl = tuple(slice(a, a + WIN * kk) for a, kk in zip(lo, k))
                             xc, yc = x[(slice(None), *sl)], y[sl]
                     idx, fr = _cells(yc, k, K, cap, rng)
-                    with torch.no_grad():
-                        a = read(enc, curves, seed, xc, sp, k, mm, 30_000, 32, 8, taps=True)   # all 17 blocks: small windows (OOM at 200k)
-                    a = torch.from_numpy(a.reshape(-1, n + 1, d)[idx])
-                    f = feats.setdefault((task, split, mm), [[], []])
-                    f[0].append(a)
-                    f[1].append(fr.cpu())
+                    # cached levels: the curves' mean (as the cache); live levels: each curve alone (one curve per live
+                    # level, chosen here: user, 24/10, a third of the live reading)
+                    for cv in ([None] if mm >= 8 else curves):
+                        with torch.no_grad():   # all 17 blocks: small windows (OOM at 200k)
+                            a = read(enc, curves if cv is None else [cv], seed, xc, sp, k, mm, 30_000, 32, 8, taps=True)
+                        f = feats.setdefault((task, split, mm, cv), [[], []])
+                        f[0].append(torch.from_numpy(a.reshape(-1, n + 1, d)[idx]))
+                        f[1].append(fr.cpu())
                 print(f"[blocks] {task} {split} {i}", flush=True)
-    for task in job["tasks"]:   # per level (user, 24/10: each level decides something else; no mean over levels)
-        res["tasks"][task], res["scores"][task] = {}, {}
-        for mm in LEVELS:
-            if (task, "train", mm) not in feats or (task, "val", mm) not in feats:
-                continue
-            D = {s_: [torch.cat(v).cuda() for v in feats[(task, s_, mm)]] for s_ in ("train", "val")}
+    def select(D, mm):   # one level's blocks (and its single-block scores) on train / val cells D
+        def score(blocks):
+            cs = [order.index(b) for b in blocks]
+            return _score(D["train"][0][:, cs].flatten(1).float(), D["train"][1],
+                          D["val"][0][:, cs].flatten(1).float(), D["val"][1])
+        single = {b: score([b]) for b in order}
+        pool = order
+        if mm < 8:   # live levels (user via Tullio, 24/10): the encoder only as deep as needed, the shallowest depth
+            top = max(single.values())   # whose best single block is within `live_tol` of the best one, at most
+            cap = int(job.get("live_cap", 9))   # live_cap (the argmax picked 14 / 15 by 0.003, noise: no cut)
+            d = next((d for d in range(-1, cap + 1) if max(single[b] for b in order if b <= d) >= top - float(job.get("live_tol", 0.01))), cap)
+            pool = [b for b in order if b <= d]
+        chosen, best, steps = [], 0.5, []
+        while len(chosen) < max_blocks:
+            cand = {b: score(chosen + [b]) for b in pool if b not in chosen}
+            if not cand:
+                break
+            b = max(cand, key=cand.get)
+            if chosen and cand[b] <= best:   # a second block only if it improves the val AUROC
+                break
+            chosen, best = chosen + [b], cand[b]
+            steps.append({"block": b, "val_auroc": round(best, 4)})
+        return sorted(chosen), best, steps, single
 
-            def score(blocks, D=D):
-                cs = [order.index(b) for b in blocks]
-                return _score(D["train"][0][:, cs].flatten(1).float(), D["train"][1],
-                              D["val"][0][:, cs].flatten(1).float(), D["val"][1])
-            single = {b: score([b]) for b in order}
-            pool = order
-            if mm < 8:   # live levels (user via Tullio, 24/10): the encoder only as deep as needed, the shallowest depth
-                top = max(single.values())   # whose best single block is within `live_tol` of the best one, at most
-                cap = int(job.get("live_cap", 9))   # live_cap (the argmax picked 14 / 15 by 0.003, noise: no cut)
-                d = next((d for d in range(-1, cap + 1) if max(single[b] for b in order if b <= d) >= top - float(job.get("live_tol", 0.01))), cap)
-                pool = [b for b in order if b <= d]
-            chosen, best, steps = [], 0.5, []
-            while len(chosen) < max_blocks:
-                cand = {b: score(chosen + [b]) for b in pool if b not in chosen}
-                if not cand:
-                    break
-                b = max(cand, key=cand.get)
-                if chosen and cand[b] <= best:   # a second block only if it improves the val AUROC
-                    break
-                chosen, best = chosen + [b], cand[b]
-                steps.append({"block": b, "val_auroc": round(best, 4)})
-            res["tasks"][task][str(int(mm))] = sorted(chosen)
-            res["scores"][task][str(int(mm))] = {"single": {str(b): round(v, 4) for b, v in single.items()},
-                                                 "greedy": steps, "cells": [len(D["train"][1]), len(D["val"][1])]}
-            print(f"[blocks] {task} {mm:g} mm: " + " ".join(f"{b}:{v:.3f}" for b, v in sorted(single.items())) +
-                  f" -> {sorted(chosen)} ({best:.3f})", flush=True)
-            D.clear()
+    res["curves"] = {}
+    for task in job["tasks"]:   # per level (user, 24/10: each level decides something else; no mean over levels)
+        res["tasks"][task], res["scores"][task], res["curves"][task] = {}, {}, {}
+        for mm in LEVELS:
+            out_c = {}
+            for cv in ([None] if mm >= 8 else curves):
+                if (task, "train", mm, cv) not in feats or (task, "val", mm, cv) not in feats:
+                    continue
+                D = {s_: [torch.cat(v).cuda() for v in feats[(task, s_, mm, cv)]] for s_ in ("train", "val")}
+                out_c[cv] = select(D, mm) + ([len(D["train"][1]), len(D["val"][1])],)
+                del D
+            if not out_c:
+                continue
+            cv = max(out_c, key=lambda c: out_c[c][1])   # live levels: the curve with the best val AUROC
+            chosen, best, steps, single, cells = out_c[cv]
+            res["tasks"][task][str(int(mm))] = chosen
+            if cv is not None:
+                res["curves"][task][str(int(mm))] = cv
+            res["scores"][task][str(int(mm))] = {"single": {str(b): round(v, 4) for b, v in single.items()}, "greedy": steps,
+                                                 "cells": cells, "curve": cv,
+                                                 "per_curve": {str(c): round(o[1], 4) for c, o in out_c.items()}}
+            print(f"[blocks] {task} {mm:g} mm{'' if cv is None else ' ' + cv}: " +
+                  " ".join(f"{b}:{v:.3f}" for b, v in sorted(single.items())) + f" -> {chosen} ({best:.3f})" +
+                  ("" if cv is None else " curves " + " ".join(f"{c}:{o[1]:.3f}" for c, o in out_c.items())), flush=True)
     for task, tl in res["tasks"].items():   # levels not scored (cells under 8 voxels, no target): the nearest one's
         have = sorted(float(m) for m in tl)
         for mm in LEVELS:
             if have and str(int(mm)) not in tl:
                 tl[str(int(mm))] = tl[str(int(min(have, key=lambda h: (abs(h - mm), -h))))]
+        tc = res["curves"][task]
+        for mm in (4, 2):
+            tc.setdefault(str(mm), tc.get("4", tc.get("2", curves[0])))
     res["cache"] = sorted({b for v in res["tasks"].values() for mm, bl in v.items() if float(mm) >= 8 for b in bl})   # (a set)
     res["layout"] = layout(res["cache"])
     out.mkdir(parents=True, exist_ok=True)

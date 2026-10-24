@@ -469,8 +469,10 @@ def train(job: dict) -> None:
         print(f"[seg] cascade plan {pp.name}: g0 {pl['g0']:.0f} mm, g_min {pl['gmin']:.0f} mm, {pl['per_g0']}", flush=True)
     if args.get("blocks") == "auto":   # fm/block_plan's choice for this task, next to the token cache (24/10)
         task = Path(job["out"]).parts[-3]
-        args["blocks"] = json.loads((Path(args["token_cache"]) / "blocks.json").read_text())["tasks"][task]   # {mm: blocks}
-        print(f"[seg] blocks {args['blocks']} (block_plan, {task})", flush=True)
+        pl = json.loads((Path(args["token_cache"]) / "blocks.json").read_text())
+        args["blocks"] = pl["tasks"][task]   # {mm: blocks}
+        args["live_curves"] = (pl.get("curves") or {}).get(task)   # {mm: curve} of the live levels
+        print(f"[seg] blocks {args['blocks']}, live curves {args['live_curves']} (block_plan, {task})", flush=True)
     w = build(job["cfg"], job["device"])
     torch.manual_seed(job["seed"])
     ref, frozen, patch = w.seg_net(k, pretrained=False)
