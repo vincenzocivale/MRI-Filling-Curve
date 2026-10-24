@@ -4,7 +4,9 @@ last block and miss 4-6. Per encoder, once, from a few train / val volumes of ea
 
   every block's tokens (and the patch embedding, -1) at 16 / 8 / 4 mm -> per cell its classes' voxel fractions;
   a ridge readout fitted on the train cells, scored on the val cells (mean AUROC over the classes and levels);
-  greedy: per task the block that adds most to the val score, up to `max_blocks`, while it adds >= `min_gain`.
+  greedy: per task and level the block that adds most to the val score, up to `max_blocks`, a second one only if it
+  improves it (else the first repeated: the same width at every level); at the live levels (4 / 2 mm) only blocks up
+  to the shallowest depth within live_tol (0.01) of the best single block, at most live_cap (9).
 
 -> <out>/blocks.json: per task its blocks (the decoder: its last block = the deepest, the others its taps, the
 encoder run only that deep, live levels included) and the cache's (their union, layout() order). Seconds of ridge
@@ -29,7 +31,7 @@ WIN = 16
 
 def layout(blocks) -> list[int]:
     """The order of a token row's blocks: the deepest (the encoder's last, final norm) ++ the others ascending."""
-    b = sorted({int(x) for x in blocks})
+    b = sorted(int(x) for x in blocks)   # a repeated block: its output twice (Encoder taps), same width
     return [b[-1]] + b[:-1]
 
 
@@ -100,7 +102,7 @@ def main(path: str) -> None:
     enc.taps, enc.depth = tuple(range(-1, n - 1)), None   # every block: row = last ++ (-1, 0, .., n - 2)
     order = [n - 1] + list(range(-1, n - 1))
     rng = np.random.default_rng(0)
-    cap, max_blocks, min_gain = int(job.get("cap", 1000)), int(job.get("max_blocks", 2)), float(job.get("min_gain", 0.002))
+    cap, max_blocks = int(job.get("cap", 1000)), int(job.get("max_blocks", 2))
     out, res = Path(job["out"]), {"tasks": {}, "scores": {}}
     feats = {}   # (task, split, level) -> [X [cells, n + 1, d] fp16, Y]
     for task, sp_ids in job["tasks"].items():
@@ -148,14 +150,23 @@ def main(path: str) -> None:
                 return _score(D["train"][0][:, cs].flatten(1).float(), D["train"][1],
                               D["val"][0][:, cs].flatten(1).float(), D["val"][1])
             single = {b: score([b]) for b in order}
+            pool = order
+            if mm < 8:   # live levels (user via Tullio, 24/10): the encoder only as deep as needed, the shallowest depth
+                top = max(single.values())   # whose best single block is within `live_tol` of the best one, at most
+                cap = int(job.get("live_cap", 9))   # live_cap (the argmax picked 14 / 15 by 0.003, noise: no cut)
+                d = next((d for d in range(-1, cap + 1) if max(single[b] for b in order if b <= d) >= top - float(job.get("live_tol", 0.01))), cap)
+                pool = [b for b in order if b <= d]
             chosen, best, steps = [], 0.5, []
             while len(chosen) < max_blocks:
-                cand = {b: score(chosen + [b]) for b in order if b not in chosen}
+                cand = {b: score(chosen + [b]) for b in pool if b not in chosen}
+                if not cand:
+                    break
                 b = max(cand, key=cand.get)
-                if chosen and cand[b] - best < min_gain and job.get("min_gain") is not None:
-                    break   # (default: exactly max_blocks per level, the decoder's width the same at every level)
+                if chosen and cand[b] <= best:   # a second block only if it improves the val AUROC
+                    break
                 chosen, best = chosen + [b], cand[b]
                 steps.append({"block": b, "val_auroc": round(best, 4)})
+            chosen += [chosen[-1]] * (max_blocks - len(chosen))   # repeated: the same width at every level
             res["tasks"][task][str(int(mm))] = sorted(chosen)
             res["scores"][task][str(int(mm))] = {"single": {str(b): round(v, 4) for b, v in single.items()},
                                                  "greedy": steps, "cells": [len(D["train"][1]), len(D["val"][1])]}
@@ -167,7 +178,7 @@ def main(path: str) -> None:
         for mm in LEVELS:
             if have and str(int(mm)) not in tl:
                 tl[str(int(mm))] = tl[str(int(min(have, key=lambda h: (abs(h - mm), -h))))]
-    res["cache"] = sorted({b for v in res["tasks"].values() for mm, bl in v.items() if float(mm) >= 8 for b in bl})
+    res["cache"] = sorted({b for v in res["tasks"].values() for mm, bl in v.items() if float(mm) >= 8 for b in bl})   # (a set)
     res["layout"] = layout(res["cache"])
     out.mkdir(parents=True, exist_ok=True)
     (out / "blocks.json").write_text(json.dumps(res, indent=1))
