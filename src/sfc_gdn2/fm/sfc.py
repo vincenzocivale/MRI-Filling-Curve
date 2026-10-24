@@ -354,7 +354,13 @@ class SegNet(nn.Module):
     def to_fine(self, z, vol, sp, k, g, i, keep=None, zmap=None):
         """Tokens [N, c] on grid g -> the fine level's inputs [Nf, 128] on the grid of half the patch (parent token +
         the voxels' embedding), their coordinates, grid and patch dims; fine_mix mixes them along each curve."""
-        from ..curves import grid_coords, keys
+        d = self._fine_prep(z, vol, sp, k, g, i, keep, zmap)
+        self._read_many([d], i)
+        return self._fine_done(d)
+
+    def _fine_prep(self, z, vol, sp, k, g, i, keep=None, zmap=None) -> dict:
+        """to_fine up to the frozen encoder's live reading: the parent (+ cached) tokens and what the reading takes."""
+        from ..curves import grid_coords
         from ..data.volume import patch_grid, patchify
 
         kf = self.fine_dims(sp, i)
@@ -366,7 +372,7 @@ class SegNet(nn.Module):
         par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
         pidx = (par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]
         t = self.up[i](z)[pidx if zmap is None else zmap[pidx]]
-        t_par = t
+        d = {"t_par": t, "xyz": xyz, "gf": gf, "kf": kf, "vol": vol, "sp": sp, "i": i, "keep": keep, "read": None}
         sub = (lambda a: a) if keep is None else (lambda a: a[keep])
         if self._cur is not None and self.fine_tok is not None and i < self.ncached:   # fine_encoder from the cache: the
             ci, corner, _ = self._cur                     # whole-scan reading of this level, last block ++ taps as at 16 mm
@@ -387,20 +393,61 @@ class SegNet(nn.Module):
                     x = pe(sub(patchify(vol.float(), kf))[sel], pe.weights(sp.float(), kf))
                     q = xyz[sel]
                     lab = self._groups(q, gf) if self.fine_split and i == 2 else torch.zeros(len(sel), dtype=torch.long, device=z.device)
-                    cu1 = F.pad(torch.bincount(lab).cumsum(0), (1, 0)).to(torch.int32)   # one sequence per group
-                    bf, keep_ = 0, (self.encoder.depth, self.encoder.taps)
-                    if getattr(self, "blocks_lv", None):   # this level's blocks (block_plan), the encoder that deep
-                        from .block_plan import apply
-                        apply(self.encoder, self.blocks_lv.get(float(self.fine_mm[i]), self.blocks_lv[16.0]))
-                    cl = (getattr(self, "curves_lv", None) or {}).get(float(self.fine_mm[i]), self.enc_curves)
-                    for c in cl:   # within each group along the curve (block_plan: one curve per live level)
-                        kk = keys(c, q, gf, self.seed)
-                        o = (lab * (int(kk.max()) + 1) + kk).argsort()
-                        bf = bf + self.encoder.flat(x[o], cu1, pos=q[o]).float()[o.argsort()]
-                    bf = bf / len(cl)
-                    self.encoder.depth, self.encoder.taps = keep_
                 pe.patch_mm = mm0
-                t = t.index_add(0, sel, self.fine_tok[i](self._fproj(i, bf)))
+                d["read"] = (x, q, lab, sel)
+        d["t"] = t
+        return d
+
+    def _read_many(self, ds: list, i: int) -> None:
+        """The frozen encoder's live reading of level i for several tiles / scans at once (24/10: one call per curve with
+        every tile's groups packed as sequences, not one per tile: the same tokens, the ~16-block encoder's Triton kernels
+        launched once per level and batch) -> d["bf"] of each _fine_prep dict d with a reading."""
+        from ..curves import keys
+        rs = [d for d in ds if d["read"] is not None]
+        if not rs:
+            return
+        pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
+        pe.patch_mm = self.fine_mm[i]
+        keep_ = (self.encoder.depth, self.encoder.taps)
+        if getattr(self, "blocks_lv", None):   # this level's blocks (block_plan), the encoder that deep
+            from .block_plan import apply
+            apply(self.encoder, self.blocks_lv.get(float(self.fine_mm[i]), self.blocks_lv[16.0]))
+        cl = (getattr(self, "curves_lv", None) or {}).get(float(self.fine_mm[i]), self.enc_curves)
+        groups, n = [[]], 0   # calls of at most MIX_MAX tokens (whole tiles), as fine_mix
+        for d in rs:
+            if groups[-1] and n + len(d["read"][0]) > MIX_MAX:
+                groups.append([])
+                n = 0
+            groups[-1].append(d)
+            n += len(d["read"][0])
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for grp in groups:
+                bf = [0] * len(grp)
+                for c in cl:   # within each group along the curve (block_plan: one curve per live level)
+                    xs, ps, os_, cu, n0 = [], [], [], [0], 0
+                    for d in grp:
+                        x, q, lab, _ = d["read"]
+                        kk = keys(c, q, d["gf"], self.seed)
+                        o = (lab * (int(kk.max()) + 1) + kk).argsort()
+                        xs.append(x[o]), ps.append(q[o]), os_.append(o)
+                        cu += (n0 + torch.bincount(lab).cumsum(0)).tolist()   # one sequence per group
+                        n0 += len(x)
+                    h = self.encoder.flat(torch.cat(xs), torch.tensor(cu, dtype=torch.int32, device=xs[0].device),
+                                          pos=torch.cat(ps)).float()
+                    for m, (hh, o) in enumerate(zip(h.split([len(o) for o in os_]), os_)):
+                        bf[m] = bf[m] + hh[o.argsort()]
+                for d, b_ in zip(grp, bf):
+                    d["bf"] = b_ / len(cl)
+        self.encoder.depth, self.encoder.taps = keep_
+        pe.patch_mm = mm0
+
+    def _fine_done(self, d: dict) -> tuple:
+        """to_fine after the live reading: + the encoder's tokens, + the image kernel -> t, xyz, gf, kf."""
+        from ..data.volume import patchify
+        t, t_par, i, kf, vol, sp, keep = d["t"], d["t_par"], d["i"], d["kf"], d["vol"], d["sp"], d["keep"]
+        sub = (lambda a: a) if keep is None else (lambda a: a[keep])
+        if d["read"] is not None:
+            t = t.index_add(0, d["read"][3], self.fine_tok[i](self._fproj(i, d["bf"])))
         t_enc = t - t_par   # the encoder's part (decoder D's MLP reads the parts apart)
         if self.image and self.enc_img is not None:
             pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
@@ -418,7 +465,7 @@ class SegNet(nn.Module):
             e = self.fine[i][0].patch_embed
             t = t + e(sub(patchify(vol.float(), kf)), e.weights(sp.float(), kf))
         self._parts = (t_par, t_enc, t - t_par - t_enc)
-        return t, xyz, gf, kf
+        return t, d["xyz"], d["gf"], kf
 
     def _fproj(self, i, t):
         """Level i's tokens for its fine_tok: as they are under per-level blocks (fine_tok reads them), else -> d."""
@@ -701,29 +748,46 @@ class SegNet(nn.Module):
         """Level i's tokens on the dense grid of its cells: the children of the `read` parents read (to_fine + the refine
         blocks, those children only, one sequence along each curve), the others their parent's token through up[i]
         -> tokens [Nf, 128], dims, grid, parent index of every child."""
+        return self._level_sparse_many([(zd, kp, gp, vol, sp, read, self._cur)], i)[0]
+
+    def _level_sparse_many(self, items: list, i: int) -> list:
+        """_level_sparse of several tiles / scans at level i, items [(z, k, g, vol, sp, read, cur)]: their live readings
+        and refine blocks each in one call (packed sequences, the same tokens as one call per tile)."""
         from ..curves import grid_coords
-        dev = zd.device
-        kf = self.fine_dims(sp, i)
-        gf = [-(-v // a) for v, a in zip(vol.shape, kf)]
-        xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
-        par = torch.minimum(((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(kp, device=dev)).long(),
-                            torch.tensor(gp, device=dev) - 1)
-        pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
-        keep = read[pidx].nonzero()[:, 0]
-        tk = None
-        if len(keep):
-            t, xyzk, gft, _ = self.to_fine(zd, vol, sp, kp, gp, i, keep=keep)
-            if self.fine_head == "mlp":   # decoder D: child = parent + MLP(parent, encoder token, image kernel)
-                p_, e_, m_ = self._parts
-                tk = (p_ + self.fhead[i](torch.cat([p_, e_, m_], -1))).float()
-            else:
-                tk = self.fine_mix([t], [xyzk], [gft], i)[0]
-        if i == 2:   # the last level (2 mm): only the read cells (their 27 neighbours are read too: the ring)
-            return SparseLevel(keep, tk if tk is not None else zd.new_zeros(0, 128), zd, pidx, self.up[i]), kf, gf, pidx
-        dense = self.up[i](zd)[pidx]
-        if tk is not None:
-            dense = dense.index_copy(0, keep, tk.to(dense.dtype))
-        return dense, kf, gf, pidx
+        pre = []
+        for zd, kp, gp, vol, sp, read, cur in items:
+            self._cur = cur
+            dev = zd.device
+            kf = self.fine_dims(sp, i)
+            gf = [-(-v // a) for v, a in zip(vol.shape, kf)]
+            xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
+            par = torch.minimum(((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(kp, device=dev)).long(),
+                                torch.tensor(gp, device=dev) - 1)
+            pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
+            keep = read[pidx].nonzero()[:, 0]
+            pre.append((kf, gf, pidx, keep, self._fine_prep(zd, vol, sp, kp, gp, i, keep=keep) if len(keep) else None))
+        self._read_many([p[4] for p in pre if p[4] is not None], i)
+        live = [n for n, p in enumerate(pre) if p[4] is not None]
+        done = {n: self._fine_done(pre[n][4]) + (self._parts,) for n in live}
+        tks = {}
+        if self.fine_head == "mlp":   # decoder D: child = parent + MLP(parent, encoder token, image kernel)
+            for n in live:
+                p_, e_, m_ = done[n][4]
+                tks[n] = (p_ + self.fhead[i](torch.cat([p_, e_, m_], -1))).float()
+        elif live:
+            tks = dict(zip(live, self.fine_mix([done[n][0] for n in live], [done[n][1] for n in live],
+                                               [done[n][2] for n in live], i)))
+        out = []
+        for n, ((zd, *_), (kf, gf, pidx, keep, _)) in enumerate(zip(items, pre)):
+            tk = tks.get(n)
+            if i == 2:   # the last level (2 mm): only the read cells (their 27 neighbours are read too: the ring)
+                out.append((SparseLevel(keep, tk if tk is not None else zd.new_zeros(0, 128), zd, pidx, self.up[i]), kf, gf, pidx))
+                continue
+            dense = self.up[i](zd)[pidx]
+            if tk is not None:
+                dense = dense.index_copy(0, keep, tk.to(dense.dtype))
+            out.append((dense, kf, gf, pidx))
+        return out
 
     def _jmin(self, sp) -> int:
         """The last level read: g_min, the finest level whose cells hold >= 8 voxels, and 4 mm during the warm-up."""
@@ -761,6 +825,21 @@ class SegNet(nn.Module):
 
     def _capply(self, st: dict, n_out: int, train: bool = False, upto=None) -> None:
         """Pure / mixed with this level's threshold; the mixed cells' children read (the next level), or done."""
+        self._capply_many([st], n_out, train, upto)
+
+    def _capply_many(self, sts: list, n_out: int, train: bool = False, upto=None) -> None:
+        """_capply of several tiles / scans at the same level, their next level read together (_level_sparse_many)."""
+        go = [st for st in sts if self._cdecide(st, n_out, train, upto)]
+        if not go:
+            return
+        res = self._level_sparse_many([(st["z"], st["k"], st["g"], st["vol"], st["sp"],
+                                        self._dilate(st["S"], st["g"]) & st["inside"], st["cur"]) for st in go], go[0]["j"])
+        for st, (zf, kf, gf, pidx) in zip(go, res):
+            st["lv"].append((zf, list(kf), gf))
+            st.update(cand=st["S"][pidx], z=zf, k=kf, g=gf, j=st["j"] + 1)
+
+    def _cdecide(self, st: dict, n_out: int, train: bool = False, upto=None) -> bool:
+        """_capply's choice: the level's pure / mixed cells (st["S"]: mixed) -> whether its children are read."""
         j, cand = st["j"], st["cand"]
         if st["ci"] is None:   # above g0: every cell goes down
             S = cand
@@ -781,22 +860,24 @@ class SegNet(nn.Module):
         st["S"] = S
         if j == st["jmin"] or j == upto or not S.any():
             st["done"] = True
-            return
-        self._cur = st["cur"]
-        zf, kf, gf, pidx = self._level_sparse(st["z"], st["k"], st["g"], st["vol"], st["sp"], j,
-                                              self._dilate(S, st["g"]) & st["inside"])
-        st["lv"].append((zf, list(kf), gf))
-        st.update(cand=S[pidx], z=zf, k=kf, g=gf, j=j + 1)
+            return False
+        return True
 
     def _cascade(self, z16, k16, g16, vol, sp, cur, n_out, yy=None, train=False) -> dict:
         """One tile / scan down the levels with the current thresholds -> its final state: lv (the levels' dense tokens,
         c_logits), info [(j, candidate cells, head logits, their label counts)], S (the cells still mixed at the last
         level read, dims k, grid g), fill [(j, cells, class or None = background)]."""
-        st = self._cstart(z16, k16, g16, vol, sp, cur, yy)
-        while not st["done"]:
-            self._cheads(st, n_out)
-            self._capply(st, n_out, train)
-        return st
+        return self._cascade_many([(z16, k16, g16, vol, sp, cur, yy)], n_out, train)[0]
+
+    def _cascade_many(self, items: list, n_out: int, train: bool = False) -> list:
+        """_cascade of several tiles [(z16, k16, g16, vol, sp, cur, yy)] level by level, each level read for all at once."""
+        sts = [self._cstart(*it) for it in items]
+        while not all(st["done"] for st in sts):
+            act = [st for st in sts if not st["done"]]
+            for st in act:
+                self._cheads(st, n_out)
+            self._capply_many(act, n_out, train)
+        return sts
 
     def _whole(self, x, ctx):
         """A whole scan's 16 mm tokens (the tile is the scan) -> z, k, g, cur, spacing."""
@@ -809,16 +890,21 @@ class SegNet(nn.Module):
         """Training (encoder frozen): the level heads on their candidate cells (weighted CE + soft Dice, targets pure k /
         mixed, weights frequency^-0.5), the point head on stratified voxels of the cells still mixed at g_min (true
         mixed + predicted ones), unweighted."""
-        if self.cwarm:
-            self.it_seen += 1
-        st, V, sp = self(x, ctx, levels=True, stop=0)
+        parts = list(zip(x, y, ctx)) if isinstance(x, list) else [(x, y, ctx)]   # lists: tiles of several shapes
+        tiles = []
+        for xp, yp, cp in parts:
+            if self.cwarm:
+                self.it_seen += 1
+            st, V, sp = self(xp, cp, levels=True, stop=0)
+            for b, (z, k, g, _, cur) in enumerate(st):
+                yy, vol = yp[b, : V[b][0], : V[b][1], : V[b][2]], xp[b, 0, : V[b][0], : V[b][1], : V[b][2]]
+                ok = yy < n_out
+                self.cfreq += torch.bincount(yy[ok].flatten().long(), minlength=n_out).float()
+                tiles.append((z, k, g, vol, sp[b], cur, yy))
+        # every tile of the batch down the levels together (24/10: one live reading per level, not per tile)
         add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
         fin, aux = None, [None] * len(self.lhead)
-        for b, (z, k, g, _, cur) in enumerate(st):
-            yy, vol = y[b, : V[b][0], : V[b][1], : V[b][2]], x[b, 0, : V[b][0], : V[b][1], : V[b][2]]
-            ok = yy < n_out
-            self.cfreq += torch.bincount(yy[ok].flatten().long(), minlength=n_out).float()
-            c = self._cascade(z, k, g, vol, sp[b], cur, n_out, yy=yy, train=True)
+        for (z, k, g, vol, _, cur, yy), c in zip(tiles, self._cascade_many(tiles, n_out, train=True)):
             lv, S, kl, gl = c["lv"], c["S"], c["k"], c["g"]
             for j, ci, lg, hc in c["info"]:
                 keep = hc.sum(1) > 0
@@ -837,7 +923,7 @@ class SegNet(nn.Module):
                     fin = add(fin, wsums(self.c_logits(lv, vol, pts), lab, torch.ones(len(idx), device=pts.device), n_out))
             self.last_refined = float(S.float().mean())
         if fin is None:   # nothing mixed in the batch
-            dev = x.device
+            dev = parts[0][0].device
             fin = [torch.zeros((), device=dev), torch.zeros((), device=dev)] + [torch.zeros(n_out, device=dev)] * 3
         return fin, [a for a in aux if a is not None]
 
@@ -938,38 +1024,56 @@ class SegNet(nn.Module):
         cells, the top ctopk (training) / ctopk_eval[level] cells per landmark (+ the true cell, pts [landmarks, 3] voxels or NaN, in training) go down:
         their children are read with a ring of one cell. -> lv, [(logits, targets or None)], the last level's chosen cells
         (dense mask), its dims and grid."""
-        self._cur = cur
-        jmin = self._jmin(sp)
-        lv, info = [(z, k, g)], []
-        inside = (patchify_any(vol, k).abs().sum(1) > 0)[: len(z)]
-        cand = inside
-        for j in range(jmin + 1):
-            ci = cand.nonzero()[:, 0]
-            lg = self.lhead[j](z[ci])[:, 1:n_out].float()
-            sel = torch.zeros(len(z), dtype=torch.bool, device=ci.device)
-            tgt = None
-            if pts is not None:
-                kk, gg = torch.tensor(k, device=ci.device), torch.tensor(g, device=ci.device)
-                ok = ~pts.isnan().any(1)
-                cell = torch.minimum((pts[ok] // kk).long(), gg - 1)
-                cell = (cell[:, 0] * g[1] + cell[:, 1]) * g[2] + cell[:, 2]
-                row = torch.full((len(z),), -1, dtype=torch.long, device=ci.device)
-                row[ci] = torch.arange(len(ci), device=ci.device)
-                tgt = torch.zeros_like(lg)
-                for c, r in zip(ok.nonzero()[:, 0].tolist(), row[cell].tolist()):
-                    if r >= 0:
-                        tgt[r, c] = 1
-                sel[cell] = True
-            tk = self.ctopk if pts is not None else self.ctopk_eval[min(j, len(self.ctopk_eval) - 1)]
-            top = lg.detach().topk(min(tk, len(ci)), 0).indices.flatten()
-            sel[ci[top]] = True
-            info.append((lg, tgt))
-            if j == jmin:
-                return lv, info, sel, k, g
-            zf, kf, gf, pidx = self._level_sparse(z, k, g, vol, sp, j, self._dilate(sel, g) & inside)
-            lv.append((zf, list(kf), gf))
-            inside = (patchify_any(vol, kf).abs().sum(1) > 0)[: len(pidx)]
-            cand, z, k, g = sel[pidx] & inside, zf, kf, gf
+        return self._lm_levels_many([(z, k, g, vol, sp, cur, pts)], n_out)[0]
+
+    def _lm_levels_many(self, items: list, n_out: int) -> list:
+        """_lm_levels of several tiles [(z, k, g, vol, sp, cur, pts)] level by level, each level read for all at once."""
+        sts = []
+        for z, k, g, vol, sp, cur, pts in items:
+            self._cur = cur
+            inside = (patchify_any(vol, k).abs().sum(1) > 0)[: len(z)]
+            sts.append({"z": z, "k": k, "g": g, "vol": vol, "sp": sp, "cur": cur, "pts": pts, "jmin": self._jmin(sp),
+                        "lv": [(z, k, g)], "info": [], "cand": inside, "inside": inside, "out": None})
+        j = 0
+        while any(st["out"] is None for st in sts):
+            go = []
+            for st in sts:
+                if st["out"] is not None:
+                    continue
+                z, k, g, pts = st["z"], st["k"], st["g"], st["pts"]
+                ci = st["cand"].nonzero()[:, 0]
+                lg = self.lhead[j](z[ci])[:, 1:n_out].float()
+                sel = torch.zeros(len(z), dtype=torch.bool, device=ci.device)
+                tgt = None
+                if pts is not None:
+                    kk, gg = torch.tensor(k, device=ci.device), torch.tensor(g, device=ci.device)
+                    ok = ~pts.isnan().any(1)
+                    cell = torch.minimum((pts[ok] // kk).long(), gg - 1)
+                    cell = (cell[:, 0] * g[1] + cell[:, 1]) * g[2] + cell[:, 2]
+                    row = torch.full((len(z),), -1, dtype=torch.long, device=ci.device)
+                    row[ci] = torch.arange(len(ci), device=ci.device)
+                    tgt = torch.zeros_like(lg)
+                    for c, r in zip(ok.nonzero()[:, 0].tolist(), row[cell].tolist()):
+                        if r >= 0:
+                            tgt[r, c] = 1
+                    sel[cell] = True
+                tk = self.ctopk if pts is not None else self.ctopk_eval[min(j, len(self.ctopk_eval) - 1)]
+                top = lg.detach().topk(min(tk, len(ci)), 0).indices.flatten()
+                sel[ci[top]] = True
+                st["info"].append((lg, tgt))
+                if j == st["jmin"]:
+                    st["out"] = (st["lv"], st["info"], sel, k, g)
+                else:
+                    go.append((st, sel))
+            if go:
+                res = self._level_sparse_many([(st["z"], st["k"], st["g"], st["vol"], st["sp"],
+                                                self._dilate(sel, st["g"]) & st["inside"], st["cur"]) for st, sel in go], j)
+                for (st, sel), (zf, kf, gf, pidx) in zip(go, res):
+                    st["lv"].append((zf, list(kf), gf))
+                    inside = (patchify_any(st["vol"], kf).abs().sum(1) > 0)[: len(pidx)]
+                    st.update(cand=sel[pidx] & inside, inside=inside, z=zf, k=kf, g=gf)
+            j += 1
+        return [st["out"] for st in sts]
 
     def _lm_region(self, sel, k, g, S):
         """The voxels [P, 3] of the chosen last-level cells and their ring of one cell."""
@@ -989,21 +1093,27 @@ class SegNet(nn.Module):
     def landmark_sums(self, x, h, ctx, n_out):
         """Training on landmark heatmaps h [B, landmarks, *T] (segrun.heatmaps: 1 at each landmark's voxel): the level
         heads (balanced BCE: the cell holding the landmark against the other candidates) and the point head's focal loss
-        on the voxels of the cells reached and their ring."""
+        on the voxels of the cells reached and their ring. x, h, ctx may be lists (tiles of several shapes): every tile
+        of the batch goes down the levels together (24/10: one live reading per level, not per tile)."""
+        parts = list(zip(x, h, ctx)) if isinstance(x, list) else [(x, h, ctx)]
         if not self.cascade:   # decoder C2: every level on the whole tile, the point head near the landmarks + anywhere
-            return self._lm_c_sums(x, h, ctx, n_out)
-        if self.cwarm:
-            self.it_seen += 1
-        st, V, sp = self(x, ctx, levels=True, stop=0)
+            return sum(self._lm_c_sums(xp, hp, cp, n_out) for xp, hp, cp in parts) / len(parts)
+        tiles, heat = [], []
+        for xp, hp, cp in parts:
+            if self.cwarm:
+                self.it_seen += 1
+            st, V, sp = self(xp, cp, levels=True, stop=0)
+            for b, (z, k, g, _, cur) in enumerate(st):
+                vol, hb = xp[b, 0, : V[b][0], : V[b][1], : V[b][2]], hp[b, :, : V[b][0], : V[b][1], : V[b][2]].float()
+                pts = torch.full((hb.shape[0], 3), float("nan"), device=xp.device)
+                for c in range(hb.shape[0]):
+                    w = (hb[c] > 0.999).nonzero()
+                    if len(w):
+                        pts[c] = w[0].float()
+                tiles.append((z, k, g, vol, sp[b], cur, pts))
+                heat.append(hb)
         loss = 0.0
-        for b, (z, k, g, _, cur) in enumerate(st):
-            vol, hb = x[b, 0, : V[b][0], : V[b][1], : V[b][2]], h[b, :, : V[b][0], : V[b][1], : V[b][2]].float()
-            pts = torch.full((hb.shape[0], 3), float("nan"), device=x.device)
-            for c in range(hb.shape[0]):
-                w = (hb[c] > 0.999).nonzero()
-                if len(w):
-                    pts[c] = w[0].float()
-            lv, info, sel, kl, gl = self._lm_levels(z, k, g, vol, sp[b], cur, n_out, pts)
+        for (_, _, _, vol, _, _, _), hb, (lv, info, sel, kl, gl) in zip(tiles, heat, self._lm_levels_many(tiles, n_out)):
             for lg, tgt in info:
                 pos = tgt > 0
                 ll = -F.logsigmoid(-lg)[~pos].mean()
@@ -1015,7 +1125,7 @@ class SegNet(nn.Module):
                 q = q[torch.randperm(len(q), device=q.device)[: 1 << 16]]
             lg = self.c_logits(lv, vol, q)[:, 1:n_out].float()
             loss = loss + self._focal(lg, hb[:, q[:, 0], q[:, 1], q[:, 2]].T)
-        return loss / len(st)
+        return loss / len(tiles)
 
     def _lm_c_sums(self, x, h, ctx, n_out):
         """Decoder C2 on landmark heatmaps: its levels on the whole tile; the focal loss on every voxel where any heatmap

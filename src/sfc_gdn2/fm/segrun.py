@@ -227,15 +227,17 @@ def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
     at a time, every model's decoder as it is."""
     parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
         [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
-    tot = 0.0
-    for xi, yi, ci in parts:
+    if getattr(net, "decoder_c", False):   # ours: every tile in one call, the cascade's levels read for all at once (24/10)
         with amp():
-            if getattr(net, "decoder_c", False):   # ours (decoder C2 / cascade): the point head on points, no dense map
-                loss = net.landmark_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), yi.shape[1] + 1) / len(parts)
-            else:
-                lg = call(net, xi.to(dev).float(), ci)
-        if not getattr(net, "decoder_c", False):
-            loss = focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) / len(parts)
+            loss = net.landmark_sums([a.to(dev).float() for a, _, _ in parts], [b.to(dev) for _, b, _ in parts],
+                                     [u.to(dev) for _, _, u in parts], parts[0][1].shape[1] + 1)
+        loss.backward()
+        return loss.detach()
+    tot = 0.0
+    for xi, yi, ci in parts:   # the other models: one scan at a time
+        with amp():
+            lg = call(net, xi.to(dev).float(), ci)
+        loss = focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) / len(parts)
         loss.backward()
         tot += float(loss)
     return torch.tensor(tot)
@@ -408,10 +410,13 @@ def sums_loss(t: list) -> torch.Tensor:
 def matryoshka_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
     """Decoder F matryoshka (21/10): the final prediction's loss plus each cell head's (16, 8, 4 mm), one backward."""
     parts = [(t, u, v) for t, u, v in zip(x, y, c)] if isinstance(x, list) else [(x, y, c)]
+    if getattr(net, "cascade", False) and len(parts) > 1:   # the cascade takes tiles of several shapes in one call (24/10:
+        parts = [([t.to(dev).float() for t, _, _ in parts], [u.to(dev) for _, u, _ in parts],   # its levels read for all)
+                  [v.to(dev) for _, _, v in parts])]
     fin, aux = None, None
     for xi, yi, ci in parts:
         with amp():
-            f, a = net.matryoshka_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), k)
+            f, a = net.matryoshka_sums(*((xi, yi, ci) if isinstance(xi, list) else (xi.to(dev).float(), yi.to(dev), ci.to(dev))), k)
         fin = f if fin is None else [u + v for u, v in zip(fin, f)]
         aux = a if aux is None else [[u + v for u, v in zip(p, q)] for p, q in zip(aux, a)] + (aux[len(a):] or a[len(aux):])
     loss = sums_loss(fin) + getattr(net, "head_w", 1.0) * sum(sums_loss(a) for a in aux)
