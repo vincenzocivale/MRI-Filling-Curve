@@ -60,7 +60,7 @@ class SegNet(nn.Module):
                  refine: int = 0, image: bool = False, fine_curves: list | None = None, rough: bool = False,
                  zoom: bool = False, fine_seg: int = 0, erase: str = "channel",
                  fine_mm: list | None = None, image_kernel: str = "own", fine_encoder: bool = False,
-                 refine_frac: float = 1.0, token_cache: str | None = None, fine_pca: int = 0,
+                 refine_frac: float = 1.0, token_cache: str | None = None,
                  adaptive: bool = False, refine_tau: float = 0.9, matryoshka: bool = False, quota: float = 0.5, head_w: float = 1.0,
                  rand_dec: float = 0.02, test_all: bool = False, kernel_skip: int = 0, kernel_skip_mm: float = 0.0,
                  level2: bool = False, decoder_c: bool = False, c_points: int = 32768, c_local: bool = False,
@@ -259,10 +259,6 @@ class SegNet(nn.Module):
         assert not fine_live4 or self.cascade, "fine_live4: the cascade only (C2h reads every 4 mm cell)"
         if self.cache is not None and getattr(self, "fine_tok", None) is not None:
             self.cache.levels = (16.0, 8.0, 4.0)[: 1 + self.ncached]
-            if fine_pca:   # the fine levels' tokens on token_cache.project's PCA basis: fine_tok reads them directly
-                self.cache.pca = int(fine_pca)
-                self.fine_tok = nn.ModuleList(nn.Linear(int(fine_pca), 128) if i < self.ncached else nn.Linear(encoder.dim, 128)
-                                              for i in range(self.refine))   # not cached: read live
 
     def forward(self, x: torch.Tensor, spacing: torch.Tensor, levels: bool = False, stop: int | None = None):
         """x [B, 1, *T] native voxels, spacing [B, 3] mm, or [B, 6] = spacing + the scan's shape (segrun `seg_extent`)
@@ -373,7 +369,7 @@ class SegNet(nn.Module):
                 tf = self.cache.tokens_at(ci, float(self.fine_mm[i]), corner, gf.tolist(), kf, keep).to(z.device).float()
             else:
                 tf = sub(self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float())
-            t = t + self.fine_tok[i](tf if self.cache.pca else self._fproj(i, tf))
+            t = t + self.fine_tok[i](self._fproj(i, tf))
         elif self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
             if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
                 sel = torch.arange(len(xyz), device=z.device)   # TotalSeg's 4 mm level, ~2e5 tokens, did not fit)
@@ -1442,7 +1438,7 @@ class SFC(Wrapper):
                      erase=self.args.get("erase") or "channel", fine_mm=self.args.get("fine_mm"),
                      image_kernel=self.args.get("image_kernel") or "own", fine_encoder=bool(self.args.get("fine_encoder")),
                      refine_frac=float(self.args.get("refine_frac") or 1.0), token_cache=self.args.get("token_cache"),
-                     fine_pca=int(self.args.get("fine_pca") or 0), adaptive=bool(self.args.get("adaptive")),
+                     adaptive=bool(self.args.get("adaptive")),
                      refine_tau=float(self.args.get("refine_tau") or 0.9), matryoshka=bool(self.args.get("matryoshka")),
                      quota=float(self.args.get("refine_quota") or 0.5), head_w=float(self.args.get("head_w") or 1.0),
                      rand_dec=float(self.args.get("rand_dec") or 0.02), test_all=bool(self.args.get("test_decode_all")),
@@ -1468,7 +1464,7 @@ class SFC(Wrapper):
             u = 1 if net.unique else 2                           # into its fine_tok (a projection to d first was a second
             net.fine_direct = set()                              # linear map in a row: ~2M parameters for nothing)
             for i, m in enumerate(net.fine_mm[: len(net.fine_tok)]):
-                if float(m) in lv and not (net.cache is not None and net.cache.pca and i < net.ncached):
+                if float(m) in lv:
                     net.fine_tok[i] = nn.Linear(len(lv[float(m)]) * enc.dim * u, 128)
                     net.fine_direct.add(i)
         lc = self.args.get("live_curves")   # block_plan: one curve per live level (a third of the live reading)
@@ -1477,6 +1473,9 @@ class SFC(Wrapper):
             from .block_plan import columns
             cb = json.loads(bj.read_text())["cache"]
             net.cache.cols = {m: columns(cb, v, enc.dim) for m, v in lv.items() if m >= 8} if lv else columns(cb, blocks, enc.dim)
+        cc = self.args.get("cache_curves")   # block_plan: the curve (or "mean") of each cached level, its own files
+        if cc and isinstance(net.cache, TokenCache):
+            net.cache.curves = {float(m): c for m, c in cc.items()}
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

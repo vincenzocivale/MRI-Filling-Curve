@@ -43,7 +43,7 @@ cache() {
 F="args.taps=3 args.refine=2 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true args.matryoshka=true args.head_w=0.2 args.decoder_c=true args.c_local=true args.c_wpow=0.5"
 seg() {
   [ -f $D/segdec/$1/s0/sfc_gdn2__pretrained.json ] && { echo "[arm] seg $1 done, skipped"; return 0; }
-  step seg_$1 sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --tasks $1 --iters $SEG_ITERS --val-only --fm-set checkpoint=$D $F args.fine_pca=0 args.token_cache=$D/tok --override segdec.out=$D/segdec out_dir=$MV probe.tasks=$TV
+  step seg_$1 sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --tasks $1 --iters $SEG_ITERS --val-only --fm-set checkpoint=$D $F args.token_cache=$D/tok --override segdec.out=$D/segdec out_dir=$MV probe.tasks=$TV
 }
 pair() {   # pair <cmd for GPU 0> <cmd for GPU 1> (either may be empty); NGPU=1: one after the other
   if [ $NGPU = 1 ]; then for c in "$1" "$2"; do [ -n "$c" ] && eval "$c"; done; return; fi

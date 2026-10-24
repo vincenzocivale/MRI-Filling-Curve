@@ -6,10 +6,13 @@ last block and miss 4-6. Per encoder, once, from a few train / val volumes of ea
   a ridge readout fitted on the train cells, scored on the val cells (mean AUROC over the classes and levels);
   greedy: per task and level the block that adds most to the val score, up to `max_blocks`, a second one only if it
   improves it (1 or 2 blocks per level: SegNet projects each level's width on its own); at the live levels (4 / 2 mm) only blocks up
-  to the shallowest depth within live_tol (0.01) of the best single block, at most live_cap (9).
+  to the shallowest depth within live_tol (0.01) of the best single block, at most live_cap (9);
+  per level also the curve: each curve read alone, and at the cached levels (16 / 8 mm) also their mean, the one with
+  the best val AUROC (user, 24/10).
 
 -> <out>/blocks.json: per task its blocks (the decoder: its last block = the deepest, the others its taps, the
-encoder run only that deep, live levels included) and the cache's (their union, layout() order). Seconds of ridge
+encoder run only that deep, live levels included) and its curve per level ("curves" {task: {mm: curve | "mean"}});
+the cache's blocks (their union, layout() order) and curves per cached level ("cache_curves", the union over tasks). Seconds of ridge
 fits on the GPU after one encoder pass over 16 volumes.
 
     python -m sfc_gdn2.fm.block_plan <job.json>   {"checkpoint", "inputs", "tasks": {task: {"train": [ids], "val": [ids]}},
@@ -104,7 +107,8 @@ def main(path: str) -> None:
     rng = np.random.default_rng(0)
     cap, max_blocks = int(job.get("cap", 1000)), int(job.get("max_blocks", 2))
     out, res = Path(job["out"]), {"tasks": {}, "scores": {}}
-    feats = {}   # (task, split, level) -> [X [cells, n + 1, d] fp16, Y]
+    feats = {}   # (task, split, level, curve) -> [X [cells, n + 1, d] fp16, Y]
+    cands = lambda mm: (["mean"] if mm >= 8 else []) + list(curves)
     for task, sp_ids in job["tasks"].items():
         for split, ids in sp_ids.items():
             used = 0   # volumes holding the target (CMB: many scans have no lesion), up to n[split] of the ids given
@@ -131,11 +135,11 @@ def main(path: str) -> None:
                             sl = tuple(slice(a, a + WIN * kk) for a, kk in zip(lo, k))
                             xc, yc = x[(slice(None), *sl)], y[sl]
                     idx, fr = _cells(yc, k, K, cap, rng)
-                    # cached levels: the curves' mean (as the cache); live levels: each curve alone (one curve per live
-                    # level, chosen here: user, 24/10, a third of the live reading)
-                    for cv in ([None] if mm >= 8 else curves):
-                        with torch.no_grad():   # all 17 blocks: small windows (OOM at 200k)
-                            a = read(enc, curves if cv is None else [cv], seed, xc, sp, k, mm, 30_000, 32, 8, taps=True)
+                    # each curve alone (one curve per level, chosen here: user, 24/10, a third of the live reading),
+                    # and at the cached levels also their mean (the cache before 24/10); each curve read once
+                    with torch.no_grad():   # all 17 blocks: small windows (OOM at 200k)
+                        A = read(enc, curves, seed, xc, sp, k, mm, 30_000, 32, 8, taps=True, want=cands(mm))
+                    for cv, a in A.items():
                         f = feats.setdefault((task, split, mm, cv), [[], []])
                         f[0].append(torch.from_numpy(a.reshape(-1, n + 1, d)[idx]))
                         f[1].append(fr.cpu())
@@ -169,7 +173,7 @@ def main(path: str) -> None:
         res["tasks"][task], res["scores"][task], res["curves"][task] = {}, {}, {}
         for mm in LEVELS:
             out_c = {}
-            for cv in ([None] if mm >= 8 else curves):
+            for cv in cands(mm):
                 if (task, "train", mm, cv) not in feats or (task, "val", mm, cv) not in feats:
                     continue
                 D = {s_: [torch.cat(v).cuda() for v in feats[(task, s_, mm, cv)]] for s_ in ("train", "val")}
@@ -177,17 +181,16 @@ def main(path: str) -> None:
                 del D
             if not out_c:
                 continue
-            cv = max(out_c, key=lambda c: out_c[c][1])   # live levels: the curve with the best val AUROC
+            cv = max(out_c, key=lambda c: out_c[c][1])   # the curve with the best val AUROC (ties: the mean)
             chosen, best, steps, single, cells = out_c[cv]
             res["tasks"][task][str(int(mm))] = chosen
-            if cv is not None:
-                res["curves"][task][str(int(mm))] = cv
+            res["curves"][task][str(int(mm))] = cv
             res["scores"][task][str(int(mm))] = {"single": {str(b): round(v, 4) for b, v in single.items()}, "greedy": steps,
                                                  "cells": cells, "curve": cv,
                                                  "per_curve": {str(c): round(o[1], 4) for c, o in out_c.items()}}
-            print(f"[blocks] {task} {mm:g} mm{'' if cv is None else ' ' + cv}: " +
+            print(f"[blocks] {task} {mm:g} mm {cv}: " +
                   " ".join(f"{b}:{v:.3f}" for b, v in sorted(single.items())) + f" -> {chosen} ({best:.3f})" +
-                  ("" if cv is None else " curves " + " ".join(f"{c}:{o[1]:.3f}" for c, o in out_c.items())), flush=True)
+                  " curves " + " ".join(f"{c}:{o[1]:.3f}" for c, o in out_c.items()), flush=True)
     for task, tl in res["tasks"].items():   # levels not scored (cells under 8 voxels, no target): the nearest one's
         have = sorted(float(m) for m in tl)
         for mm in LEVELS:
@@ -196,11 +199,14 @@ def main(path: str) -> None:
         tc = res["curves"][task]
         for mm in (4, 2):
             tc.setdefault(str(mm), tc.get("4", tc.get("2", curves[0])))
+        for mm in (16, 8):
+            tc.setdefault(str(mm), "mean")
     res["cache"] = sorted({b for v in res["tasks"].values() for mm, bl in v.items() if float(mm) >= 8 for b in bl})   # (a set)
     res["layout"] = layout(res["cache"])
+    res["cache_curves"] = {mm: sorted({tc[mm] for tc in res["curves"].values()}) for mm in ("16", "8")}
     out.mkdir(parents=True, exist_ok=True)
     (out / "blocks.json").write_text(json.dumps(res, indent=1))
-    print(f"[blocks] cache {res['cache']} -> {out / 'blocks.json'}", flush=True)
+    print(f"[blocks] cache {res['cache']}, curves {res['cache_curves']} -> {out / 'blocks.json'}", flush=True)
 
 
 if __name__ == "__main__":
