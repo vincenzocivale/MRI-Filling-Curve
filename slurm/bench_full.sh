@@ -9,13 +9,14 @@
 #   B. 12 / 8 mm extractions
 #   C. probe readings (caches)
 #   D. segdec (Dmix cascade, 16 tasks x SEG_SEEDS) and probes (every non-seg task, 5 seeds; the externals keep their
-#      earlier probes, user 24/10), LANES at a time round-robin over the GPUs
+#      earlier probes, user 24/10): seg in LANES lanes (one per GPU), probes beside them in 4 lanes of their own
 # Segmentation data on $FAST (user 24/10): the inputs in $FAST/fcorrent/segdec_inputs, the token cache live (each run
 # reads and writes the 16 / 8 mm tokens its volumes lack: no cache job) in $FAST/fcorrent/tok/<out dir name>/<task>, so
 # the seeds after the first only read. block_plan chooses the blocks on seed 0's train / val volumes for every seed.
 set -u
 S=$1; CK=$2
 R=/leonardo_scratch/large/userexternal/fcorrent/sfc_runs; MV=/leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench_v2
+MX=${MV}_fast; [ -f $MX/volumes.csv ] || MX=$MV   # the extraction inputs on $FAST (fast_move/move_bench_raw.sh), else scratch
 TV=configs/bench/probe_tasks_v2.yaml; PAR="bash slurm/par.sh"
 F=/leonardo_scratch/fast/IscrC_SFMRI/fcorrent; TOK=$F/tok/$(basename $S); SEG_SEEDS=${SEG_SEEDS:-0}; LANES=${LANES:-4}
 source ~/mri-sfc/env.sh >/dev/null 2>&1; cd ~/mri-sfc/repo
@@ -35,7 +36,7 @@ from sfc_gdn2.bench import probe as bp
 from sfc_gdn2.fm.api import load_config
 from sfc_gdn2.fm.sfc import SFC
 mm, S, ck = float(sys.argv[1]), sys.argv[2], sys.argv[3]
-v, s = pd.read_csv("$MV/volumes.csv", low_memory=False), pd.read_csv("$MV/splits.csv")
+v, s = pd.read_csv("$MX/volumes.csv", low_memory=False), pd.read_csv("$MX/splits.csv")
 fit = set(v.loc[v["subject"].isin(bp.tune_subjects(s)), "id"])
 cand = [i for i in sorted(v.loc[v["dataset"].isin(["crossMoDA", "TopCoW", "UCSF-PDGM"]), "id"]) if i in fit]
 g = torch.Generator().manual_seed(0)
@@ -61,7 +62,7 @@ for name, ts in pool.items():
 torch.save({"basis": basis, "dim": 64}, f"{S}/basis{int(mm)}.pt")
 PY
 echo "[bench] $(date +%H:%M) A: 16 mm, bases, block_plan"
-{ for g in 0 1 2 3; do echo "$X --shard $g/4 --out $S/fm --override out_dir=$MV"; done
+{ for g in 0 1 2 3; do echo "$X --shard $g/4 --out $S/fm --override out_dir=$MX"; done
   for mm in 12 8; do echo "[ -f $S/basis$mm.pt ] || python $S/cmds/basis.py $mm $S $CK"; done
   echo "[ -f $TOK/blocks.json ] || { python $R/blocks/mk_job.py $CK $TOK 6 4 $SEG && python -m sfc_gdn2.fm.block_plan $TOK/blocks_job.json; }"
 } > $S/cmds/A.txt
@@ -83,7 +84,7 @@ PY
 
 echo "[bench] $(date +%H:%M) B: 12 / 8 mm"
 { for mm in 12 8; do for g in 0 1 2 3; do
-    echo "$X args.patch_mm=$mm args.cov_basis=$S/basis$mm.pt $FINE --shard $g/4 --out $S/fm$mm --override out_dir=$MV 'fm.save.sfc_gdn2={features: [map, fg, mean, std, mean_b8, mean_b12, std_b8, std_b12, covsqrt, covsqrt_fg]}'"
+    echo "$X args.patch_mm=$mm args.cov_basis=$S/basis$mm.pt $FINE --shard $g/4 --out $S/fm$mm --override out_dir=$MX 'fm.save.sfc_gdn2={features: [map, fg, mean, std, mean_b8, mean_b12, std_b8, std_b12, covsqrt, covsqrt_fg]}'"
   done; done
 } > $S/cmds/B.txt
 $PAR $S/cmds/B.txt
@@ -100,13 +101,21 @@ P="env SFC_IO_WORKERS=8 sfc bench-probe configs/bench/bench.yaml --seeds 0,1,2,3
     case $t in vs_seg|wmh_seg|cmb_seg|fetal_landmarks) gmin=2;; stroke) gmin=8;; *) gmin=4;; esac
     echo "sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --seeds $sd --resume --tasks $t --fm-set checkpoint=$CK $DM args.cascade_g0=16 args.cascade_gmin=$gmin args.token_cache=live:$TOK/$t --override segdec.out=$S/seg segdec.cache=$F/segdec_inputs out_dir=$MV probe.tasks=$TV"
   done; done
-  for t in $OLD; do echo "$P --models sfc_gdn2 --common $EXTM --tasks $t $O fm.out_root=$S/fm probe.out=$S/probe $MENU"; done
+} > $S/cmds/Dseg.txt
+{ for t in $OLD; do echo "$P --models sfc_gdn2 --common $EXTM --tasks $t $O fm.out_root=$S/fm probe.out=$S/probe $MENU"; done
   for t in $NEW; do echo "$P --models sfc_gdn2 --tasks $t $O fm.out_root=$S/fm probe.out=$S/probe $MENU"; done
-} > $S/cmds/D.txt
-for k in $(seq 0 $((LANES - 1))); do   # 4 lanes, one per GPU with 8 CPUs: the decoder's training is CPU-bound (24/10: two
-  ( n=0; sed -n "$((k + 1))~${LANES}p" $S/cmds/D.txt | while IFS= read -r l; do n=$((n + 1))   # fetal runs on 8 CPUs, 2.25 s/it each, ~1 alone)
-      CUDA_VISIBLE_DEVICES=$((k % 4)) bash -c "$l" < /dev/null > $S/cmds/D.$k.$n.log 2>&1; echo "[bench] lane $k #$n exit $? $(date +%H:%M)"
-    done ) &
-done
+} > $S/cmds/Dprobe.txt
+# segdec: LANES lanes, one per GPU (its training is CPU-bound: 24/10, two fetal runs on 8 CPUs 2.25 s/it each, ~1 alone);
+# probes beside them in their own lanes on the same GPUs (L-BFGS: one Python thread, a few GB), 2 threads each
+lanes() {   # lanes <file> <n> <tag> [env]: the file's lines round-robin over n lanes, lane k on GPU k % 4
+  for k in $(seq 0 $(($2 - 1))); do
+    ( n=0; sed -n "$((k + 1))~${2}p" $1 | while IFS= read -r l; do n=$((n + 1))
+        env CUDA_VISIBLE_DEVICES=$((k % 4)) ${4:-} bash -c "$l" < /dev/null > $S/cmds/$3.$k.$n.log 2>&1
+        echo "[bench] $3 lane $k #$n exit $? $(date +%H:%M)"
+      done ) &
+  done
+}
+lanes $S/cmds/Dseg.txt $LANES seg
+lanes $S/cmds/Dprobe.txt 4 probe OMP_NUM_THREADS=2
 wait
 echo "[bench] $(date +%H:%M) done"
