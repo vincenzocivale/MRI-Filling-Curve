@@ -20,6 +20,7 @@ out-of-fold predictions, a cross-fitted choice of head; one `skill` per task (0 
 """
 from __future__ import annotations
 
+import copy
 import functools
 import json
 import math
@@ -263,6 +264,45 @@ def fit(x: torch.Tensor, y: torch.Tensor, kind: Kind, l2: float, hidden: int, se
     return head.eval().requires_grad_(False)
 
 
+GRID_PARAMS = 12e6  # ponytail: stacked parameters per L-BFGS (its 100-step history ~ 200x that in fp32, ~10 GB); bigger grids in chunks
+
+
+def fit_grid(x: torch.Tensor, y: torch.Tensor, kind: Kind, hidden: int, l2s=L2_GRID, seed: int = 0) -> list[Head]:
+    """fit() for every L2 of `l2s` at once (user, 24/10: the one-by-one fits, launch-bound, timed the cv5 probes out):
+    the heads (same init as fit) are stacked and one L-BFGS minimises the sum of their independent objectives. The shared
+    line search makes the optimum slightly different from fit()'s, so every model's probes run with this. A non-finite
+    head (one diverged L2 poisons the shared steps) -> that chunk is fitted one by one with fit()."""
+    def new():
+        torch.manual_seed(seed)
+        return Head(x.shape[1], kind.outputs(), hidden, getattr(kind, "ordinal", False)).to(x.device)
+    per = max(1, int(GRID_PARAMS // sum(p.numel() for p in new().parameters())))
+    if len(l2s) > per:
+        return [h for i in range(0, len(l2s), per) for h in fit_grid(x, y, kind, hidden, l2s[i:i + per], seed)]
+    heads = [new() for _ in l2s]
+    params, _ = torch.func.stack_module_state(heads)
+    base = copy.deepcopy(heads[0]).to("meta")
+    lam = torch.tensor(l2s, device=x.device)
+    opt = torch.optim.LBFGS(list(params.values()), max_iter=500, line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        out = torch.vmap(lambda p: torch.func.functional_call(base, p, (x,)))(params)  # [G, N, out]
+        loss = sum(kind.loss(o, y) for o in out) + sum(
+            (lam.view(-1, *[1] * (v.ndim - 1)) * v.square()).sum() for v in params.values() if v.ndim > 2)
+        loss.backward()
+        return loss
+    with torch.enable_grad():
+        opt.step(closure)
+    with torch.no_grad():
+        for g, h in enumerate(heads):
+            for k, p in h.named_parameters():
+                p.copy_(params[k][g])
+    heads = [h.eval().requires_grad_(False) for h in heads]
+    if not all(torch.isfinite(h(x)).all() for h in heads):
+        heads = [fit(x, y, kind, l2, hidden, seed) for l2 in l2s]
+    return heads
+
+
 def subject_ci(stat, subjects, n: int = 1000, seed: int = 0) -> list[float]:
     """95% CI of `stat(row positions)` over resamples of the subjects (`subjects`: one per row; fixed seed -> the
     same resamples for every model, paired). Also the segdec CI (bench/segdec.py)."""
@@ -329,19 +369,23 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
         for fname, f in feats.items():
             x = f[rid].float().to(device)
             xs = {s: v[sel[s]] for v in (standardize(x, sel[fit_on]),) for s in sel}
-            for l2 in L2_GRID:
-                if cv:  # out-of-fold outputs, each fold standardized on its own training part
-                    oof = None
-                    for k in range(CV_FOLDS):
-                        tr, te = sel["fit"][fold != k], sel["fit"][fold == k]
-                        xk = standardize(x, tr)
-                        o = fit(xk[tr], y_all[tr].to(device), kind, l2, hidden)(xk[te])
-                        oof = o.new_zeros((len(sel["fit"]), *o.shape[1:])) if oof is None else oof
-                        oof[torch.from_numpy(np.flatnonzero(fold == k)).to(device)] = o
-                    o = oof
+            if cv:  # out-of-fold outputs, each fold standardized on its own training part
+                oofs = [None] * len(L2_GRID)
+                for k in range(CV_FOLDS):
+                    tr, te = sel["fit"][fold != k], sel["fit"][fold == k]
+                    xk = standardize(x, tr)
+                    for j, h in enumerate(fit_grid(xk[tr], y_all[tr].to(device), kind, hidden)):
+                        o = h(xk[te])
+                        oofs[j] = o.new_zeros((len(sel["fit"]), *o.shape[1:])) if oofs[j] is None else oofs[j]
+                        oofs[j][torch.from_numpy(np.flatnonzero(fold == k)).to(device)] = o
+            else:
+                heads = fit_grid(xs["train"], y["train"], kind, hidden)
+            for j, l2 in enumerate(L2_GRID):
+                if cv:
+                    o = oof = oofs[j]
                     val = kind.metrics(kind.predict(oof), y["fit"], rows.iloc[sel["fit"]])
                 else:
-                    head = fit(xs["train"], y["train"], kind, l2, hidden)
+                    head = heads[j]
                     o = head(xs["val"])
                     val = kind.metrics(kind.predict(o), y["val"], rows.iloc[sel["val"]])
                 if not torch.isfinite(o).all():   # a diverged L-BFGS fit (21/10: NaN scores ranked as ties gave the
@@ -458,14 +502,15 @@ def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.T
     for variant, hidden in HIDDEN.items():
         for fname, f in feats.items():
             x = f[rid].float().to(device)
-            for l2 in L2_GRID:
-                pred = None
-                for k in range(folds):
-                    tr, te = (torch.as_tensor(np.flatnonzero(m), device=device) for m in (fold != k, fold == k))
-                    mu, sd = x[tr].mean(0), x[tr].std(0).clamp_min(1e-6)
-                    pk = kind.predict(fit((x[tr] - mu) / sd, y[tr], kind, l2, hidden)((x[te] - mu) / sd))
-                    pred = pk.new_zeros(len(rows), *pk.shape[1:]) if pred is None else pred
-                    pred[te] = pk
+            preds = [None] * len(L2_GRID)
+            for k in range(folds):
+                tr, te = (torch.as_tensor(np.flatnonzero(m), device=device) for m in (fold != k, fold == k))
+                mu, sd = x[tr].mean(0), x[tr].std(0).clamp_min(1e-6)
+                for j, h in enumerate(fit_grid((x[tr] - mu) / sd, y[tr], kind, hidden)):
+                    pk = kind.predict(h((x[te] - mu) / sd))
+                    preds[j] = pk.new_zeros(len(rows), *pk.shape[1:]) if preds[j] is None else preds[j]
+                    preds[j][te] = pk
+            for l2, pred in zip(L2_GRID, preds):
                 cands.append({"head": variant, "feature": fname, "l2": l2, "skill": [skill(pred, h) for h in halves]})
     a, b = (max(cands, key=lambda c, h=h: c["skill"][h]) for h in (0, 1))
     return {"task": name, "metric": kind.key, "skill": (a["skill"][1] + b["skill"][0]) / 2, "n": len(rows),
