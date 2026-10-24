@@ -744,7 +744,8 @@ class SegNet(nn.Module):
         st["ci"] = st["lg"] = None
         if j >= st["j0"]:
             st["ci"] = st["cand"].nonzero()[:, 0]
-            st["lg"] = self.lhead[j](z[st["ci"]])
+            with torch.autocast(z.device.type, enabled=False):   # fp32 logits: bf16 ones tie the margins (12.0, 7.875)
+                st["lg"] = self.lhead[j](z[st["ci"]].float())
             # confidence of the best pure class as a logit margin (its logit - logsumexp of the others), not a probability:
             # trained heads saturate the softmax at exactly 1.0 and a threshold of 1.0 then filled every tied cell past the
             # calibrated prefix (CMB, 24/10: val F1 0 from 3750 on, its lesion cells filled as background at 16 / 8 mm)
