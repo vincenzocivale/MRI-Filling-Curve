@@ -491,11 +491,14 @@ class Encoder(nn.Module):
             x = x.unsqueeze(-2).expand(*x.shape[:-1], self.hc, x.shape[-1]).contiguous()
         cu = cu_seqlens if cu_seqlens is not None else torch.tensor([0, x.shape[1]], device=x.device, dtype=torch.int32)
         for i, block in enumerate(self.blocks[: self.depth]):
-            if self.cpe is not None and pos is not None and str(i) in self.cpe and not self.hc:
-                x = x + checkpoint(self.cpe[str(i)], x[0], pos, cu, use_reentrant=False)[None]
+            cpe = self.cpe[str(i)] if self.cpe is not None and pos is not None and str(i) in self.cpe and not self.hc else None
             r = rev if self.bidir == "block" or self.reads_back[i] else None
-            x = (checkpoint(block, x, cu_seqlens, r, self.bidir == "block", pos, use_reentrant=False) if ckpt and self.training
-                 else block(x, cu_seqlens, r, self.bidir == "block", pos))
+
+            def step(x, block=block, cpe=cpe, r=r):   # CPE then block: one checkpoint, one saved input per block
+                if cpe is not None:                   # (two kept 2 x 16 [T, d] inputs with dwconv 'all': OOM at 48 scans)
+                    x = x + cpe(x[0], pos, cu)[None]
+                return block(x, cu_seqlens, r, self.bidir == "block", pos)
+            x = checkpoint(step, x, use_reentrant=False) if ckpt and self.training else step(x)
             taps += [x.mean(-2) if self.hc else x] * self.taps.count(i)  # a repeated index: same width, no new block
         x = x.mean(-2) if self.hc else x
         return torch.cat([x, *taps], -1) if taps else x
