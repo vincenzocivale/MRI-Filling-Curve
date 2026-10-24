@@ -8,7 +8,7 @@
 #   A. 16 mm extraction (4 shards), 12 / 8 mm covariance bases, block_plan of the seg tasks
 #   B. 12 / 8 mm extractions, token cache 16 / 8 mm (train + val + test of the seg tasks)
 #   C. probe readings (caches)
-#   D. segdec (Dmix cascade, 16 tasks) and probes (every non-seg task, 5 seeds; fit_grid, so the externals rerun too)
+#   D. segdec (Dmix cascade, 16 tasks) and probes (every non-seg task, 5 seeds; the externals keep their earlier probes, user 24/10)
 set -u
 S=$1; CK=$2
 R=/leonardo_scratch/large/userexternal/fcorrent/sfc_runs; MV=/leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench_v2

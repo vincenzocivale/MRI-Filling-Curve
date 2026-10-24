@@ -270,7 +270,7 @@ GRID_PARAMS = 12e6  # ponytail: stacked parameters per L-BFGS (its 100-step hist
 def fit_grid(x: torch.Tensor, y: torch.Tensor, kind: Kind, hidden: int, l2s=L2_GRID, seed: int = 0) -> list[Head]:
     """fit() for every L2 of `l2s` at once (user, 24/10: the one-by-one fits, launch-bound, timed the cv5 probes out):
     the heads (same init as fit) are stacked and one L-BFGS minimises the sum of their independent objectives. The shared
-    line search makes the optimum slightly different from fit()'s, so every model's probes run with this. A non-finite
+    line search makes the optimum slightly different from fit()'s (the external models keep their earlier fit() probes: same test, user 24/10). A non-finite
     head (one diverged L2 poisons the shared steps) -> that chunk is fitted one by one with fit()."""
     def new():
         torch.manual_seed(seed)
