@@ -469,7 +469,7 @@ def train(job: dict) -> None:
         print(f"[seg] cascade plan {pp.name}: g0 {pl['g0']:.0f} mm, g_min {pl['gmin']:.0f} mm, {pl['per_g0']}", flush=True)
     if args.get("blocks") == "auto":   # fm/block_plan's choice for this task, next to the token cache (24/10)
         task = Path(job["out"]).parts[-3]
-        pl = json.loads((Path(args["token_cache"]) / "blocks.json").read_text())
+        pl = json.loads((Path(str(args["token_cache"]).removeprefix("live:")) / "blocks.json").read_text())
         args["blocks"] = pl["tasks"][task]   # {mm: blocks}
         cv = (pl.get("curves") or {}).get(task) or {}   # {mm: curve}: live levels a curve, cached ones a curve or "mean"
         args["live_curves"] = {m: c for m, c in cv.items() if float(m) < 8} or None
@@ -520,6 +520,8 @@ def train(job: dict) -> None:
             ctx = torch.cat([ctx.float(), torch.tensor(r["x"].shape[1:], dtype=torch.float)])
         if tcache is not None:   # + the volume's index in the token cache; tiles append their corner
             ctx = torch.cat([ctx, torch.tensor([float(vid[it["id"]])])])
+            if hasattr(tcache, "ensure"):   # LiveCache: its levels read and written now if the folder lacks them
+                tcache.ensure(it["id"], r["x"], r["ctx"])
         v = {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx,
              "align": None if tcache is None else [4 * a for a in tcache.meta(it["id"])["k4"]]}
         if LM:   # model-grid spacing (mm: GT zooms through the grid mapping) and each landmark's voxel on the grid

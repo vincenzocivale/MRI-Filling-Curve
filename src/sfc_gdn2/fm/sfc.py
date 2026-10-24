@@ -194,7 +194,7 @@ class SegNet(nn.Module):
                 self.kgate.bias[: self.kskip] = 1.0   # a = 1, b = 0, g = 0
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0, embed_only=embed_only, reverse=tta)
         # every decoder can read the cached whole-scan tokens (20/10)
-        # token_cache "live:<segdec inputs>" (23/10, user): LiveCache, the tokens read in the job when first needed and kept
+        # token_cache "live:<folder>" (24/10, user): LiveCache, the volumes the folder lacks read in the job and written to it
         self.cache = (LiveCache(token_cache[5:], self) if str(token_cache).startswith("live:") else TokenCache(token_cache)) \
             if token_cache else None
         self._cur, self.width = None, width
@@ -368,13 +368,9 @@ class SegNet(nn.Module):
         t = self.up[i](z)[pidx if zmap is None else zmap[pidx]]
         t_par = t
         sub = (lambda a: a) if keep is None else (lambda a: a[keep])
-        live = isinstance(self.cache, LiveCache)
-        if self._cur is not None and self.fine_tok is not None and (i < self.ncached or live):   # fine_encoder from the cache: the
+        if self._cur is not None and self.fine_tok is not None and i < self.ncached:   # fine_encoder from the cache: the
             ci, corner, _ = self._cur                     # whole-scan reading of this level, last block ++ taps as at 16 mm
-            if live:   # only the cells asked for, read (once) in their fixed blocks
-                tf = self.cache.tokens_at(ci, float(self.fine_mm[i]), corner, gf.tolist(), kf, keep).to(z.device).float()
-            else:
-                tf = sub(self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float())
+            tf = sub(self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float())
             t = t + self.fine_tok[i](self._fproj(i, tf))
         elif self.fine_tok is not None:   # the frozen encoder at this level's patch, one sequence (curves summed in turn)
             if self.refine_frac >= 1:   # every child (the extractor's reading without its h ++ h copies and statistics:
@@ -1467,7 +1463,7 @@ class SFC(Wrapper):
                      cascade_warm=int(self.args.get("cascade_warm") or 0),
                      cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16),
                      fine_live4=bool(self.args.get("fine_live4")))
-        bj = Path(str(self.args.get("token_cache") or "")) / "blocks.json"
+        bj = Path(str(self.args.get("token_cache") or "").removeprefix("live:")) / "blocks.json"
         net.blocks_lv = lv
         if lv and getattr(net, "fine_tok", None) is not None:   # each finer level reads its own blocks (1 or 2) straight
             u = 1 if net.unique else 2                           # into its fine_tok (a projection to d first was a second
