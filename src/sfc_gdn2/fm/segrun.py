@@ -603,13 +603,17 @@ def train(job: dict) -> None:
                 for xi, ci in (zip(b[0], b[2]) if isinstance(b[0], list) else [(b[0], b[2])]):
                     tcache.prefetch(ci, tuple(xi.shape[2:]))
             return b
-        queue = [draw() for _ in range(min(AHEAD, iters - start + 1))]
+        # drawn on one thread while the GPU trains (24/10, fetal: tiles + heatmaps took 0.9 of 2.4 s per iteration in
+        # series with the step); one worker: the same draws in the same order
+        from concurrent.futures import ThreadPoolExecutor
+        drawer = ThreadPoolExecutor(1)
+        queue = [drawer.submit(draw) for _ in range(min(AHEAD, iters - start + 1))]
         tm = {"data": 0.0, "step": 0.0, "val": 0.0}   # seconds per part since the last val line (24/10: where the time goes)
         for it in range(start, iters + 1):
             ta = time.time()
-            x, y, c = queue.pop(0)
+            x, y, c = queue.pop(0).result()
             if it + len(queue) < iters:
-                queue.append(draw())
+                queue.append(drawer.submit(draw))
             tb = time.time()
             opt.zero_grad(set_to_none=True)
             # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
