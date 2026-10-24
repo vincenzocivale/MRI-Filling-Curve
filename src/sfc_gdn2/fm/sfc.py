@@ -232,7 +232,7 @@ class SegNet(nn.Module):
             self.lhead = nn.ModuleList([nn.Linear(encoder.dim, n_out + 1)] + [nn.Linear(128, n_out + 1) for _ in range(refine)])
             # buffers, saved with the trained state: the levels' thresholds (set on val), the training tiles' voxel counts
             # per class (rare classes) and cell-target counts (class weights, frequency^-0.5)
-            self.register_buffer("taus", torch.full((refine + 1,), 0.5))
+            self.register_buffer("taus", torch.full((refine + 1,), 0.0))   # logit margins (0: probability 0.5)
             self.register_buffer("cfreq", torch.zeros(n_out))
             self.register_buffer("tcount", torch.zeros(n_out + 1))
         # decoder D (23/10, user, notes/decoder_cascade.md): fine_split: the encoder's live 2 mm reading as one sequence
@@ -745,7 +745,12 @@ class SegNet(nn.Module):
         if j >= st["j0"]:
             st["ci"] = st["cand"].nonzero()[:, 0]
             st["lg"] = self.lhead[j](z[st["ci"]])
-            st["s"], st["a"] = st["lg"].detach().float().softmax(1)[:, :n_out].max(1)
+            # confidence of the best pure class as a logit margin (its logit - logsumexp of the others), not a probability:
+            # trained heads saturate the softmax at exactly 1.0 and a threshold of 1.0 then filled every tied cell past the
+            # calibrated prefix (CMB, 24/10: val F1 0 from 3750 on, its lesion cells filled as background at 16 / 8 mm)
+            lg = st["lg"].detach().float()
+            st["a"] = lg[:, :n_out].argmax(1)
+            st["s"] = lg.gather(1, st["a"][:, None])[:, 0] - lg.scatter(1, st["a"][:, None], float("-inf")).logsumexp(1)
 
     def _capply(self, st: dict, n_out: int, train: bool = False, upto=None) -> None:
         """Pure / mixed with this level's threshold; the mixed cells' children read (the next level), or done."""
@@ -904,7 +909,7 @@ class SegNet(nn.Module):
                         o = s.argsort(descending=True)
                         okp = (ls[o].cumsum(0)[:, 1:] <= (1 - self.cr) * tot[None, 1:]).all(1)
                         m = int(okp.long().cumprod(0).sum())   # the longest prefix of most confident cells that may be filled
-                        self.taus[j] = float(s[o[m - 1]]) if m else 1.01
+                        self.taus[j] = float(s[o[m - 1]]) if m else float("inf")
                         print(f"[cascade] level {j}: tau {float(self.taus[j]):.4f}, filled {m}/{len(s)} cells", flush=True)
                 for i in live:
                     st = {a: mv(b, dev) for a, b in sts[i].items()}
