@@ -19,6 +19,8 @@ R=/leonardo_scratch/large/userexternal/fcorrent/sfc_runs; MV=/leonardo_work/Iscr
 MX=${MV}_fast; [ -f $MX/volumes.csv ] || MX=$MV   # the extraction inputs on $FAST (fast_move/move_bench_raw.sh), else scratch
 TV=configs/bench/probe_tasks_v2.yaml; PAR="bash slurm/par.sh"
 F=/leonardo_scratch/fast/IscrC_SFMRI/fcorrent; TOK=$F/tok/$(basename $S); SEG_SEEDS=${SEG_SEEDS:-0}; LANES=${LANES:-4}
+BIG="totalseg stroke tumor_ucsf tumor_upenn"   # their token folders on scratch: all seg volumes at 2 blocks ~620 GB, these
+tokdir() { case " $BIG " in *" $1 "*) echo $S/tok/$1;; *) echo $TOK/$1;; esac; }   # ~510 (TotalSeg 275): FAST is 1 TB
 source ~/mri-sfc/env.sh >/dev/null 2>&1; cd ~/mri-sfc/repo
 mkdir -p $S/cmds
 SEG="tumor_ucsf tumor_upenn stroke totalseg spine_seg fetal_landmarks vs_seg prostate_zones prostate_lesion wmh_seg cmb_seg heart_seg ms_seg bladder_seg cow_seg hie_seg"
@@ -76,8 +78,8 @@ pl = json.loads(Path("$TOK/blocks.json").read_text())
 for t, bl in pl["tasks"].items():
     cache = sorted({b for mm, v in bl.items() if float(mm) >= 8 for b in v})
     tc = pl["curves"].get(t, {})
-    d = Path("$TOK") / t
-    d.mkdir(exist_ok=True)
+    d = Path("$S/tok" if t in "$BIG".split() else "$TOK") / t
+    d.mkdir(parents=True, exist_ok=True)
     (d / "blocks.json").write_text(json.dumps({"tasks": {t: bl}, "curves": {t: tc}, "cache": cache, "layout": layout(cache),
                                                "cache_curves": {mm: [tc.get(mm, "mean")] for mm in ("16", "8")}}, indent=1))
 PY
@@ -99,7 +101,7 @@ MENU="'probe.menu.sfc_gdn2=[mean, blocks+std, blocks+covsqrt, mean@12mm, blocks+
 P="env SFC_IO_WORKERS=8 sfc bench-probe configs/bench/bench.yaml --seeds 0,1,2,3,4"; O="--override out_dir=$MV probe.tasks=$TV fm.common_root=$R/fm_bench"
 { for sd in $SEG_SEEDS; do for t in $SEG; do   # the finest level per task (summary 24/10): 2 mm for small lesions / landmarks, 8 mm for stroke
     case $t in vs_seg|wmh_seg|cmb_seg|fetal_landmarks) gmin=2;; stroke) gmin=8;; *) gmin=4;; esac
-    echo "sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --seeds $sd --resume --tasks $t --fm-set checkpoint=$CK $DM args.cascade_g0=16 args.cascade_gmin=$gmin args.token_cache=live:$TOK/$t --override segdec.out=$S/seg segdec.cache=$F/segdec_inputs out_dir=$MV probe.tasks=$TV"
+    echo "sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --seeds $sd --resume --tasks $t --fm-set checkpoint=$CK $DM args.cascade_g0=16 args.cascade_gmin=$gmin args.token_cache=live:$(tokdir $t) --override segdec.out=$S/seg segdec.cache=$F/segdec_inputs out_dir=$MV probe.tasks=$TV"
   done; done
 } > $S/cmds/Dseg.txt
 { for t in $OLD; do echo "$P --models sfc_gdn2 --common $EXTM --tasks $t $O fm.out_root=$S/fm probe.out=$S/probe $MENU"; done
