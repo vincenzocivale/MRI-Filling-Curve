@@ -661,8 +661,9 @@ def train(job: dict) -> None:
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
                         ({"val_f1": rec["val_f1"]} if "val_f1" in rec else {})
                 set_mode()
-                pat = int(job.get("patience") or 0)   # screening: once learning (> 0), no new best for `pat` validations
-                if pat and (job.get("select") == "mre" or best["score"] > 0) and \
+                pat = int(job.get("patience") or 0)   # screening: once learning (> 0), no new best for `pat` validations,
+                # never before 60 % of the budget (CMB p20 d4 Dmix, 24/10: F1 .018 / .024 then 0, learns after 7500)
+                if pat and it >= 0.6 * iters and (job.get("select") == "mre" or best["score"] > 0) and \
                         sum(r["iter"] > best["iter"] for r in curve) >= pat:
                     print(f"[seg] no new val best since it {best['iter']}: stopped (screening)", flush=True)
                     break
