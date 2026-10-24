@@ -67,7 +67,8 @@ class SegNet(nn.Module):
                  c_unweighted: bool = False, c_wpow: float = 1.0, cascade: bool = False, cascade_g0: float = 16.0,
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
                  cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2,
-                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_eval=(8, 8, 16, 16), fine_live4: bool = False):
+                 fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_eval=(8, 8, 16, 16), fine_live4: bool = False,
+                 dec_cpe: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -108,6 +109,11 @@ class SegNet(nn.Module):
                 for m in self.fine.modules():
                     if hasattr(m, "b_proj") and hasattr(m, "head_k_dim"):
                         m.b_proj = HeadErase(m)
+            # dec_cpe (24/10, user): a TokenConv3D (the encoder's CPE: true 3D neighbours by coordinate, residual, zero
+            # at init) before each fine_mix block, whose GDN-2 reads the sparse children along a 1-D curve
+            from ..model import TokenConv3D
+            self.fcpe = nn.ModuleList(nn.ModuleList(TokenConv3D(128) for _ in self.fine_curves)
+                                      for _ in range(self.refine)) if dec_cpe else None
             self.up = nn.ModuleList([nn.Linear(c, 128)] + [nn.Linear(128, 128) for _ in range(self.refine - 1)])
             # zoom: the image at each scale through the encoder's own (frozen) patch kernel, zoomed onto the cell (its
             # voxels at 2^i x their spacing fill one 16 mm patch: exact, nothing resampled), projected to 128
@@ -438,13 +444,16 @@ class SegNet(nn.Module):
         (cu_seqlens): a batch of sliding-window tiles costs one GDN-2 call per curve, not one per tile."""
         from ..curves import keys
 
-        for curve, enc in zip(self.fine_curves, self.fine[i] if encs is None else encs):
+        for ci, (curve, enc) in enumerate(zip(self.fine_curves, self.fine[i] if encs is None else encs)):
             orders = [keys(curve, xyz, gf, self.seed).argsort() for xyz, gf in zip(xyzs, gfs)]
             cu, o = [0], 0
             for t in ts:
                 cu += [o + j for j in range(self.fine_seg or len(t), len(t), self.fine_seg or len(t))] + [o + len(t)]
                 o += len(t)
             seq = torch.cat([t[od] for t, od in zip(ts, orders)])
+            if encs is None and getattr(self, "fcpe", None) is not None:
+                pos = torch.cat([xyz[od] for xyz, od in zip(xyzs, orders)])
+                seq = seq + self.fcpe[i][ci](seq, pos, torch.tensor(cu, device=seq.device, dtype=torch.int32))
             # calls of at most MIX_MAX tokens, cut at sequence boundaries: the short convolution's Triton grid failed
             # on a whole-body scan (~1e6 tokens in one call, 21/10)
             groups, a = [], 0
@@ -1431,7 +1440,7 @@ class SFC(Wrapper):
             apply(enc, lv[16.0] if lv else blocks)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
-                     tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")),
+                     tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")), dec_cpe=bool(self.args.get("dec_cpe")),
                      kernel=bool(self.args.get("kernel")), refine=int(self.args.get("refine") or 0),
                      image=bool(self.args.get("image")), fine_curves=self.args.get("fine_curves"), rough=bool(self.args.get("rough")),
                      zoom=bool(self.args.get("zoom")), fine_seg=int(self.args.get("fine_seg") or 0),
