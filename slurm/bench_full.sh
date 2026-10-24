@@ -1,7 +1,7 @@
 #!/bin/bash
 # Full benchmark of one encoder checkpoint in ONE 4-GPU job (user, 24/10: no chain of ~150 small jobs; as sb2_bench.sh
 # for SB epoch 2, with the Dmix cascade of night_dmix/group.sh for segmentation, full 12500 iterations + test):
-#   bench_full.sh <out dir> <checkpoint>      (EXT=1: also the 12 external models' probes into $R/probe_v3, once)
+#   bench_full.sh <out dir> <checkpoint>
 #   python slurm/submit.py slurm/presets/1gpu.yaml --set gres=gpu:4 --set cpus_per_task=32 --set mem=480G \
 #     --set time=14:00:00 -- bash slurm/bench_full.sh <out dir> <checkpoint>
 # Phases (slurm/par.sh, one command per GPU), each skipped / resumed where its outputs exist, so a rerun continues:
@@ -96,10 +96,11 @@ P="env SFC_IO_WORKERS=8 sfc bench-probe configs/bench/bench.yaml --seeds 0,1,2,3
   done
   for t in $OLD; do echo "$P --models sfc_gdn2 --common $EXTM --tasks $t $O fm.out_root=$S/fm probe.out=$S/probe $MENU"; done
   for t in $NEW; do echo "$P --models sfc_gdn2 --tasks $t $O fm.out_root=$S/fm probe.out=$S/probe $MENU"; done
-  if [ "${EXT:-0}" = 1 ]; then for m in $EXTM; do
-    echo "$P --models $m --common $EXTM --tasks $OLD $O probe.out=$R/probe_v3"
-    echo "$P --models $m --tasks $NEW $O probe.out=$R/probe_v3"
-  done; fi
 } > $S/cmds/D.txt
-$PAR $S/cmds/D.txt
+for k in 0 1 2 3 4 5 6 7; do   # 8 lanes, 2 per GPU (decoders and L-BFGS fits are launch-bound: two share a GPU, group.sh)
+  ( n=0; sed -n "$((k + 1))~8p" $S/cmds/D.txt | while IFS= read -r l; do n=$((n + 1))
+      CUDA_VISIBLE_DEVICES=$((k % 4)) bash -c "$l" < /dev/null > $S/cmds/D.$k.$n.log 2>&1; echo "[bench] lane $k #$n exit $? $(date +%H:%M)"
+    done ) &
+done
+wait
 echo "[bench] $(date +%H:%M) done"
