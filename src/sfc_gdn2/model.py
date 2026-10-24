@@ -108,13 +108,12 @@ class TokenConv3D(nn.Module):
         seq = torch.searchsorted(cu[1:].long(), torch.arange(T, device=dev), right=True)
         p = pos.long() + 1
         M = int(p.max()) + 2
-        key = lambda q: ((seq * M + q[:, 0]) * M + q[:, 1]) * M + q[:, 2]
+        key = lambda q: ((seq * M + q[..., 0]) * M + q[..., 1]) * M + q[..., 2]
         sk, order = key(p).sort()
-        nbr = torch.empty(len(self.off), T, dtype=torch.long, device=dev)   # each offset's neighbour row, T if absent
-        for j, o in enumerate(self.off):
-            nk = key(p + o)
-            i = torch.searchsorted(sk, nk).clamp(max=T - 1)
-            nbr[j] = torch.where(sk[i] == nk, order[i], T)
+        # the 27 offsets at once (24/10: the loop's ~100 small kernels per call were 0.6 s per segdec iteration)
+        nk = key(p + self.off[:, None])                                    # [27, T]
+        i = torch.searchsorted(sk, nk).clamp(max=T - 1)
+        nbr = torch.where(sk[i] == nk, order[i], T)                         # each offset's neighbour row, T if absent
         return _NbrConv.apply(x, nbr, self.w.to(x.dtype), self.b.to(x.dtype))
 
 
