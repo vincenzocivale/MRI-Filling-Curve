@@ -23,7 +23,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-LEVELS = ((16.0, 4), (8.0, 2), (4.0, 1))   # as token_cache: (mm, cells of 4 mm per axis)
+LEVELS = (16.0, 8.0, 4.0, 2.0)   # the cascade's levels; 4 / 2 mm read live in a window around the target (WIN cells)
+WIN = 16
 
 
 def layout(blocks) -> list[int]:
@@ -99,7 +100,7 @@ def main(path: str) -> None:
     enc.taps, enc.depth = tuple(range(-1, n - 1)), None   # every block: row = last ++ (-1, 0, .., n - 2)
     order = [n - 1] + list(range(-1, n - 1))
     rng = np.random.default_rng(0)
-    cap, max_blocks, min_gain = int(job.get("cap", 1000)), int(job.get("max_blocks", 4)), float(job.get("min_gain", 0.002))
+    cap, max_blocks, min_gain = int(job.get("cap", 1000)), int(job.get("max_blocks", 2)), float(job.get("min_gain", 0.002))
     out, res = Path(job["out"]), {"tasks": {}, "scores": {}}
     feats = {}   # (task, split, level) -> [X [cells, n + 1, d] fp16, Y]
     for task, sp_ids in job["tasks"].items():
@@ -109,43 +110,53 @@ def main(path: str) -> None:
                 x, sp = r["x"].cuda(), r["ctx"][:3].float().cuda()
                 y = (r["y"][0] if r["y"].dim() == 4 else r["y"]).cuda()
                 K = int(job["k"][task])
-                k4 = patch_dims(sp.tolist(), 4.0)
-                for mm, m in LEVELS:
-                    k = [kk * m for kk in k4]
+                for mm in LEVELS:
+                    k = list(patch_dims(sp.tolist(), mm))
                     if mm < 8 and not fine_ok(k):
                         continue
-                    idx, fr = _cells(y, k, K, cap, rng)
+                    xc, yc = x, y
+                    if mm < 8:   # as the cascade reads them: a window of WIN cells around a target voxel, not the scan
+                        fgv = (y > 0).nonzero()
+                        if len(fgv):
+                            c = fgv[int(rng.integers(len(fgv)))].tolist()
+                            lo = [max(0, min(cc - WIN * kk // 2, s_ - WIN * kk)) // kk * kk for cc, kk, s_ in zip(c, k, y.shape)]
+                            sl = tuple(slice(a, a + WIN * kk) for a, kk in zip(lo, k))
+                            xc, yc = x[(slice(None), *sl)], y[sl]
+                    idx, fr = _cells(yc, k, K, cap, rng)
                     with torch.no_grad():
-                        a = read(enc, curves, seed, x, sp, k, mm, 200_000, 64, 8, taps=True)
+                        a = read(enc, curves, seed, xc, sp, k, mm, 30_000, 32, 8, taps=True)   # all 17 blocks: small windows (OOM at 200k)
                     a = torch.from_numpy(a.reshape(-1, n + 1, d)[idx])
                     f = feats.setdefault((task, split, mm), [[], []])
                     f[0].append(a)
                     f[1].append(fr.cpu())
                 print(f"[blocks] {task} {split} {i}", flush=True)
-    for task in job["tasks"]:
-        lv = [mm for mm, _ in LEVELS if (task, "train", mm) in feats and (task, "val", mm) in feats]
-        D = {(s, mm): [torch.cat(v).cuda() for v in feats[(task, s, mm)]] for s in ("train", "val") for mm in lv}
+    for task in job["tasks"]:   # per level (user, 24/10: each level decides something else; no mean over levels)
+        res["tasks"][task], res["scores"][task] = {}, {}
+        for mm in LEVELS:
+            if (task, "train", mm) not in feats or (task, "val", mm) not in feats:
+                continue
+            D = {s_: [torch.cat(v).cuda() for v in feats[(task, s_, mm)]] for s_ in ("train", "val")}
 
-        def score(blocks, D=D, lv=lv):
-            cs = [order.index(b) for b in blocks]
-            return float(np.nanmean([_score(D["train", mm][0][:, cs].flatten(1).float(), D["train", mm][1],
-                                            D["val", mm][0][:, cs].flatten(1).float(), D["val", mm][1]) for mm in lv]))
-        single = {b: score([b]) for b in order}
-        chosen, best, steps = [], 0.5, []
-        while len(chosen) < max_blocks:
-            cand = {b: score(chosen + [b]) for b in order if b not in chosen}
-            b = max(cand, key=cand.get)
-            if chosen and cand[b] - best < min_gain:
-                break
-            chosen, best = chosen + [b], cand[b]
-            steps.append({"block": b, "val_auroc": round(best, 4)})
-        res["tasks"][task] = sorted(chosen)
-        res["scores"][task] = {"single": {str(b): round(v, 4) for b, v in single.items()}, "greedy": steps,
-                               "levels_mm": lv}
-        print(f"[blocks] {task}: single " + " ".join(f"{b}:{v:.3f}" for b, v in single.items()) +
-              f" -> {sorted(chosen)} (val AUROC {best:.3f})", flush=True)
-        D.clear()
-    res["cache"] = sorted({b for v in res["tasks"].values() for b in v})
+            def score(blocks, D=D):
+                cs = [order.index(b) for b in blocks]
+                return _score(D["train"][0][:, cs].flatten(1).float(), D["train"][1],
+                              D["val"][0][:, cs].flatten(1).float(), D["val"][1])
+            single = {b: score([b]) for b in order}
+            chosen, best, steps = [], 0.5, []
+            while len(chosen) < max_blocks:
+                cand = {b: score(chosen + [b]) for b in order if b not in chosen}
+                b = max(cand, key=cand.get)
+                if chosen and cand[b] - best < min_gain:
+                    break
+                chosen, best = chosen + [b], cand[b]
+                steps.append({"block": b, "val_auroc": round(best, 4)})
+            res["tasks"][task][str(int(mm))] = sorted(chosen)
+            res["scores"][task][str(int(mm))] = {"single": {str(b): round(v, 4) for b, v in single.items()},
+                                                 "greedy": steps, "cells": [len(D["train"][1]), len(D["val"][1])]}
+            print(f"[blocks] {task} {mm:g} mm: " + " ".join(f"{b}:{v:.3f}" for b, v in sorted(single.items())) +
+                  f" -> {sorted(chosen)} ({best:.3f})", flush=True)
+            D.clear()
+    res["cache"] = sorted({b for v in res["tasks"].values() for mm, bl in v.items() if float(mm) >= 8 for b in bl})
     res["layout"] = layout(res["cache"])
     out.mkdir(parents=True, exist_ok=True)
     (out / "blocks.json").write_text(json.dumps(res, indent=1))
