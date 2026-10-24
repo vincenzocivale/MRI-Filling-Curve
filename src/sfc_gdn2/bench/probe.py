@@ -38,7 +38,7 @@ HIDDEN = {"linear": 0, "mlp": 256}
 # val with fewer subjects than this (user, 21/10: e.g. cmb_any, 7 val subjects -> val AUROC 0.32, test 0.74): the
 # (feature, L2) is chosen on out-of-fold predictions of a CV_FOLDS-fold split of train + val by subject, then the head
 # is refitted on train + val; test is never seen by the choice. Same rule for every model.
-CV_MIN_VAL, CV_FOLDS = 25, 5
+CV_MIN_VAL, CV_FOLDS = 25, 3  # 3 folds, not 5 (user, 24/10: the cost of the noisy tasks)
 
 
 # ------------------------------------------------------------------------------------------- features
