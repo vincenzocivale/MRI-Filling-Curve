@@ -375,7 +375,8 @@ class Encoder(nn.Module):
     "alternate" every odd block reads backwards (Vision-LSTM, Alkin et al. 2024): every token sees the whole sequence
     from block 2 on, at half the late encoder's cost; "block" every block reads both ways with the same mixer, outputs
     averaged (Vision Mamba / Hydra pattern), the late encoder's mixer cost and half its MLP. One stream: bi = h ++ h
-    (same interface for the heads, probes and decoder).
+    (same interface for the heads, probes and decoder). "alternate_gdn" alternates over the GDN-2 blocks only: with
+    attn_every 4 "alternate" lands the attention on the odd (backward) slots, 8 GDN-2 forwards and 4 backwards (24/10).
     """
 
     def __init__(self, d_model: int, depth: int, head_dim: int, num_heads: int, use_short_conv: bool = True,
@@ -383,7 +384,7 @@ class Encoder(nn.Module):
                  long_mem: dict | None = None, attn_every: int = 0, attn_rope: bool = False, attn_insert: int = 0,
                  norm: str = "layer", hc: int = 0, rope3d: str = "", dwconv: bool | str = False, **embed):
         super().__init__()
-        assert bidir in ("late", "alternate", "block"), bidir
+        assert bidir in ("late", "alternate", "alternate_gdn", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
         self.taps: tuple = ()  # block indices whose outputs `flat` also returns (segmentation decoder input, fm/sfc.py)
         self.depth: int | None = None  # run only the first `depth` blocks (fm/block_plan: the decoder's last block)
@@ -395,6 +396,9 @@ class Encoder(nn.Module):
                                     else GDN2Block(d_model, head_dim, num_heads, use_short_conv, i) for i in range(depth))
         # backwards reading of `alternate`: every other GDN-2 block (attention reads no direction)
         self.reads_back = [bool(i % 2) for i in range(depth)]
+        if bidir == "alternate_gdn":   # every other GDN-2 block, counted without the attention blocks (6 / 6 at 16, k 4)
+            gdn = [not isinstance(b, AttnBlock) for b in self.blocks]
+            self.reads_back = [g and sum(gdn[:i]) % 2 == 1 for i, g in enumerate(gdn)]
         if attn_insert:  # attn_insert k (18/10, growth): `depth` GDN-2 blocks + an identity-initialised AttnBlock after
             # every k-th; the GDN-2 blocks keep their order and direction, so a pure stack's weights load unchanged
             # (pretrain: train.init_from maps their indices) and the grown model starts as the same function
@@ -429,10 +433,12 @@ class Encoder(nn.Module):
                     b.add_rope(self.rope3d)
         # dwconv "attn" (23/10, user: CPE where PTv3 / CPVT put it): a TokenConv3D on the residual stream before each
         # attention block instead of on the input tokens
-        assert dwconv in (False, True, "attn"), dwconv
+        # dwconv "all" (24/10, user): a TokenConv3D before every block (PTv3 / CPVT with a PEG per block)
+        assert dwconv in (False, True, "attn", "all"), dwconv
         self.dw = TokenConv3D(d_model) if dwconv is True else None
         self.cpe = nn.ModuleDict({str(i): TokenConv3D(d_model) for i, b in enumerate(self.blocks)
-                                  if isinstance(getattr(b, "block", b), AttnBlock)}) if dwconv == "attn" else None
+                                  if dwconv == "all" or isinstance(getattr(b, "block", b), AttnBlock)}) \
+            if dwconv in ("attn", "all") else None
 
     @classmethod
     def from_config(cls, cfg: dict) -> Encoder:
