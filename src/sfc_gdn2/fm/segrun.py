@@ -698,6 +698,18 @@ def train(job: dict) -> None:
         del val_v
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     if job.get("val_only"):  # pretraining tuning: the best val Dice, no test volume read
+        if job.get("save_pred"):   # the best state's val predictions kept anyway (user, 24/10: lesion counts on val)
+            load_trained(best["state"])
+            net.eval()
+            if "lm_topk" in best:
+                net.ctopk_eval = best["lm_topk"]
+            pv = out_p.with_suffix(".pred_val")
+            for it in split["val"]:
+                if not (pv / f"{it['id']}.npz").exists():
+                    v = load(it)
+                    save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]),
+                              v["grid_from_gt"])
+                    del v
         best.pop("state")
         out_p.write_text(json.dumps({"model": job["cfg"]["model"], "init": job["init"], "iters": iters,
                                      "best": best, "curve": curve, "val_dice": best["val"],
