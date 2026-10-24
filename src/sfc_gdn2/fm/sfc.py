@@ -18,6 +18,7 @@ bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in ou
 """
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -1410,6 +1411,10 @@ class SFC(Wrapper):
         if isinstance(taps, int):           # quarter points below the last block (2: n/2, 3n/4; 3: also n/4; 4: also
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
+        blocks = self.args.get("blocks")   # fm/block_plan (24/10): these blocks only, the encoder run as deep as the last
+        if blocks:
+            from .block_plan import apply
+            apply(enc, blocks)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
                      tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")),
@@ -1439,6 +1444,10 @@ class SFC(Wrapper):
                      cascade_warm=int(self.args.get("cascade_warm") or 0),
                      cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16),
                      fine_live4=bool(self.args.get("fine_live4")))
+        bj = Path(str(self.args.get("token_cache") or "")) / "blocks.json"
+        if blocks and isinstance(net.cache, TokenCache) and bj.exists():   # a cache of more blocks: the decoder's columns
+            from .block_plan import columns
+            net.cache.cols = columns(json.loads(bj.read_text())["cache"], blocks, enc.dim)
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

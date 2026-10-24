@@ -43,6 +43,7 @@ class TokenCache:
         self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(16), {}, (16.0,), {}, 0
         self._recent = {}
         self.pca = None   # SegNet fine_pca: the 8 / 4 mm levels from <id>.<mm>.p<pca>.npy (project())
+        self.cols = None   # SegNet blocks: the columns of the decoder's blocks in a cache of more (block_plan.layout)
 
     def meta(self, i: str) -> dict:
         if i not in self._meta:
@@ -79,7 +80,7 @@ class TokenCache:
                 n = [-(-v // kk) for v, kk in zip(V, k)]
                 key = (i, mm, tuple(corner), tuple(n))
                 if key not in self._ahead:
-                    self._ahead[key] = (self._gen, self._io.submit(self._read, i, mm, corner, n, k))
+                    self._ahead[key] = (self._gen, self._io.submit(lambda *a: self._cols(self._read(*a), a[1]), i, mm, corner, n, k))
 
     def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
         key = (i, mm, tuple(int(c) for c in corner), tuple(n))
@@ -87,8 +88,11 @@ class TokenCache:
         if f is not None:
             return f[1].result()
         if key not in self._recent:   # the last few reads (adaptive decoding reads a scan's levels once per chunk)
-            self._recent = dict(list(self._recent.items())[-3:]) | {key: self._read(i, mm, corner, n, k)}
+            self._recent = dict(list(self._recent.items())[-3:]) | {key: self._cols(self._read(i, mm, corner, n, k), mm)}
         return self._recent[key]
+
+    def _cols(self, t: torch.Tensor, mm: float) -> torch.Tensor:
+        return t if self.cols is None or (self.pca and mm < 16) else t[..., self.cols]
 
     def _read(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
         fd, shape, dt, off = self._open(i, mm, self.pca if mm < 16 else None)

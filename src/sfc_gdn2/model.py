@@ -386,6 +386,7 @@ class Encoder(nn.Module):
         assert bidir in ("late", "alternate", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
         self.taps: tuple = ()  # block indices whose outputs `flat` also returns (segmentation decoder input, fm/sfc.py)
+        self.depth: int | None = None  # run only the first `depth` blocks (fm/block_plan: the decoder's last block)
         self.patch_embed = KernelEmbed(d_model, patch_mm, **embed)
         self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
         self.pos = ViewPos(d_model) if view_pos else None
@@ -458,7 +459,7 @@ class Encoder(nn.Module):
         if self.hc:                                       # n identical residual streams (mHC); read out as their mean
             x = x.unsqueeze(-2).expand(*x.shape[:-1], self.hc, x.shape[-1]).contiguous()
         cu = cu_seqlens if cu_seqlens is not None else torch.tensor([0, x.shape[1]], device=x.device, dtype=torch.int32)
-        for i, block in enumerate(self.blocks):
+        for i, block in enumerate(self.blocks[: self.depth]):
             if self.cpe is not None and pos is not None and str(i) in self.cpe and not self.hc:
                 x = x + checkpoint(self.cpe[str(i)], x[0], pos, cu, use_reentrant=False)[None]
             r = rev if self.bidir == "block" or self.reads_back[i] else None
