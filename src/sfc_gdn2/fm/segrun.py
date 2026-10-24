@@ -604,10 +604,13 @@ def train(job: dict) -> None:
                     tcache.prefetch(ci, tuple(xi.shape[2:]))
             return b
         queue = [draw() for _ in range(min(AHEAD, iters - start + 1))]
+        tm = {"data": 0.0, "step": 0.0, "val": 0.0}   # seconds per part since the last val line (24/10: where the time goes)
         for it in range(start, iters + 1):
+            ta = time.time()
             x, y, c = queue.pop(0)
             if it + len(queue) < iters:
                 queue.append(draw())
+            tb = time.time()
             opt.zero_grad(set_to_none=True)
             # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
             # of ~1e7 voxels x 50 classes: then micro_step (the two graphs of joint_step went OOM)
@@ -640,6 +643,8 @@ def train(job: dict) -> None:
                                          f"context {None if c is None else [t.tolist() for t in c]}")
             opt.step()
             sched.step()
+            tc = time.time()
+            tm["data"], tm["step"] = tm["data"] + tb - ta, tm["step"] + tc - tb
             if it % every == 0 or it == iters:
                 net.eval()
                 if getattr(net, "cascade", False) and not LM:   # one pass: the levels' thresholds on val and the val predictions
@@ -662,7 +667,10 @@ def train(job: dict) -> None:
                     rec["val_f1"], score, msg = f1v, f1v, msg + f" val F1 {f1v:.3f}"
                 del preds
                 curve.append(rec)
-                print(f"[seg] it {it} loss {float(loss):.3f} {msg} ({(time.time() - t0) / 60:.1f} min)", flush=True)
+                tm["val"] = time.time() - tc
+                print(f"[seg] it {it} loss {float(loss):.3f} {msg} ({(time.time() - t0) / 60:.1f} min; s: data {tm['data']:.0f}"
+                      f" step {tm['step']:.0f} val {tm['val']:.0f})", flush=True)
+                tm = dict.fromkeys(tm, 0.0)
                 if "state" not in best or score > best.get("score", best["val"]):
                     best = {"val": val, "iter": it, "score": score, "state": trained()} | \
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
