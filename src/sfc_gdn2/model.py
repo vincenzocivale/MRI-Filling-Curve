@@ -110,13 +110,38 @@ class TokenConv3D(nn.Module):
         M = int(p.max()) + 2
         key = lambda q: ((seq * M + q[:, 0]) * M + q[:, 1]) * M + q[:, 2]
         sk, order = key(p).sort()
-        out = self.b.to(x.dtype).expand_as(x).clone()
+        nbr = torch.empty(len(self.off), T, dtype=torch.long, device=dev)   # each offset's neighbour row, T if absent
         for j, o in enumerate(self.off):
             nk = key(p + o)
             i = torch.searchsorted(sk, nk).clamp(max=T - 1)
-            hit = (sk[i] == nk)[:, None].to(x.dtype)
-            out = out + x[order[i]] * hit * self.w[j].to(x.dtype)
+            nbr[j] = torch.where(sk[i] == nk, order[i], T)
+        return _NbrConv.apply(x, nbr, self.w.to(x.dtype), self.b.to(x.dtype))
+
+
+class _NbrConv(torch.autograd.Function):
+    """out = b + sum_j x[nbr_j] * w_j (row T = an absent neighbour, zero), keeping only x and the indices for the
+    backward: the autograd of the plain loop kept 27 [T, d] products per call (p27, 24/10: dwconv 'all' at 48 scans
+    per GPU, 2.6e5 tokens, OOM at the first step; 'attn' had only run at 6 scans per GPU)."""
+
+    @staticmethod
+    def forward(ctx, x, nbr, w, b):
+        xp = torch.cat([x, x.new_zeros(1, x.shape[1])])
+        out = b.expand_as(x).clone()
+        for j in range(len(nbr)):
+            out.add_(xp[nbr[j]] * w[j])
+        ctx.save_for_backward(x, nbr, w)
         return out
+
+    @staticmethod
+    def backward(ctx, g):
+        x, nbr, w = ctx.saved_tensors
+        xp = torch.cat([x, x.new_zeros(1, x.shape[1])])
+        gx = torch.zeros_like(xp)
+        gw = torch.empty_like(w)
+        for j in range(len(nbr)):
+            gx.index_add_(0, nbr[j], g * w[j])
+            gw[j] = (xp[nbr[j]] * g).float().sum(0).to(w.dtype)
+        return gx[:-1], None, gw, g.sum(0)
 
 
 class GDN2Block(nn.Module):
