@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -289,6 +290,8 @@ class Pretrainer:
                 torch.save(self.net.encoder.state_dict(), self.run / f"encoder_step{step:06d}.pt")
             if save and (step % t.get("ckpt_every", 500) == 0 or step == t["steps"]):
                 self._checkpoint()
+                if step in t.get("keep_ckpt_at", ()):   # branch points (final run, 25/10): ckpt.pt is overwritten
+                    shutil.copy(self.run / "ckpt.pt", self.run / f"ckpt_step{step:06d}.pt")
         if not save:
             return
         with open(self.run / "metrics.json", "w") as f:  # the last step: logged (hist[-1]), history.csv written
