@@ -466,17 +466,18 @@ CHANCE = {"auroc": 0.5, "c_index": 0.5, "qwk": 0.0}
 
 
 def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Tensor], index: dict[str, int],
-              device: str = "cuda", folds: int = 5) -> dict:
+              device: str = "cuda", folds: int = 5, seed: int = 0, keep: bool = False) -> dict:
     """Skill of one task on `rows` (tune_subjects only, no split used): out-of-fold predictions over `folds` subject
     folds for every (head, feature, L2) of the benchmark grid; the candidate is chosen on one half of the subjects and
     scored on the other, and vice versa (cross-fitted: no selection bias), averaged. skill: AUROC and C-index
     2(m - 0.5), QWK as is, balanced accuracy (m - 1/k) / (1 - 1/k); dex: 1 - mean over datasets of the MAE within the
-    dataset over that of its out-of-fold train median (the site-constant predictor), so site is no help."""
+    dataset over that of its out-of-fold train median (the site-constant predictor), so site is no help.
+    seed: the subjects' permutation (halves and folds); keep: also return every candidate's skill per half."""
     y, _ = targets(rows, cfg)
     y = y.to(device)
     kind = KINDS[cfg["type"]](cfg, y.cpu())
     subjects = rows["subject"].unique()
-    p = rows["subject"].map(dict(zip(subjects, np.random.default_rng(0).permutation(len(subjects))))).to_numpy()
+    p = rows["subject"].map(dict(zip(subjects, np.random.default_rng(seed).permutation(len(subjects))))).to_numpy()
     half, fold = p % 2, (p // 2) % folds
     ds, yy = rows["dataset"].to_numpy(), y.cpu().numpy()
     if cfg["type"] == "dex":  # out-of-fold train median of the volume's dataset
@@ -514,7 +515,8 @@ def tune_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.T
                 cands.append({"head": variant, "feature": fname, "l2": l2, "skill": [skill(pred, h) for h in halves]})
     a, b = (max(cands, key=lambda c, h=h: c["skill"][h]) for h in (0, 1))
     return {"task": name, "metric": kind.key, "skill": (a["skill"][1] + b["skill"][0]) / 2, "n": len(rows),
-            "subjects": len(subjects), "chosen": [{k: c[k] for k in ("head", "feature", "l2")} for c in (a, b)]}
+            "subjects": len(subjects), "chosen": [{k: c[k] for k in ("head", "feature", "l2")} for c in (a, b)]} \
+        | ({"cands": cands} if keep else {})
 
 
 _BASIS = None

@@ -3,14 +3,18 @@ a few GB): is the run on track, not a benchmark number. Frozen encoder, one curv
 
 - global, IDH: UCSF-PDGM, tune subjects (bench.probe.tune_subjects), FLAIR + T1c; the mean token over the foreground
   cells at 16 mm of blocks 4 / 8 / 12 / 16 -> bench.probe.tune_task (subject folds, the candidate chosen on one half
-  of the subjects and scored on the other: the screens' protocol, on a smaller menu) -> skill.
+  of the subjects and scored on the other: the screens' protocol, on a smaller menu) -> skill (permutation 0, as the
+  screens). Only 35 of the 163 subjects are IDH-mutant (+-0.08 skill per point, 25/10), so also the skill of one
+  fixed head (FIXED: no selection jitter, read from the same fit: no cost), the curve to read. Over 10 subject
+  permutations it moved by +-0.018 only (step 1000), so one permutation is enough. The features are saved beside <out>
+  (<out>.idh.pt), and reused if there.
 - local, WMH: WMH2017 FLAIR, the segdec split of seed 0 (train 43 / val 17 volumes). Per level (16 / 8 mm) and per
   block, a ridge (closed form) from each cell's token to its lesion fraction on a 4^3 sub-grid of the cell, resized
   trilinearly to the voxels -> val Dice (mean per volume, class 2 and the ignore label left out) at the best
   threshold and ridge strength on val. A real segmentation score, not a cell AUROC (fm/block_plan).
 
 UCSF inputs are preprocessed once into <cache> (the run's preprocessing: canonical axes, native voxels, scaled).
-    python -m sfc_gdn2.online_probe <encoder_step*.pt> <out.json> [--mm 16 8] [--cache dir] [--mem-frac 0.15]
+    python -m sfc_gdn2.online_probe <encoder_step*.pt> <out.json> [--tasks wmh idh] [--mm 16 8] [--cache dir]
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ SEG_INPUTS = Path("/leonardo_scratch/large/userexternal/fcorrent/sfc_runs/segdec
 CACHE = Path("/leonardo_scratch/large/userexternal/fcorrent/sfc_runs/online_probe/ucsf")
 TAPS = (1, 3, 5, 7, 9, 11, 13)   # + the last block (15): every other block for WMH; IDH reads 3 / 7 / 11 / 15
 IDH_BLOCKS = (3, 7, 11, 15)
+FIXED = {"head": "linear", "feature": "mean_b12", "l2": 1.0}   # chosen at 2 of the 3 first snapshots (25/10)
 SUB = 4                          # sub-grid per cell edge (16 mm: 4 mm, 8 mm: 2 mm)
 ALPHAS = (1e-3, 1e-2, 1e-1)      # ridge strength, relative to the mean diagonal of X^T X
 THRESH = torch.linspace(0.02, 0.6, 30)
@@ -102,7 +107,7 @@ def wmh(enc, seed, mms) -> dict:
     return out
 
 
-def idh(w, enc, seed, cache: Path) -> dict:
+def idh(w, enc, seed, cache: Path, save: Path) -> dict:
     from .bench.probe import task_rows, tune_subjects, tune_task
     from .io import load_yaml
 
@@ -115,7 +120,7 @@ def idh(w, enc, seed, cache: Path) -> dict:
     order = [15, *TAPS]
     cols = [order.index(b) for b in IDH_BLOCKS]
     feats = []
-    for i, path in zip(rows["id"], rows["input"]):
+    for i, path in zip(rows["id"], rows["input"]) if not save.exists() else ():
         f = cache / f"{i}.pt"
         if not f.exists():   # the run's preprocessing, once (written to a temporary name, then renamed)
             p = w.preprocess(path)
@@ -127,12 +132,21 @@ def idh(w, enc, seed, cache: Path) -> dict:
         X, g, k = _tokens(enc, seed, x, sp, 16.0)
         fg = F.avg_pool3d(_pad(x[0], g, k)[None, None], k)[0, 0].flatten() > 0.05
         feats.append(X[fg if fg.any() else slice(None)][:, cols].float().mean(0).cpu())
-    F_ = torch.stack(feats)   # [volumes, blocks, d]
+    if feats:
+        F_ = torch.stack(feats)   # [volumes, blocks, d]
+        torch.save({"ids": list(rows["id"]), "blocks": IDH_BLOCKS, "feats": F_.half()}, save)
+    else:
+        r = torch.load(save)
+        assert r["ids"] == list(rows["id"]) and tuple(r["blocks"]) == IDH_BLOCKS, save
+        F_ = r["feats"].float()
     menu = {("mean" if b == 15 else f"mean_b{b + 1}"): F_[:, j] for j, b in enumerate(IDH_BLOCKS)}
     with torch.enable_grad():   # the probe heads are fitted by L-BFGS
-        r = tune_task("idh", cfg, rows, menu, {i: n for n, i in enumerate(rows["id"])}, "cuda")
-    print(f"[online] IDH skill {r['skill']:.3f} ({r['subjects']} subjects, {len(rows)} volumes)", flush=True)
-    return {"skill": round(float(r["skill"]), 4), "subjects": r["subjects"], "volumes": len(rows), "chosen": r["chosen"]}
+        r = tune_task("idh", cfg, rows, menu, {i: n for n, i in enumerate(rows["id"])}, "cuda", keep=True)
+    fix = sum(next(c for c in r["cands"] if all(c[k] == v for k, v in FIXED.items()))["skill"]) / 2
+    print(f"[online] IDH skill {r['skill']:.3f}, fixed head {fix:.3f} ({r['subjects']} subjects, {len(rows)} volumes)",
+          flush=True)
+    return {"skill": round(float(r["skill"]), 4), "fixed": FIXED | {"skill": round(float(fix), 4)},
+            "subjects": r["subjects"], "volumes": len(rows), "chosen": r["chosen"]}
 
 
 def main() -> None:
@@ -142,6 +156,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt")
     ap.add_argument("out")
+    ap.add_argument("--tasks", nargs="+", default=["wmh", "idh"])
     ap.add_argument("--mm", nargs="+", type=float, default=[16.0, 8.0])
     ap.add_argument("--cache", default=str(CACHE))
     ap.add_argument("--mem-frac", type=float, default=0.15)   # beside the training: fail the probe, never the training
@@ -157,8 +172,10 @@ def main() -> None:
     seed = int(w.run_cfg["seed"])
     res = {"ckpt": str(a.ckpt), "step": int(Path(a.ckpt).stem.split("step")[-1]) if "step" in Path(a.ckpt).stem else None}
     with torch.no_grad():
-        res["wmh"] = wmh(enc, seed, a.mm)
-        res["idh"] = idh(w, enc, seed, Path(a.cache))
+        if "wmh" in a.tasks:
+            res["wmh"] = wmh(enc, seed, a.mm)
+        if "idh" in a.tasks:
+            res["idh"] = idh(w, enc, seed, Path(a.cache), Path(a.out).with_suffix(".idh.pt"))
     res["seconds"] = round(time.time() - t0)
     res["peak_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 1)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
