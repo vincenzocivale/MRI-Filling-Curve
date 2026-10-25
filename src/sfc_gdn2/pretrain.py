@@ -242,7 +242,12 @@ class Pretrainer:
             wait += time.time() - t_w
             if choices := self.cfg["data"].get("patch_mm_choices"):  # one patch size per step, the same on every rank
                 mm = float(choices[(self.seed * 1_000_003 + step) % len(choices)])
+                full = batch
                 batch = repatch(batch, mm, self.cfg["data"].get("max_patches_per_scan"))
+                # data.global_mm (25/10, user): finer steps read their global views on a second cut at that cell
+                # (the whole volume, as the trunk), the local ones at mm (lejepa.forward: cross-grain invariance)
+                if (gmm := self.cfg["data"].get("global_mm")) and mm < gmm:
+                    batch["global"] = repatch(full, float(gmm), self.cfg["data"].get("max_patches_per_scan"))
                 self.net.encoder.patch_embed.patch_mm = mm
                 # data.view_tokens_by_mm {mm: cap} (22/10 screens): fewer tokens per view at small cells, so a 4 mm step
                 # holds about as many tokens as a 16 mm one (the same views in mm would hold up to 64x more: OOM)
@@ -257,6 +262,8 @@ class Pretrainer:
             gen.manual_seed((self.seed * 1_000_003 + step) * 4096 + self.rank)  # resumable on any number of GPUs
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 vols = to_device(batch, self.device) | {"session": self.session[batch["index"]].to(self.device)}
+                if "global" in batch:
+                    vols["global"] = to_device(batch["global"], self.device)
                 out = self.model(vols, gen)
             self.opt.zero_grad(set_to_none=True)
             out["loss"].backward()

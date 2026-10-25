@@ -374,10 +374,10 @@ class LeJEPA(nn.Module):
         bi = torch.cat([fwd, bwd.index_select(0, rev) if late else bwd], -1)   # index_select: backward index_add
         return tv, idx, pxyz, fgv, mask, bi, n, off, lens
 
-    def forward(self, vols: dict, generator: torch.Generator) -> dict[str, torch.Tensor]:
-        """vols (`dataset.to_device`): patches = per scan [N_b, P_b] native voxel values, spacing [B,3] mm,
-        k [B,3] voxels per patch axis, grid [B,3] patch grid, session [B] (any ids)."""
-        grid, gen = vols["grid"], generator
+    def _grid_ctx(self, vols: dict) -> tuple:
+        """One cut of the batch's scans -> (vols with host lists, grid [B,3], n_patch, foreground [B,N], kernel
+        weights per scan)."""
+        grid = vols["grid"]
         b, n_patch = len(grid), int(grid.prod(1).max())
         fg = per_patch(vols, n_patch, lambda x: x.mean(-1)) > self.fg_threshold            # [B,N]
         vols = {**vols, "k_list": vols["k"].tolist(), "spacing_list": vols["spacing"].tolist()}
@@ -390,7 +390,20 @@ class LeJEPA(nn.Module):
                 memo[key] = pe.weights(torch.tensor(sp, device=grid.device), k)
         pe.patch_mm = mm0
         ws = [memo[(*sp, *k, m)] for sp, k, m in zip(vols["spacing_list"], vols["k_list"], mms)]
-        def rec_target(scan, pid):
+        return vols, grid, n_patch, fg, ws
+
+    def forward(self, vols: dict, generator: torch.Generator) -> dict[str, torch.Tensor]:
+        """vols (`dataset.to_device`): patches = per scan [N_b, P_b] native voxel values, spacing [B,3] mm,
+        k [B,3] voxels per patch axis, grid [B,3] patch grid, session [B] (any ids)."""
+        gen, b = generator, len(vols["grid"])
+        fine = self._grid_ctx(vols)
+        # data.global_mm (25/10, user): at a finer step the global views are read on the scans cut at that cell
+        # (vols["global"], repatched by the trainer: the whole volume, as in the trunk, not a few cm at the token cap),
+        # the local ones at the step's grain; the volume and session levels pull every view to the mean of the
+        # globals, so the fine views are tied to the coarse reading of the same scan (cross-grain invariance)
+        coarse = self._grid_ctx(vols["global"]) if "global" in vols else fine
+        vols, grid, _, fg, ws = fine
+        def rec_target(scan, pid, vols):
             """Sub-patch targets of the rows (scan [R], patch [R]): each patch's native voxels in rec_cells^3 cells,
             normalised per patch. Only the rows a loss uses (22/10: all patches of the batch held a copy of every voxel
             at 4 mm cells, ~10 GB and OOM)."""
@@ -405,22 +418,26 @@ class LeJEPA(nn.Module):
                     out[s] = t
             return out
         rec, recv = [], []
-        corner, edge = self.jittered(*self.boxes(fg, grid, gen), grid, gen)           # [B,G,2,3]
+        corner, edge = self.jittered(*self.boxes(fg, grid, gen), grid, gen)               # [B,G,2,3]
+        if coarse is not fine:   # the global boxes on the coarse grid (the fine draw's globals unused)
+            gc, ge = self.jittered(*self.boxes(coarse[3], coarse[1], gen), coarse[1], gen)
+            corner, edge = (torch.cat([g[:, : self.gg], f[:, self.gg:]], 1) for g, f in ((gc, corner), (ge, edge)))
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
         zg, pred, tgt, ztok, tvol, tfg, lens, tops, zc = [], [], [], [], [], [], [], [], []
         vpred, vtgt, spred, stgt, smask = [], [], [], [], []
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
+            pv, pgrid, pn, pfg, pws = coarse if part.start == 0 else fine
             c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
             nv, dev = len(c), c.device
             masked = torch.arange(nv, device=dev) % 2 == 0
             if self.tok_self:   # the same draws again for the unmasked reading
                 gen_self = torch.Generator(gen.device)
                 gen_self.set_state(gen.get_state())
-            tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(vols, ws, fg, n_patch, v, c, e, masked, gen)
+            tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(pv, pws, pfg, pn, v, c, e, masked, gen)
             if self.tok_self:   # the target reading, without gradient (TIPSv2's teacher pass; memory as one read)
                 with torch.no_grad():
-                    bi_u = self.read(vols, ws, fg, n_patch, v, c, e, torch.zeros_like(masked), gen_self)[5]
+                    bi_u = self.read(pv, pws, pfg, pn, v, c, e, torch.zeros_like(masked), gen_self)[5]
             has = torch.zeros(nv, device=dev).index_add_(0, tv, fgv.float()) > 0
             w = (fgv | ~has[tv]).float()                                                   # foreground (all if none)
             top = torch.zeros(nv, bi.shape[-1], device=dev).index_add_(0, tv, bi.float() * w[:, None]) \
@@ -430,15 +447,15 @@ class LeJEPA(nn.Module):
             if self.cov is not None:
                 zc.append(self.cov(self.view_cov(bi, tv, w, off, n_h)).float().view(b, -1, 2, self.cov[-1].out_features))
             for i, (cs, head) in enumerate(zip(self.levels, self.cell)):
-                p, q, zb, vb = self.cells(bi, tv, fgv, mask, pxyz, grid[v[tv]], cs, n_patch, head)
+                p, q, zb, vb = self.cells(bi, tv, fgv, mask, pxyz, pgrid[v[tv]], cs, pn, head)
                 cpred[i].append(p)
                 ctgt[i].append(q)
                 cz[i].append(zb)
                 cvol[i].append(v[1::2][vb])
             ia = _ranges(off[0::2], n[0::2], sum(n_h[0::2]))                               # A's tokens, B's tokens
             ib = _ranges(off[1::2], n[1::2], sum(n_h[1::2]))
-            kb, rb = (tv[ib] // 2 * n_patch + idx[ib]).sort()                              # (pair, patch) of B's rows
-            ka = tv[ia] // 2 * n_patch + idx[ia]
+            kb, rb = (tv[ib] // 2 * pn + idx[ib]).sort()                              # (pair, patch) of B's rows
+            ka = tv[ia] // 2 * pn + idx[ia]
             pos = torch.searchsorted(kb, ka).clamp(max=len(kb) - 1)
             j_b = torch.where(kb[pos] == ka, rb[pos], -1)                                  # A's patch -> its row in B
             pair = mask[ia] & (j_b >= 0)                                                   # mask is foreground only
@@ -474,7 +491,7 @@ class LeJEPA(nn.Module):
                 if w:
                     r = r.nonzero()[:, 0]
                     if len(r):
-                        acc.append((self.rec(bi.index_select(0, r)).float() - rec_target(v[tv[r]], idx[r])).square().mean(1))
+                        acc.append((self.rec(bi.index_select(0, r)).float() - rec_target(v[tv[r]], idx[r], pv)).square().mean(1))
         zg = torch.cat(zg, 1)                                                              # [B,G,2,D]
         inv_g = (zg - zg.mean(2, keepdim=True)).square().mean()
         # symmetric, as LeJEPA: both tokens pulled to their mean, no stop-grad (with a stop-grad target and
