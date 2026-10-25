@@ -57,7 +57,7 @@ import torch.distributed.nn
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from .curves import grid_coords, keys, symmetries, transform
+from .curves import keys, symmetries, transform
 from .data.dataset import per_patch
 from .model import Encoder
 
@@ -203,22 +203,30 @@ class LeJEPA(nn.Module):
         s = (cap / e.prod(-1, keepdim=True)).clamp(max=1) ** (1 / 3)
         return torch.where(s < 1, (e * s).floor().clamp_min(1), e)
 
-    def boxes(self, fg: torch.Tensor, xyz: torch.Tensor, grid: torch.Tensor,
-              gen: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
-        """fg [B,N], coords [B,N,3], grid [B,3] -> group boxes (corner, edge) [B,G,3], globals first.
+    def boxes(self, fg: torch.Tensor, grid: torch.Tensor, gen: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+        """fg [B,N], grid [B,3] -> group boxes (corner, edge) [B,G,3], globals first.
         Centres on foreground patches; global edges span global_frac of the foreground bounding box
-        (volume fraction), local edges are log-uniform in local_edge per axis."""
+        (volume fraction), local edges are log-uniform in local_edge per axis. No [B,N,3] coordinate table (25/10: at
+        2 mm cells it was GBs, the reason max_patches_per_scan coarsened every brain to ~5 mm)."""
         b, g = len(fg), grid[:, None]
-        big = torch.where(fg[..., None], xyz, 1 << 30).amin(1), torch.where(fg[..., None], xyz, -1).amax(1)
-        extent = (big[1] - big[0] + 1).clamp_min(1)                                       # [B,3]
+        lo, hi = [], []
+        for i, (gx, gy, gz) in enumerate(grid.tolist()):   # per scan: the foreground's extent along each axis
+            f = fg[i, : gx * gy * gz].view(gx, gy, gz)
+            a = [f.any(2).any(1), f.any(2).any(0), f.any(1).any(0)]
+            has = a[0].any()
+            lo.append(torch.stack([torch.where(has, x.int().argmax(), 1 << 30) for x in a]))
+            hi.append(torch.stack([torch.where(has, len(x) - 1 - x.flip(0).int().argmax(), -1) for x in a]))
+        extent = (torch.stack(hi) - torch.stack(lo) + 1).clamp_min(1)                     # [B,3]
         frac = self._u((b, self.gg, 1), *self.global_frac, gen) ** (1 / 3)
         e_glob = self._cap((extent[:, None] * frac).round(), self.max_view_tokens)
         lo, hi = torch.tensor(self.local_edge, dtype=torch.float).log()
         # ponytail: independent per-axis edges (aspect in [3/8, 8/3]); add an explicit aspect prior if needed
         e_loc = self._u((b, self.gl, 3), lo, hi, gen).exp().round()
         edge = torch.cat([e_glob, e_loc], 1).clamp_min(1).minimum(g).long()               # [B,G,3]
-        centre = xyz.gather(1, torch.multinomial(fg.float() + 1e-6 * (xyz[..., 0] >= 0), self.gg + self.gl, replacement=True,
-                                                 generator=gen)[..., None].expand(-1, -1, 3))
+        valid = torch.arange(fg.shape[1], device=fg.device) < grid.prod(1, keepdim=True)
+        j = torch.multinomial(fg.float() + 1e-6 * valid, self.gg + self.gl, replacement=True, generator=gen)
+        gy, gz = g[..., 1], g[..., 2]
+        centre = torch.stack([j // (gy * gz), j // gz % gy, j % gz], -1)                     # [B,G,3]
         return (centre - edge // 2).clamp(min=0).minimum(g - edge), edge
 
     def jittered(self, corner, edge, grid, gen):
@@ -305,7 +313,8 @@ class LeJEPA(nn.Module):
         ok_c = cells <= (edge.amin(-1, keepdim=True) // 2).clamp_min(1)
         c = cells[0][torch.rand(ok_c.shape, device=dev, generator=gen).masked_fill(~ok_c, -1).argmax(1)]
         cid = self.cell_ids(pxyz, vols["grid"][vol[tv]], c[tv])
-        draw = torch.rand(nv, n_patch, device=dev, generator=gen)[tv, cid]
+        # one uniform per (view, cube): a hash of a per-view seed, not a [views x patches] table (GBs at 2 mm cells)
+        draw = _hash01(torch.randint(1 << 30, (nv,), device=dev, generator=gen)[tv], cid)
         mask = masked[tv] & fgv & (draw < u(*self.mask_ratio).view(-1)[tv])
         aug = (gamma.view(-1), scale.view(-1), shift.view(-1), noise.view(-1))
         coarse = []      # coarse_max > 1: in coarse_prob of the views, each axis averaged in blocks of 1..coarse_max
@@ -370,7 +379,6 @@ class LeJEPA(nn.Module):
         k [B,3] voxels per patch axis, grid [B,3] patch grid, session [B] (any ids)."""
         grid, gen = vols["grid"], generator
         b, n_patch = len(grid), int(grid.prod(1).max())
-        xyz = grid_coords(grid, n_patch)                                                  # [B,N,3]
         fg = per_patch(vols, n_patch, lambda x: x.mean(-1)) > self.fg_threshold            # [B,N]
         vols = {**vols, "k_list": vols["k"].tolist(), "spacing_list": vols["spacing"].tolist()}
         memo, pe = {}, self.encoder.patch_embed     # one kernel weight matrix per distinct (spacing, k, cell mm)
@@ -397,7 +405,7 @@ class LeJEPA(nn.Module):
                     out[s] = t
             return out
         rec, recv = [], []
-        corner, edge = self.jittered(*self.boxes(fg, xyz, grid, gen), grid, gen)           # [B,G,2,3]
+        corner, edge = self.jittered(*self.boxes(fg, grid, gen), grid, gen)           # [B,G,2,3]
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
         zg, pred, tgt, ztok, tvol, tfg, lens, tops, zc = [], [], [], [], [], [], [], [], []
         vpred, vtgt, spred, stgt, smask = [], [], [], [], []
@@ -429,9 +437,10 @@ class LeJEPA(nn.Module):
                 cvol[i].append(v[1::2][vb])
             ia = _ranges(off[0::2], n[0::2], sum(n_h[0::2]))                               # A's tokens, B's tokens
             ib = _ranges(off[1::2], n[1::2], sum(n_h[1::2]))
-            row_b = torch.full((nv // 2, n_patch), -1, device=dev)                         # (pair, patch) -> row in B
-            row_b[tv[ib] // 2, idx[ib]] = torch.arange(len(ib), device=dev)
-            j_b = row_b[tv[ia] // 2, idx[ia]]                                              # A's patch -> its row in B
+            kb, rb = (tv[ib] // 2 * n_patch + idx[ib]).sort()                              # (pair, patch) of B's rows
+            ka = tv[ia] // 2 * n_patch + idx[ia]
+            pos = torch.searchsorted(kb, ka).clamp(max=len(kb) - 1)
+            j_b = torch.where(kb[pos] == ka, rb[pos], -1)                                  # A's patch -> its row in B
             pair = mask[ia] & (j_b >= 0)                                                   # mask is foreground only
             # token head recomputed in backward for big scans: whole-volume views give ~10^5 tokens x 1024 hidden
             # (deterministic: batch-statistics BatchNorm)
@@ -795,6 +804,15 @@ def min_key(origin: torch.Tensor, size: int, dims: torch.Tensor, seed: int) -> t
     aligned block of a power-of-two size is contiguous on the curve, so this orders mixed-size blocks along it)."""
     off = torch.stack(torch.meshgrid(*(torch.arange(size, device=origin.device),) * 3, indexing="ij"), -1).view(-1, 3)
     return keys("hilbert", (origin[:, None] + off[None]).view(-1, 3), dims, seed).view(len(origin), -1).amin(1)
+
+
+def _hash01(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Integers a, b >= 0 (a < 2^31) -> uniform-looking floats in [0, 1): a 31-bit integer hash (0x45d9f3b rounds)."""
+    m = (1 << 31) - 1
+    x = (a * 1_000_003 + b) & m
+    for _ in range(3):
+        x = ((x ^ (x >> 16)) * 0x45D9F3B) & m
+    return (x >> 7).float() / (1 << 24)   # 24 bits: exact in float32, so < 1
 
 
 def _ranges(start: torch.Tensor, n: torch.Tensor, total: int) -> torch.Tensor:
