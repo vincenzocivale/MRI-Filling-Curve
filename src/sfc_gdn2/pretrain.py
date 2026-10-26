@@ -65,6 +65,8 @@ def lr_factor(step: int, t: dict) -> float:
     the plateau: resume it with train.steps = its step + decay_steps. `warmup_from`: the step the warmup starts at
     (a run continued from a decayed checkpoint warms up again from there)."""
     warm = min(1.0, max(0.0, step + 1 - t.get("warmup_from", 0)) / max(t.get("warmup_steps", 0), 1))
+    if t.get("schedule") == "plateau":   # train.grain_plateau sets the lr (GrainPlateau.scale)
+        return warm
     if t.get("schedule", "cosine") == "cosine":
         return warm * 0.5 * (1 + math.cos(math.pi * min(step / t["steps"], 1.0)))
     left = (t["steps"] - step) / max(t["decay_steps"], 1)   # 1 at the decay's start, 0 at the end
@@ -128,6 +130,70 @@ class MuonAdamW(torch.optim.Optimizer):
                 p.mul_(1 - lr * wd).addcdiv_(m, (v / (1 - b2 ** t)).sqrt_().add_(g["eps"]), value=-lr / (1 - b1 ** t))
 
 
+class GrainPlateau:
+    """train.grain_plateau (26/10, user: GrainMixScheduler, then ReduceLROnGrainPlateau): the grains of each step
+    (data.patch_mm_choices) grow by stages, each stage running until the loss of its finest grain stops improving;
+    after the last stage the lr is cut by `lr_factor` on each plateau of the whole mix, `lr_cuts` times, then the run
+    ends. Plateau: every `every` steps, the mean loss of the watched steps over the last `window` steps against the
+    same mean `gap` steps before improves by less than `rate` per 1000 steps, `patience` checks in a row (both windows
+    inside the stage: >= window + gap steps per stage). The loss is the step's mean over the GPUs (the same decision on
+    every rank); a run resumed from a checkpoint without this state replays its history.csv (the logged steps)."""
+
+    def __init__(self, g: dict, hist: list[dict], patch_mm: float):
+        self.stages = [[float(m) for m in st] for st in g["stages"]]
+        self.window, self.gap, self.every = int(g.get("window", 250)), int(g.get("gap", 500)), int(g.get("every", 250))
+        self.rate, self.patience = float(g.get("rate", 0.03)), int(g.get("patience", 2))
+        self.min_samples = int(g.get("min_samples", 5))   # per window (a smoke's toy windows: 1)
+        self.factor, self.max_cuts = float(g.get("lr_factor", 0.3)), int(g.get("lr_cuts", 3))
+        self.stage, self.cuts, self.start, self.hits, self.done = int(g.get("start_stage", 0)), 0, 0, 0, False
+        self.rec, self.events = [], []
+        for h in hist:   # replayed: the checks of the logged steps give the state the rule had on them
+            self.update(int(h["step"]), float(h.get("mm", patch_mm)), float(h["loss"]))
+
+    def state_dict(self) -> dict:
+        return {k: getattr(self, k) for k in ("stage", "cuts", "start", "hits", "done", "rec", "events")}
+
+    def load_state_dict(self, d: dict) -> None:
+        self.__dict__.update(d)
+
+    @property
+    def choices(self) -> list[float]:
+        return self.stages[self.stage]
+
+    @property
+    def scale(self) -> float:
+        return self.factor ** self.cuts
+
+    def update(self, step: int, mm: float, loss: float) -> str | None:
+        """Records the step; returns the event of a plateau (next stage, lr cut, done) or None."""
+        self.rec.append((step, mm, loss))
+        if self.done or step % self.every or step - self.start < self.window + self.gap:
+            return None
+        watch = min(self.choices) if self.cuts == 0 else None   # grain stages: the finest grain; lr cuts: every step
+
+        def mean(a, b):
+            v = [lo for s, m, lo in self.rec if a < s <= b and (watch is None or m == watch)]
+            return sum(v) / len(v) if len(v) >= self.min_samples else None
+        now, before = mean(step - self.window, step), mean(step - self.gap - self.window, step - self.gap)
+        if now is None or before is None:
+            return None
+        rate = (before - now) / before * 1000 / self.gap
+        self.hits = self.hits + 1 if rate < self.rate else 0
+        if self.hits < self.patience:
+            return None
+        self.hits, self.start = 0, step
+        if self.cuts == 0 and self.stage < len(self.stages) - 1:
+            self.stage += 1
+            ev = f"stage {self.stage}: grains {self.choices}"
+        elif self.cuts < self.max_cuts:
+            self.cuts += 1
+            ev = f"lr cut {self.cuts}: x{self.scale:.3g}"
+        else:
+            self.done, ev = True, "done"
+        self.events.append({"step": step, "event": ev, "rate": rate, "loss": now})
+        return f"{ev} (loss {now:.4f}, {rate * 100:.2f}% per 1000 steps)"
+
+
 class Pretrainer:
     """LeJEPA pretraining on every row of the pretraining split: no held-out set; checkpoints are
     selected downstream on the probe's val split. All randomness derives from cfg['seed'].
@@ -152,6 +218,10 @@ class Pretrainer:
         # gradient, ~30% of the step on the SIMT cores. Its rounding (~5e-4 relative) is ~40x below the training
         # noise augmentation (objective.noise); SIGReg keeps full fp32; extraction (benchmark) stays fp32.
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = bool(t.get("tf32", True))
+        if gb := t.get("global_batch"):   # 26/10: the same run on 2 / 4 / 8 GPUs (scans and patches per step fixed)
+            assert gb % world == 0, f"train.global_batch {gb} on {world} GPUs"
+            t["batch_size"] = gb // world
+            cfg["data"]["patches_per_batch"] = int(cfg["data"]["global_patches"]) // world
         rows = pretrain_rows(cfg)
         if self.rank == 0:
             rows[["dataset", "subject", "sample_id"]].to_csv(run / "split.csv", index=False)
@@ -169,7 +239,9 @@ class Pretrainer:
         groups = param_groups(self.net, t["weight_decay"], muon)
         self.opt = MuonAdamW(groups, lr=t["lr"]) if muon else torch.optim.AdamW(
             [{k: v for k, v in g.items() if k != "muon"} for g in groups], lr=t["lr"], fused=True)
-        self.sched = torch.optim.lr_scheduler.LambdaLR(self.opt, lambda s: lr_factor(s, t))
+        self.gp, self._gp_state = None, None
+        self.sched = torch.optim.lr_scheduler.LambdaLR(
+            self.opt, lambda s: lr_factor(s, t) * (self.gp.scale if self.gp else 1.0))
         self.gen = torch.Generator(self.device).manual_seed(self.seed + 123 + self.rank)
         self.log = print if self.rank == 0 else (lambda *a, **k: None)
         self.log(f"[lejepa] world={world} curves={cfg['objective']['view_curves']} volumes={len(rows)} "
@@ -189,12 +261,21 @@ class Pretrainer:
                       for n, v in sd.items()}
             r = self.net.load_state_dict(sd, strict=False)
             self.log(f"[lejepa] init from {t['init_from']}: new {r.missing_keys}, dropped {r.unexpected_keys}", flush=True)
+        if g := t.get("grain_plateau"):
+            self.gp = GrainPlateau(g, self.hist, float(cfg["data"]["patch_mm"]))
+            if self._gp_state:
+                self.gp.load_state_dict(self._gp_state)
+            for pg in self.opt.param_groups:   # the restored lr times the scheduler's cuts
+                pg["lr"] = t["lr"] * lr_factor(self.step, t) * self.gp.scale
+            self.log(f"[lejepa] grain_plateau: stage {self.gp.stage} {self.gp.choices}, lr cuts {self.gp.cuts}, "
+                     f"{len(self.gp.rec)} steps of record", flush=True)
 
     def _restore(self, path: Path) -> None:
         c = torch.load(path, map_location="cpu", weights_only=False)
         self.net.load_state_dict(c["model"])
         self.opt.load_state_dict(c["opt"])
         self.sched.load_state_dict(c["sched"])
+        self._gp_state = c.get("grain")
         t = self.cfg["train"]  # the lr of this config's schedule, not the source's (a run that ended its decay saved 0)
         self.sched.base_lrs = [t["lr"]] * len(self.opt.param_groups)
         for g in self.opt.param_groups:
@@ -213,7 +294,8 @@ class Pretrainer:
         tmp = self.run / "ckpt.pt.tmp"
         torch.save({"step": self.step, "consumed": self.consumed, "world": self.world, "skipped": self.skipped,
                     "seconds": time.time() - self.t0, "model": self.net.state_dict(),
-                    "opt": self.opt.state_dict(), "sched": self.sched.state_dict()}, tmp)
+                    "opt": self.opt.state_dict(), "sched": self.sched.state_dict()}
+                   | ({"grain": self.gp.state_dict()} if self.gp else {}), tmp)
         os.replace(tmp, self.run / "ckpt.pt")
         pd.DataFrame(self.hist).to_csv(self.run / "history.csv", index=False)
 
@@ -226,12 +308,25 @@ class Pretrainer:
         batches, wait, patches, t_log = iter(self.loader), 0.0, 0, time.time()  # endless; wait share, patches/s
         if save and self.step == 0:
             torch.save(self.net.encoder.state_dict(), self.run / "encoder_step000000.pt")  # init baseline
+        if self.gp and self.gp.done:
+            self.log(f"[lejepa] grain_plateau already done at step {self.step}", flush=True)
+            return
         if self.step >= t["steps"]:
             self.log(f"[lejepa] already at step {self.step} of {t['steps']}", flush=True)
             return
         self.model.train()
+        handoff = os.environ.get("SFC_HANDOFF")
         prof, first = os.environ.get("SFC_PROFILE"), self.step + 1  # a dir: steps first+5..first+7 profiled, then stop
         for step in range(self.step + 1, t["steps"] + 1):
+            if handoff:   # $SFC_HANDOFF exists (a larger job takes the run over): rank 0's view, on every rank
+                flag = torch.tensor([float(self.rank == 0 and os.path.exists(handoff))], device=self.device)
+                if dist.is_initialized():
+                    dist.all_reduce(flag)
+                if flag.item():
+                    if save:
+                        self._checkpoint()
+                    self.log(f"[lejepa] handoff at step {self.step}: checkpoint written, exiting", flush=True)
+                    return
             if prof and step == first + 5 and save:
                 torch.cuda.memory._record_memory_history(max_entries=500_000)
                 p = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
@@ -240,7 +335,8 @@ class Pretrainer:
             t_w = time.time()
             batch = next(batches)   # the previous step already synced (isfinite(gnorm)): this wait is a GPU stall
             wait += time.time() - t_w
-            if choices := self.cfg["data"].get("patch_mm_choices"):  # one patch size per step, the same on every rank
+            mm = float(self.cfg["data"]["patch_mm"])
+            if choices := self.gp.choices if self.gp else self.cfg["data"].get("patch_mm_choices"):  # one patch size per step, the same on every rank
                 mm = float(choices[(self.seed * 1_000_003 + step) % len(choices)])
                 full = batch
                 batch = repatch(batch, mm, self.cfg["data"].get("max_patches_per_scan"))
@@ -272,11 +368,18 @@ class Pretrainer:
                 self.opt.step()
             else:
                 self.skipped += 1
+            event = None
+            if self.gp:   # the step's loss averaged over the GPUs: every rank takes the same decision
+                lo = out["loss"].detach().float().reshape(1)
+                if dist.is_initialized():
+                    dist.all_reduce(lo)
+                    lo /= self.world
+                event = self.gp.update(step, mm, lo.item())   # a cut reaches the lr at sched.step() (its lambda)
             self.sched.step()
             self.step, self.consumed = step, self.consumed + self.world
             if step % t.get("log_every", 50) == 0 or step == t["steps"]:
                 dt = time.time() - t_log
-                hist.append({"step": step, **{k: v.item() for k, v in out.items()}, "grad_norm": gnorm.item(),
+                hist.append({"step": step, "mm": mm, **{k: v.item() for k, v in out.items()}, "grad_norm": gnorm.item(),
                              "skipped": self.skipped, "lr": self.sched.get_last_lr()[0],
                              "seconds": time.time() - t0, "data_wait": wait / dt, "patches_per_s": patches / dt,
                              "peak_vram_mb": torch.cuda.max_memory_allocated(self.device) / 2 ** 20})
@@ -293,6 +396,15 @@ class Pretrainer:
                                                        + ka.table(sort_by="self_cpu_time_total", row_limit=40))
                     torch.cuda.memory._dump_snapshot(f"{prof}/memory.pickle")
                 return
+            if event:   # a branch point: encoder, full checkpoint kept, the event in events.json
+                self.log(f"[lejepa] grain_plateau at step {step}: {event}", flush=True)
+                if save:
+                    torch.save(self.net.encoder.state_dict(), self.run / f"encoder_step{step:06d}.pt")
+                    self._checkpoint()
+                    shutil.copy(self.run / "ckpt.pt", self.run / f"ckpt_step{step:06d}.pt")
+                    (self.run / "events.json").write_text(json.dumps(self.gp.events, indent=1))
+                if self.gp.done:
+                    break
             if save and (step % t["save_every"] == 0 or step == t["steps"]):
                 torch.save(self.net.encoder.state_dict(), self.run / f"encoder_step{step:06d}.pt")
             if save and (step % t.get("ckpt_every", 500) == 0 or step == t["steps"]):
