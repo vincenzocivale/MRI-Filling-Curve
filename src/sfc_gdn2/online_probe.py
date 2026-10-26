@@ -15,6 +15,8 @@ a few GB): is the run on track, not a benchmark number. Frozen encoder, one curv
 
 UCSF inputs are preprocessed once into <cache> (the run's preprocessing: canonical axes, native voxels, scaled).
     python -m sfc_gdn2.online_probe <encoder_step*.pt> <out.json> [--tasks wmh idh] [--mm 16 8] [--cache dir]
+        [--idh-mm 16] [--idh-part I N]   # IDH at a finer grain; part: features of volumes I::N, then a run without
+                                         # --idh-part merges the N parts and fits
 """
 from __future__ import annotations
 
@@ -107,7 +109,7 @@ def wmh(enc, seed, mms) -> dict:
     return out
 
 
-def idh(w, enc, seed, cache: Path, save: Path) -> dict:
+def idh(w, enc, seed, cache: Path, save: Path, mm: float = 16.0, part: tuple[int, int] | None = None) -> dict | None:
     from .bench.probe import task_rows, tune_subjects, tune_task
     from .io import load_yaml
 
@@ -119,8 +121,17 @@ def idh(w, enc, seed, cache: Path, save: Path) -> dict:
     cache.mkdir(parents=True, exist_ok=True)
     order = [15, *TAPS]
     cols = [order.index(b) for b in IDH_BLOCKS]
+    parts = sorted(save.parent.glob(f"{save.stem}.part*.pt"))
+    if not save.exists() and part is None and parts and len(parts) == torch.load(parts[0])["of"]:   # merge the parts
+        r = [torch.load(f) for f in parts]
+        F_ = torch.zeros(len(rows), len(IDH_BLOCKS), r[0]["feats"].shape[-1], dtype=torch.half)
+        for q in r:
+            assert q["ids"] == list(rows["id"].iloc[q["idx"]]), save
+            F_[q["idx"]] = q["feats"]
+        torch.save({"ids": list(rows["id"]), "blocks": IDH_BLOCKS, "feats": F_}, save)
+    sel = range(len(rows)) if part is None else range(part[0], len(rows), part[1])
     feats = []
-    for i, path in zip(rows["id"], rows["input"]) if not save.exists() else ():
+    for i, path in zip(rows["id"].iloc[list(sel)], rows["input"].iloc[list(sel)]) if not save.exists() else ():
         f = cache / f"{i}.pt"
         if not f.exists():   # the run's preprocessing, once (written to a temporary name, then renamed)
             p = w.preprocess(path)
@@ -129,9 +140,13 @@ def idh(w, enc, seed, cache: Path, save: Path) -> dict:
             f.with_suffix(".tmp").rename(f)
         r = torch.load(f, map_location="cpu")
         x, sp = r["x"].cuda().float(), r["sp"].float().cuda()
-        X, g, k = _tokens(enc, seed, x, sp, 16.0)
+        X, g, k = _tokens(enc, seed, x, sp, mm)
         fg = F.avg_pool3d(_pad(x[0], g, k)[None, None], k)[0, 0].flatten() > 0.05
         feats.append(X[fg if fg.any() else slice(None)][:, cols].float().mean(0).cpu())
+    if part is not None:   # one share of the volumes (several GPUs): features only, the fit runs on the merge
+        torch.save({"ids": list(rows["id"].iloc[list(sel)]), "idx": list(sel), "of": part[1],
+                    "feats": torch.stack(feats).half()}, save.with_suffix(f".part{part[0]}.pt"))
+        return None
     if feats:
         F_ = torch.stack(feats)   # [volumes, blocks, d]
         torch.save({"ids": list(rows["id"]), "blocks": IDH_BLOCKS, "feats": F_.half()}, save)
@@ -158,6 +173,8 @@ def main() -> None:
     ap.add_argument("out")
     ap.add_argument("--tasks", nargs="+", default=["wmh", "idh"])
     ap.add_argument("--mm", nargs="+", type=float, default=[16.0, 8.0])
+    ap.add_argument("--idh-mm", type=float, default=16.0)
+    ap.add_argument("--idh-part", nargs=2, type=int, metavar=("I", "N"))   # features of volumes I::N only
     ap.add_argument("--cache", default=str(CACHE))
     ap.add_argument("--mem-frac", type=float, default=0.15)   # beside the training: fail the probe, never the training
     a = ap.parse_args()
@@ -175,7 +192,11 @@ def main() -> None:
         if "wmh" in a.tasks:
             res["wmh"] = wmh(enc, seed, a.mm)
         if "idh" in a.tasks:
-            res["idh"] = idh(w, enc, seed, Path(a.cache), Path(a.out).with_suffix(".idh.pt"))
+            res["idh"] = idh(w, enc, seed, Path(a.cache), Path(a.out).with_suffix(".idh.pt"), a.idh_mm,
+                             a.idh_part and tuple(a.idh_part))
+            if a.idh_part:
+                print(f"[online] IDH part {a.idh_part[0]} of {a.idh_part[1]}: {time.time() - t0:.0f} s", flush=True)
+                return
     res["seconds"] = round(time.time() - t0)
     res["peak_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 1)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
