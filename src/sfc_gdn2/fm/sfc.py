@@ -1487,6 +1487,14 @@ def sums(logits: torch.Tensor, lab: torch.Tensor, w, k: int) -> list:
 FINE = (8.0, 4.0, 2.0)   # multigrain levels below the 16 mm extraction
 
 
+def tricov(t: torch.Tensor) -> torch.Tensor:
+    """Tokens [n, d] -> their covariance (population), upper triangle fp16: bench.probe.second_order's exact input."""
+    t = t.float() - t.float().mean(0)
+    c = t.T @ t / max(len(t), 1)
+    i = torch.triu_indices(len(c), len(c), device=c.device)
+    return c[i[0], i[1]].half()
+
+
 @torch.no_grad()
 def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor, thr: float, above: dict) -> dict:
     """The features every head reads on our model (user, 27/10; segmentation decoders keep their own reading): below the
@@ -1494,8 +1502,9 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
     (intensity std of the foreground cells: label-free, the same for every task), as many cells as the level above has
     foreground cells (each level costs about the 8 mm one). The cells read as one sequence per 26-connected group along each curve
     (averaged), as the cascade's live reading. Per level the foreground mean and std of each block (last ++ taps, one
-    copy of h) -> g<mm>:mean, g<mm>:std_b<k>, ...; a level the scan cannot hold (cells under 8 voxels, nothing left)
-    repeats the level above (`above`: the 16 mm statistics, same names). bench.probe concatenates the levels."""
+    copy of h) -> g<mm>:mean, g<mm>:std_b<k>, ..., and the last block's covariance g<mm>:tricov; a level the scan cannot
+    hold (cells under 8 voxels, nothing left) repeats the level above (`above`: the 16 mm ones, same names).
+    bench.probe concatenates the levels."""
     from ..curves import grid_coords, keys
     from ..data.volume import patch_dims, patch_grid, patchify
 
@@ -1537,15 +1546,14 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
         for j, nm in enumerate(names):
             s, m = torch.std_mean(h[:, j * d: (j + 1) * d], 0, correction=0)
             out[f"g{int(mm)}:mean{nm}"], out[f"g{int(mm)}:std{nm}"] = m.half(), s.half()
+        out[f"g{int(mm)}:tricov"] = tricov(h[:, :d])
         prev = torch.full((len(p),), -torch.inf, device=dev)
         prev[sel[fg]] = p[sel[fg]].float().std(1)
         budget, kp, gp = max(nfg, 1), k, g
     for mm in FINE:   # the levels not read: the level above's
-        for nm in names:
-            for st in ("mean", "std"):
-                key = f"g{int(mm)}:{st}{nm}"
-                if key not in out:
-                    out[key] = out.get(f"g{int(mm) * 2}:{st}{nm}", above.get(f"{st}{nm}"))
+        for nm, v in above.items():
+            if f"g{int(mm)}:{nm}" not in out:
+                out[f"g{int(mm)}:{nm}"] = out.get(f"g{int(mm) * 2}:{nm}", v)
     return out
 
 
@@ -1746,6 +1754,11 @@ class SFC(Wrapper):
         if self.args.get("multigrain", True) and not self.args.get("patch_mm") and self.args.get("encoder") != "none":
             above = {s: v[: self._dim].half() for s, v in feats.items() if s.startswith(("mean", "std")) and "@" not in s
                      and "tta" not in s}
+            t = bi[:, : self._dim].float()   # 16 mm covariances, exact (bench.probe.second_order): every token, foreground
+            keep = t.norm(dim=1) > 0
+            fgk = keep & out["fg"][0, : len(x)]
+            feats["tricov"] = tricov(t[keep])
+            feats["tricov_fg"] = above["tricov"] = tricov(t[fgk] if fgk.any() else t[keep])
             if pe.patch_mm == self.run_cfg["data"]["patch_mm"]:
                 feats |= multigrain(self._extract_enc, self.curves, int(self.run_cfg["seed"]), vol,
                                     prepared["spacing"].to(dev), self.run_cfg["objective"].get("fg_threshold", 0.05), above)

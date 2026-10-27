@@ -79,7 +79,8 @@ def _as_torch(r):
 
 def _globals_one(path: Path) -> dict:
     r = torch.load(path, map_location="cpu", weights_only=False)
-    return {k: _vec(v).clone() for k, v in r["features"].items() if isinstance(v, torch.Tensor) and v.is_floating_point()}
+    return {k: _vec(v).clone() for k, v in r["features"].items()
+            if isinstance(v, torch.Tensor) and v.is_floating_point() and "tricov" not in k}   # covariances: second_order
 
 
 def load_globals(model_dir: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
@@ -544,6 +545,45 @@ def _covsqrt_one(path: Path) -> dict:
     return out
 
 
+TRI = ("tricov", "tricov_fg", "g8:tricov", "g4:tricov", "g2:tricov")   # fm/sfc multigrain: 16 mm (all, fg), 8, 4, 2 mm
+
+
+def _unpack(v: torch.Tensor) -> torch.Tensor:
+    """Upper triangles [..., d (d + 1) / 2] -> symmetric matrices [..., d, d]."""
+    d = int((math.isqrt(8 * v.shape[-1] + 1) - 1) // 2)
+    i = torch.triu_indices(d, d)
+    c = v.new_zeros(*v.shape[:-1], d, d)
+    c[..., i[0], i[1]] = v
+    return c + c.transpose(-1, -2) - torch.diag_embed(c.diagonal(dim1=-2, dim2=-1))
+
+
+def _tri_one(path: Path) -> dict:
+    f = torch.load(path, map_location="cpu", weights_only=False)["features"]
+    return {"C": torch.stack([f[k] for k in TRI]).float()}
+
+
+def _tri_sqrt_one(path: Path) -> dict:
+    P, dim = _BASIS   # [levels, d, dim]
+    z = P.transpose(1, 2) @ _unpack(_tri_one(path)["C"]) @ P + 1e-6 * torch.eye(dim)
+    e, v = torch.linalg.eigh(z)
+    iu = torch.triu_indices(dim, dim)
+    return {"S": ((v * e.clamp(min=0).sqrt()[:, None]) @ v.transpose(1, 2))[:, iu[0], iu[1]].half()}
+
+
+def second_order_exact(d: Path, ids: list[str], dim: int = 64, fit: set | None = None) -> dict[str, torch.Tensor]:
+    """second_order from the covariances stored at extraction (fm/sfc multigrain, 27/10; user: exact, every level): the
+    principal directions per level = eigenvectors of the mean covariance of the `fit` volumes (exact, every token; the
+    within-volume variation the reading describes, not the spread between scans), then per volume and level the square
+    root of P^T C P, upper triangle; "covsqrt" / "covsqrt_fg" = the 16 mm one (every token / foreground) ++ 8 ++ 4 ++ 2
+    mm. Every level of a volume in one batched matmul + eigh, the files read by SFC_IO_WORKERS processes."""
+    cand = [d / f"{i}.pt" for i in ids if fit is None or i in fit]
+    tot = sum(r["C"] for r in _pmap(_tri_one, cand)) / len(cand)
+    P = torch.linalg.eigh(_unpack(tot))[1][..., -dim:].contiguous()
+    S = torch.stack([r["S"] for r in _pmap(_tri_sqrt_one, [d / f"{i}.pt" for i in ids], (P, dim))])   # [N, levels, T]
+    fine = [S[:, j] for j in range(2, len(TRI))]
+    return {"covsqrt": torch.cat([S[:, 0], *fine], 1), "covsqrt_fg": torch.cat([S[:, 1], *fine], 1)}
+
+
 def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit: set | None = None) -> dict[str, torch.Tensor]:
     """{"covsqrt": [N, dim (dim + 1) / 2], and "covsqrt_fg" when the files hold `fg`}: per volume the square root of
     the covariance of its tokens (`map`: every patch; _fg: foreground patches only) projected on the first `dim`
@@ -554,6 +594,10 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit:
     cache = d / "_second_order.pt"
     if cache.exists() and (c := torch.load(cache))["ids"] == ids:
         return c["feats"]
+    if TRI[0] in torch.load(d / f"{ids[0]}.pt", map_location="cpu", weights_only=False)["features"]:
+        feats = second_order_exact(d, ids, dim, fit)
+        torch.save({"ids": ids, "feats": feats}, cache)
+        return feats
     g0 = load_globals(d)
     if "covsqrt" in g0[1]:  # computed at extraction (args.cov_basis): nothing to fit or read again
         pos = {i: k for k, i in enumerate(g0[0])}
@@ -670,7 +714,6 @@ def readings(m: str, d: Path, fit: set | None = None, extra: dict | None = None)
         f = {k: v[:, :w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
     for k in [k for k in f if f"g8:{k}" in f]:   # multigrain (fm/sfc.multigrain, 27/10): each statistic of every level
         f[k] = torch.cat([f[k], *(f[f"g{m}:{k}"] for m in (8, 4, 2))], 1)   # (16 / 8 / 4 / 2 mm), concatenated
-    # ponytail: covsqrt stays the 16 mm tokens' (second_order reads the 16 mm map), per level if it ever matters
     so = second_order(d, ids, fit=fit)
     cov = so["covsqrt"]
 
