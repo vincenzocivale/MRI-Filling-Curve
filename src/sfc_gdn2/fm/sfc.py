@@ -1526,7 +1526,7 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
             n = torch.bincount(pidx, minlength=len(prev))[order].cumsum(0)
             top = order[(n <= budget) & (prev[order] > -torch.inf)]
             sel = torch.isin(pidx, top).nonzero()[:, 0]
-        if not fine_ok(k) or not len(sel):
+        if not fine_ok(k) or not len(sel) or len(sel) > MIX_MAX:   # (whole-body scans at 8 mm: the level above's)
             prev = None
             break
         q, fg = xyz[sel], p[sel].mean(1) > thr
