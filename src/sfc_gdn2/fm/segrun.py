@@ -415,26 +415,6 @@ def train(job: dict) -> None:
           f"{len(frozen_names - loaded)} frozen but not loaded {sorted(frozen_names - loaded)[:4]}, "
           f"{len(loaded - {n for n in names if is_frozen(n)})} loaded outside the prefixes (frozen too)", flush=True)
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
-    if os.environ.get("SFC_CASCADE_FP") and getattr(net, "cascade", False) and job.get("select") != "mre":
-        # thresholds from the train set's fingerprint (user 27/10, CMB: 6 of 22 test lesions filled as background by
-        # a coarse level, the 99.5 % voxel quota let whole 4-voxel lesions go): no level may lose more voxels of a class
-        # than half its smallest train lesion (1st percentile of the components, model grid)
-        sz = train_sizes([it for it in job["items"] if it["split"] == "train"], cache, k)
-        net.csmin = torch.tensor([float("inf")] + [float(sz[c][0]) if c in sz else float("inf") for c in range(1, k)],
-                                 device=dev)
-        print(f"[seg] cascade fingerprint: smallest train lesion per class {net.csmin.tolist()[1:]} voxels", flush=True)
-    if os.environ.get("SFC_CASCADE_MARGIN") and getattr(net, "cascade", False) and job.get("select") != "mre":
-        # each level reads further cmult x the cells its val calibration asks for (user 27/10, CMB: thresholds set on
-        # the val's 4 lesions filled 6 of 22 test lesions as background; a cell read too many costs a little compute,
-        # one filled too many a lesion): cmult = 1 + 2 / sqrt(n), n = the val's components of its rarest class
-        n = {c: 0 for c in range(1, k)}
-        for it in [it for it in job["items"] if it["split"] == "val"]:
-            y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
-            y = y[0] if y.ndim == 4 else y
-            for c in n:
-                n[c] += _components(y == c)[1]
-        net.cmult = 1 + 2 / math.sqrt(max(1, min(n.values())))
-        print(f"[seg] cascade margin: val components per class {n}, each level reads x{net.cmult:.2f}", flush=True)
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
     if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
@@ -706,11 +686,6 @@ def train(job: dict) -> None:
         return
     load_trained(best.pop("state"))
     net.eval()
-    if getattr(net, "csmin", None) is not None or getattr(net, "cmult", None):   # SFC_CASCADE_FP / _MARGIN: the levels'
-        # thresholds again on val, by that rule
-        val_v = [load(it) for it in split["val"]]
-        net.cascade_val(val_v, k, amp)
-        del val_v
     if "lm_topk" in best:   # the val-chosen cells per landmark for the test and the saved val predictions
         net.ctopk_eval = best["lm_topk"]
     rule, f1 = {}, job.get("select") == "f1"
@@ -728,7 +703,16 @@ def train(job: dict) -> None:
             y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
             y = y[0] if y.ndim == 4 else y
             vals.append((z["pred"], z["prob"] if len(z["prob"]) == k else None, np.where(y == 255, 0, y)))
-        rule = choose_postproc(vals, k, train_sizes(split["train"], cache, k), f1)
+        sizes = {}   # train components' sizes (voxels on the model grid): 1st / 5th percentile per class
+        for it in split["train"][:20]:
+            y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
+            y = y[0] if y.ndim == 4 else y
+            for c in range(1, k):
+                cc, n = _components(y == c)
+                if n:
+                    sizes.setdefault(c, []).extend(np.bincount(cc.ravel())[1:].tolist())
+        sizes = {c: [int(np.percentile(v, 1)), int(np.percentile(v, 5))] for c, v in sizes.items()}
+        rule = choose_postproc(vals, k, sizes, f1)
         del vals
     tkey = key | {"best_iter": best["iter"], "postproc": {str(c): r for c, r in rule.items()}} | \
         ({"lm_topk": best["lm_topk"]} if "lm_topk" in best else {})   # (only when chosen: other runs' partial tests resume)
@@ -822,19 +806,6 @@ def _metric(sums, f1: bool) -> float:
         return 2 * a / (b + c) if b + c else float("nan")
     p, r = a / max(a + c, 1), a / max(b, 1)
     return 2 * p * r / max(p + r, 1e-9)
-
-
-def train_sizes(train: list, cache: Path, k: int) -> dict:
-    """{class: [1st, 5th percentile]} of the train components' sizes (voxels on the model grid; the first 20 volumes)."""
-    sizes = {}
-    for it in train[:20]:
-        y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
-        y = y[0] if y.ndim == 4 else y
-        for c in range(1, k):
-            cc, n = _components(y == c)
-            if n:
-                sizes.setdefault(c, []).extend(np.bincount(cc.ravel())[1:].tolist())
-    return {c: [int(np.percentile(v, 1)), int(np.percentile(v, 5))] for c, v in sizes.items()}
 
 
 def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
