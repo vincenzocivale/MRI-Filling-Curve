@@ -9,8 +9,7 @@ whose grid holds more than `nmax` tokens is read in windows of `block` cells per
 on every side, keeping each window's centre (TotalSeg whole-body at 4 mm: ~5e6 tokens); the 4 mm level only where
 fine_ok. Stored as <out>/<id>.<mm>.<curve>.npy [gx, gy, gz, C] fp16 + <out>/<id>.json {k4, spacing, shape}; <curve>
 is one curve read alone or `mean` (the curves' average); a file without the tag (caches before 24/10) is the mean.
-Which curves per level (24/10, user: the cached levels chosen by blocks and curve, as the live ones): job["curves"]
-{mm: [names]}, else block_plan's <out>/blocks.json "cache_curves", else the mean; each curve is read once for all of them.
+The decoder reads the mean; main() writes other curves only if job["curves"] {mm: [names]} asks (each read once).
 
     python -m sfc_gdn2.fm.token_cache <job.json>   {inputs, ids, out, checkpoint, args, shard, nmax, block, margin,
                                                     curves, random: the seeded random encoder, for the random-encoder baseline}
@@ -51,13 +50,10 @@ class TokenCache:
         self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(32)
         self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(16), {}, (16.0,), {}, 0
         self._recent = {}
-        self.cols = None   # SegNet blocks: the columns of the decoder's blocks in a cache of more (block_plan.layout)
-        self.curves = {}   # {mm: curve} the decoder's curve per cached level (block_plan), else the mean
         self.sig = None    # {checkpoint, taps, curves, pretrained} of the reading encoder (SegNet sets it), checked once
 
     def check(self) -> None:
-        """The folder's tokens are this encoder's (27/10: a blocks.json copied from another encoder's folder went
-        unnoticed): <root>/cache.json written by the LiveCache that starts the folder, else compared; folders started
+        """The folder's tokens are this encoder's (27/10: a folder's tokens of another encoder went unnoticed): <root>/cache.json written by the LiveCache that starts the folder, else compared; folders started
         before it (tokens of an unknown encoder) are never stamped and pass."""
         if self.sig is None:
             return
@@ -77,7 +73,7 @@ class TokenCache:
         return self._meta[i]
 
     def _open(self, i: str, mm: float):
-        key, name = (i, mm), level_file(self.root, i, mm, self.curves.get(float(mm), "mean"))
+        key, name = (i, mm), level_file(self.root, i, mm)
         if key not in self._fd:
             with open(name, "rb") as f:
                 major, _ = np.lib.format.read_magic(f)
@@ -106,7 +102,7 @@ class TokenCache:
                 n = [-(-v // kk) for v, kk in zip(V, k)]
                 key = (i, mm, tuple(corner), tuple(n))
                 if key not in self._ahead:
-                    self._ahead[key] = (self._gen, self._io.submit(lambda *a: self._cols(self._read(*a), a[1]), i, mm, corner, n, k))
+                    self._ahead[key] = (self._gen, self._io.submit(self._read, i, mm, corner, n, k))
 
     def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
         key = (i, mm, tuple(int(c) for c in corner), tuple(n))
@@ -114,12 +110,8 @@ class TokenCache:
         if f is not None:
             return f[1].result()
         if key not in self._recent:   # the last few reads (adaptive decoding reads a scan's levels once per chunk)
-            self._recent = dict(list(self._recent.items())[-3:]) | {key: self._cols(self._read(i, mm, corner, n, k), mm)}
+            self._recent = dict(list(self._recent.items())[-3:]) | {key: self._read(i, mm, corner, n, k)}
         return self._recent[key]
-
-    def _cols(self, t: torch.Tensor, mm: float) -> torch.Tensor:
-        c = self.cols.get(float(mm)) if isinstance(self.cols, dict) else self.cols   # per level: {mm: columns}
-        return t if c is None else t[..., c]
 
     def _read(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
         fd, shape, dt, off = self._open(i, mm)
@@ -206,9 +198,7 @@ def main(path: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     i0, n = (int(v) for v in job.get("shard", "0/1").split("/"))
     ids = sorted(job["ids"])[i0::n]
-    bj = out / "blocks.json"
-    cv = job.get("curves") or (json.loads(bj.read_text()).get("cache_curves") if bj.exists() else None) or {}
-    cv = {float(m): list(v) for m, v in cv.items()}
+    cv = {float(m): list(v) for m, v in (job.get("curves") or {}).items()}
     print(f"[cache] curves per level {cv or 'mean'}", flush=True)
     for c, i in enumerate(ids):
         lv = [(mm, m) for mm, m in LEVELS if mm >= float(job.get("min_mm", 4))]
@@ -251,7 +241,7 @@ if __name__ == "__main__":
 class LiveCache(TokenCache):
     """A TokenCache that writes the volumes it lacks itself (24/10, user: the cache live, on $FAST; no separate cache
     job): segrun calls ensure() as it loads each volume, which reads the missing levels with the job's frozen encoder
-    exactly as main() (the blocks and cached curves of the folder's blocks.json) and writes them to the folder, so later
+    exactly as main() (the decoder's last ++ taps, the curves' mean) and writes them to the folder, so later
     runs (seeds, other tasks on the same volumes) only read. token_cache "live:<folder>"."""
 
     def __init__(self, root, net):
@@ -262,18 +252,12 @@ class LiveCache(TokenCache):
         self.check()
         if (self.root / f"{i}.json").exists():
             return
-        from .block_plan import apply
         enc = self.net.encoder
-        keep, mode = (enc.depth, enc.taps, enc.patch_embed.patch_mm), enc.training
-        bj = self.root / "blocks.json"   # without one (no block_plan, 27/10): the decoder's last ++ taps, the curves' mean
-        pl = json.loads(bj.read_text()) if bj.exists() else {}
-        cv = {float(m): list(v) if isinstance(v, list) else [v] for m, v in (pl.get("cache_curves") or {}).items()}
+        keep, mode = enc.patch_embed.patch_mm, enc.training
         try:
-            if "cache" in pl:
-                apply(enc, pl["cache"])   # the union of the levels' blocks, as the cache job's encoder
             enc.eval()                # segrun loads the volumes before its first set_mode()
             with torch.no_grad():
-                write_volume(enc, self.net.enc_curves, self.net.seed, x, ctx, self.root, i, cv, min(self.levels))
+                write_volume(enc, self.net.enc_curves, self.net.seed, x, ctx, self.root, i, {}, min(self.levels))
         finally:
-            enc.depth, enc.taps, enc.patch_embed.patch_mm = keep
+            enc.patch_embed.patch_mm = keep
             enc.train(mode)

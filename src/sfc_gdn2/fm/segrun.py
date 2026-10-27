@@ -459,16 +459,6 @@ def train(job: dict) -> None:
     dev = torch.device(job["device"])
     rng = np.random.default_rng(job["seed"])
     k, cache = int(job["k"]), Path(job["cache"])
-    args = job["cfg"].get("args") or {}
-    if args.get("blocks") == "auto":   # fm/block_plan's choice for this task, next to the token cache (24/10)
-        task = Path(job["out"]).parts[-3]
-        pl = json.loads((Path(str(args["token_cache"]).removeprefix("live:")) / "blocks.json").read_text())
-        args["blocks"] = pl["tasks"][task]   # {mm: blocks}
-        cv = (pl.get("curves") or {}).get(task) or {}   # {mm: curve}: live levels a curve, cached ones a curve or "mean"
-        args["live_curves"] = {m: c for m, c in cv.items() if float(m) < 8} or None
-        args["cache_curves"] = {m: c for m, c in cv.items() if float(m) >= 8} or None
-        print(f"[seg] blocks {args['blocks']}, live curves {args['live_curves']}, cache curves {args['cache_curves']} "
-              f"(block_plan, {task})", flush=True)
     w = build(job["cfg"], job["device"])
     torch.manual_seed(job["seed"])
     ref, frozen, patch = w.seg_net(k, pretrained=False)

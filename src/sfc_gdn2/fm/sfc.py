@@ -19,7 +19,6 @@ bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in ou
 """
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
@@ -419,11 +418,7 @@ class SegNet(nn.Module):
             return
         pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
         pe.patch_mm = self.fine_mm[i]
-        keep_ = (self.encoder.depth, self.encoder.taps)
-        if getattr(self, "blocks_lv", None):   # this level's blocks (block_plan), the encoder that deep
-            from .block_plan import apply
-            apply(self.encoder, self.blocks_lv.get(float(self.fine_mm[i]), self.blocks_lv[16.0]))
-        cl = (getattr(self, "curves_lv", None) or {}).get(float(self.fine_mm[i]), self.enc_curves)
+        cl = self.enc_curves
         groups, n = [[]], 0   # calls of at most MIX_MAX tokens (whole tiles), as fine_mix
         for d in rs:
             if groups[-1] and n + len(d["read"][0]) > MIX_MAX:
@@ -434,7 +429,7 @@ class SegNet(nn.Module):
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             for grp in groups:
                 bf = [0] * len(grp)
-                for c in cl:   # within each group along the curve (block_plan: one curve per live level)
+                for c in cl:   # within each group along the curve
                     xs, ps, os_, cu, n0 = [], [], [], [0], 0
                     for d in grp:
                         x, q, lab, _ = d["read"]
@@ -449,7 +444,6 @@ class SegNet(nn.Module):
                         bf[m] = bf[m] + hh[o.argsort()]
                 for d, b_ in zip(grp, bf):
                     d["bf"] = b_ / len(cl)
-        self.encoder.depth, self.encoder.taps = keep_
         pe.patch_mm = mm0
 
     def _fine_done(self, d: dict) -> tuple:
@@ -479,7 +473,7 @@ class SegNet(nn.Module):
         return t, d["xyz"], d["gf"], kf
 
     def _fproj(self, i, t):
-        """Level i's tokens for its fine_tok: as they are under per-level blocks (fine_tok reads them), else -> d."""
+        """Level i's tokens for its fine_tok: last ++ taps as they are (fine_direct, seg_net), else through proj -> d."""
         return t if i in getattr(self, "fine_direct", ()) else self.proj(t)
 
     @staticmethod
@@ -1639,13 +1633,6 @@ class SFC(Wrapper):
         if isinstance(taps, int):           # quarter points below the last block (2: n/2, 3n/4; 3: also n/4; 4: also
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
-        blocks = self.args.get("blocks")   # fm/block_plan (24/10): these blocks only, the encoder run as deep as the last;
-        lv = None                           # a dict {mm: blocks} (as many per level): each level its own (16 mm at build)
-        if blocks:
-            from .block_plan import apply
-            if isinstance(blocks, dict):
-                lv = {float(m): [int(b) for b in v] for m, v in blocks.items()}
-            apply(enc, lv[16.0] if lv else blocks)
         net = SegNet(enc, self.curves, int(self.run_cfg["seed"]), self.run_cfg["data"]["patch_mm"], n_out,
                      embed_only=self.args.get("encoder") == "none", context=bool(self.args.get("context")),
                      tta=bool(self.args.get("tta")), neighbors=bool(self.args.get("neighbors")), dec_cpe=bool(self.args.get("dec_cpe")),
@@ -1675,28 +1662,15 @@ class SFC(Wrapper):
                      cascade_warm=int(self.args.get("cascade_warm") or 0),
                      cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16),
                      fine_live4=bool(self.args.get("fine_live4")), cascade_rank=bool(self.args.get("cascade_rank")))
-        bj = Path(str(self.args.get("token_cache") or "").removeprefix("live:")) / "blocks.json"
         if isinstance(net.cache, TokenCache):   # checked at its first read (segrun also builds a random net it never runs)
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
-                             "curves": list(self.curves), "blocks": blocks}
-        net.blocks_lv = lv
-        if (lv or enc.taps) and getattr(net, "fine_tok", None) is not None:   # each finer level reads its own blocks
-            u = 1 if net.unique else 2        # (block_plan's 1 or 2, else last ++ taps: the depth quartiles concatenated as the
-            net.fine_direct = set()           # probe, user 27/10) straight into its fine_tok (a projection to d first was a
-            for i, m in enumerate(net.fine_mm[: len(net.fine_tok)]):   # second linear map in a row: ~2M parameters for nothing)
-                if not lv or float(m) in lv:
-                    nb = len(lv[float(m)]) if lv else 1 + len(enc.taps)
-                    net.fine_tok[i] = nn.Linear(nb * enc.dim * u, 128)
-                    net.fine_direct.add(i)
-        lc = self.args.get("live_curves")   # block_plan: one curve per live level (a third of the live reading)
-        net.curves_lv = {float(m): [c] for m, c in lc.items()} if lc else None
-        if blocks and isinstance(net.cache, TokenCache) and bj.exists():   # a cache of more blocks: the decoder's columns
-            from .block_plan import columns
-            cb = json.loads(bj.read_text())["cache"]
-            net.cache.cols = {m: columns(cb, v, enc.dim) for m, v in lv.items() if m >= 8} if lv else columns(cb, blocks, enc.dim)
-        cc = self.args.get("cache_curves")   # block_plan: the curve (or "mean") of each cached level, its own files
-        if cc and isinstance(net.cache, TokenCache):
-            net.cache.curves = {float(m): c for m, c in cc.items()}
+                             "curves": list(self.curves), "blocks": None}   # (blocks: always None since block_plan's removal)
+        if enc.taps and getattr(net, "fine_tok", None) is not None:   # each finer level reads last ++ taps (the depth
+            u = 1 if net.unique else 2        # quartiles concatenated as the probe, user 27/10) straight into its fine_tok (a
+            net.fine_direct = set()           # projection to d first was a second linear map in a row: ~2M parameters for nothing)
+            for i in range(len(net.fine_tok)):
+                net.fine_tok[i] = nn.Linear((1 + len(enc.taps)) * enc.dim * u, 128)
+                net.fine_direct.add(i)
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):

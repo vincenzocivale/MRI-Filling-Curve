@@ -11,7 +11,7 @@ a few GB): is the run on track, not a benchmark number. Frozen encoder, one curv
 - local, WMH: WMH2017 FLAIR, the segdec split of seed 0 (train 43 / val 17 volumes). Per level (16 / 8 mm) and per
   block, a ridge (closed form) from each cell's token to its lesion fraction on a 4^3 sub-grid of the cell, resized
   trilinearly to the voxels -> val Dice (mean per volume, class 2 and the ignore label left out) at the best
-  threshold and ridge strength on val. A real segmentation score, not a cell AUROC (fm/block_plan).
+  threshold and ridge strength on val. A real segmentation score, not a cell AUROC.
 
 UCSF inputs are preprocessed once into <cache> (the run's preprocessing: canonical axes, native voxels, scaled).
     python -m sfc_gdn2.online_probe <encoder_step*.pt> <out.json> [--tasks wmh idh] [--mm 16 8] [--cache dir]

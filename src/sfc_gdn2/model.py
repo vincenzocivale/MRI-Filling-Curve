@@ -411,7 +411,7 @@ class Encoder(nn.Module):
         assert bidir in ("late", "alternate", "alternate_gdn", "block"), bidir
         self.dim, self.grad_checkpoint, self.bidir = d_model, grad_checkpoint, bidir
         self.taps: tuple = ()  # block indices whose outputs `flat` also returns (segmentation decoder input, fm/sfc.py)
-        self.depth: int | None = None  # run only the first `depth` blocks (fm/block_plan: the decoder's last block)
+        self.depth: int | None = None  # run only the first `depth` blocks (None: all)
         self.patch_embed = KernelEmbed(d_model, patch_mm, **embed)
         self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
         self.pos = ViewPos(d_model) if view_pos else None
