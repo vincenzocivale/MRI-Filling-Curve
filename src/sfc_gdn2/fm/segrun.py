@@ -534,7 +534,33 @@ def train(job: dict) -> None:
         drawer = ThreadPoolExecutor(1)
         queue = [drawer.submit(draw) for _ in range(min(AHEAD, iters - start + 1))]
         tm = {"data": 0.0, "step": 0.0, "val": 0.0}   # seconds per part since the last val line (24/10: where the time goes)
+        # SFC_SEG_PROFILE="w,n" (27/10, where the step's time goes): after w iterations, n under cProfile + torch.profiler,
+        # the tables to <out>.prof.txt, then the run stops (no val, no test)
+        pw, pn = (int(v) for v in os.environ.get("SFC_SEG_PROFILE", "0,0").split(","))
         for it in range(start, iters + 1):
+            if pn and it in (start + pw, start + pw + pn):
+                torch.cuda.synchronize()
+                if it == start + pw:
+                    import cProfile
+                    prof = (cProfile.Profile(), torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                                                  torch.profiler.ProfilerActivity.CUDA]), time.time())
+                    prof[1].__enter__()
+                    prof[0].enable()
+                else:
+                    import io
+                    import pstats
+                    prof[0].disable()
+                    prof[1].__exit__(None, None, None)
+                    wall = (time.time() - prof[2]) / pn
+                    ev = prof[1].key_averages()
+                    gpu = sum(e.self_device_time_total for e in ev) / 1e6 / pn
+                    buf = io.StringIO()
+                    pstats.Stats(prof[0], stream=buf).sort_stats("cumulative").print_stats(80)
+                    head = f"batch {job['batch']}: {wall:.3f} s per iteration, GPU kernels {gpu:.3f} s ({100 * gpu / wall:.0f} %)"
+                    out_p.with_suffix(".prof.txt").write_text(head + "\n\n" + ev.table(sort_by="self_device_time_total", row_limit=40)
+                                                              + "\n\n" + buf.getvalue())
+                    print(f"[seg] profile: {head} -> {out_p.with_suffix('.prof.txt')}", flush=True)
+                    return
             ta = time.time()
             x, y, c = queue.pop(0).result()
             if it + len(queue) < iters:
