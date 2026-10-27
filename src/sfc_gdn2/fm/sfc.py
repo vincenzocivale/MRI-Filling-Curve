@@ -20,7 +20,6 @@ bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in ou
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 
 import nibabel.orientations as nio
@@ -507,8 +506,6 @@ class SegNet(nn.Module):
                 if int(fp.sum()) > m:
                     fp &= torch.rand(len(fp), device=fp.device) < m / int(fp.sum())
                 mix = tm | fp
-            if not train and j == st["jmin"] and os.environ.get("SFC_CASCADE_EDGE"):
-                mix = mix | self._edge(ci, mix, st["a"], st["g"], n_out)
             st["info"].append((j, ci, st["lg"], hc))
             st.setdefault("rinfo", []).append(st.get("r"))
             st["fill"].append((j, ci[~mix], st["a"][~mix]))
@@ -519,18 +516,6 @@ class SegNet(nn.Module):
             st["done"] = True
             return False
         return True
-
-    @staticmethod
-    def _edge(ci, mix, a, g, n_out) -> torch.Tensor:
-        """The last level's filled cells with a 26-neighbour of another class or still mixed -> True: the point head
-        decides them (SFC_CASCADE_EDGE, 27/10: half of the cochlea's and the schwannoma's boundary errors were 2 mm cells
-        filled whole; the point head trains on every truly mixed cell, so reading these needs no retraining)."""
-        cls = torch.full((math.prod(g),), -1.0, device=ci.device)
-        cls[ci] = torch.where(mix, float(n_out), a.float())
-        v, ok = cls.view(1, 1, *g), (cls >= 0).view(1, 1, *g)
-        hi = F.max_pool3d(torch.where(ok, v, float("-inf")), 3, 1, 1).flatten()
-        lo = -F.max_pool3d(torch.where(ok, -v, float("-inf")), 3, 1, 1).flatten()
-        return (hi[ci] != cls[ci]) | (lo[ci] != cls[ci])
 
     def _cascade(self, z16, k16, g16, vol, sp, cur, n_out, yy=None, train=False) -> dict:
         """One tile / scan down the levels with the current thresholds -> its final state: lv (the levels' dense tokens,
