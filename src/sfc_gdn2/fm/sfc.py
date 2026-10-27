@@ -1502,7 +1502,7 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
     (intensity std of the foreground cells: label-free, the same for every task), as many cells as the level above has
     foreground cells (each level costs about the 8 mm one). The cells read as one sequence per 26-connected group along each curve
     (averaged), as the cascade's live reading. Per level the foreground mean and std of each block (last ++ taps, one
-    copy of h) -> g<mm>:mean, g<mm>:std_b<k>, ..., and the last block's covariance g<mm>:tricov; a level the scan cannot
+    copy of h) -> g<mm>:mean, g<mm>:std_b<k>, g<mm>:tricov_b<k>, ... (covariance); a level the scan cannot
     hold (cells under 8 voxels, nothing left) repeats the level above (`above`: the 16 mm ones, same names).
     bench.probe concatenates the levels."""
     from ..curves import grid_coords, keys
@@ -1546,7 +1546,7 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
         for j, nm in enumerate(names):
             s, m = torch.std_mean(h[:, j * d: (j + 1) * d], 0, correction=0)
             out[f"g{int(mm)}:mean{nm}"], out[f"g{int(mm)}:std{nm}"] = m.half(), s.half()
-        out[f"g{int(mm)}:tricov"] = tricov(h[:, :d])
+            out[f"g{int(mm)}:tricov{nm}"] = tricov(h[:, j * d: (j + 1) * d])
         prev = torch.full((len(p),), -torch.inf, device=dev)
         prev[sel[fg]] = p[sel[fg]].float().std(1)
         budget, kp, gp = max(nfg, 1), k, g
@@ -1700,9 +1700,9 @@ class SFC(Wrapper):
             from ..model import encoder_extractor
 
             enc = self._encoder().to(self.device).eval().requires_grad_(False)
-            if self.args.get("encoder") != "none":  # also blocks n/2 and 3n/4 (probe menu: mean_b<block>)
-                n = len(enc.blocks)
-                enc.taps = tuple(self.args.get("probe_taps") or (n // 2 - 1, 3 * n // 4 - 1))
+            if self.args.get("encoder") != "none":  # also the depth quartiles n/4, n/2, 3n/4 (probe menu: mean_b<block>;
+                n = len(enc.blocks)                  # 27/10, the rule of every token model in the benchmark)
+                enc.taps = tuple(self.args.get("probe_taps") or (n // 4 - 1, n // 2 - 1, 3 * n // 4 - 1))
             self._taps, self._dim = enc.taps, enc.dim
             obj = self.run_cfg["objective"]
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
@@ -1754,11 +1754,11 @@ class SFC(Wrapper):
         if self.args.get("multigrain", True) and not self.args.get("patch_mm") and self.args.get("encoder") != "none":
             above = {s: v[: self._dim].half() for s, v in feats.items() if s.startswith(("mean", "std")) and "@" not in s
                      and "tta" not in s}
-            t = bi[:, : self._dim].float()   # 16 mm covariances, exact (bench.probe.second_order): every token, foreground
-            keep = t.norm(dim=1) > 0
-            fgk = keep & out["fg"][0, : len(x)]
-            feats["tricov"] = tricov(t[keep])
-            feats["tricov_fg"] = above["tricov"] = tricov(t[fgk] if fgk.any() else t[keep])
+            fgk = out["fg"][0, : len(x)]   # 16 mm covariances per block, foreground tokens (exact: bench.probe.second_order)
+            fgk = fgk if fgk.any() else torch.ones_like(fgk)
+            for j in range(n):
+                nm = "" if j == 0 else f"_b{self._taps[j - 1] + 1}"
+                feats[f"tricov{nm}"] = above[f"tricov{nm}"] = tricov(block(out["bi"][0, : len(x)], j)[fgk, : self._dim])
             if pe.patch_mm == self.run_cfg["data"]["patch_mm"]:
                 feats |= multigrain(self._extract_enc, self.curves, int(self.run_cfg["seed"]), vol,
                                     prepared["spacing"].to(dev), self.run_cfg["objective"].get("fg_threshold", 0.05), above)
