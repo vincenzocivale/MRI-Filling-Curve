@@ -567,9 +567,10 @@ def _tri_sqrt_one(path: Path) -> dict:
     return {"S": ((v * e.clamp(min=0).sqrt()[:, None]) @ v.transpose(1, 2))[:, iu[0], iu[1]].half()}
 
 
-def second_order_exact(d: Path, ids: list[str], dim: int = 64, fit: set | None = None) -> dict[str, torch.Tensor]:
+def second_order_exact(d: Path, ids: list[str], dim: int = 16, fit: set | None = None) -> dict[str, torch.Tensor]:
     """second_order from the covariances stored at extraction (fm/sfc multigrain, 27/10; user: exact, every level): the
-    principal directions per level and block = eigenvectors of the mean covariance of the `fit` volumes (exact, every
+    `dim` principal directions per level and block (16, user 27/10: the 16 together ~ the 2080 numbers of the other
+    models' one covsqrt per map) = eigenvectors of the mean covariance of the `fit` volumes (exact, every
     foreground token; the within-volume variation the reading describes, not the spread between scans), then per volume
     the square root of P^T C P of each, upper triangle, concatenated -> "covsqrt" (16 / 8 / 4 / 2 mm x the depth
     quartiles). Every covariance of a volume in one batched matmul + eigh, the files read by SFC_IO_WORKERS processes."""
@@ -591,7 +592,7 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit:
     if cache.exists() and (c := torch.load(cache))["ids"] == ids:
         return c["feats"]
     if "tricov" in torch.load(d / f"{ids[0]}.pt", map_location="cpu", weights_only=False)["features"]:
-        feats = second_order_exact(d, ids, dim, fit)
+        feats = second_order_exact(d, ids, fit=fit)   # dim 16: 16 covariances x 136 ~ one 64-dim covsqrt
         torch.save({"ids": ids, "feats": feats}, cache)
         return feats
     g0 = load_globals(d)
