@@ -180,13 +180,20 @@ MISS_MM = 50.0   # a landmark not predicted at all counts as this radial error i
 LANDMARK_SIGMA_MM = 3.0   # landmark heatmaps (user, 23/10: landmarks are a regression, not a segmentation)
 
 
-def heatmaps(lm, start, P) -> torch.Tensor:
-    """[n, *P] Gaussian heatmaps of a tile at `start`: lm = (landmark voxels [n, 3] on the model grid, rounded, NaN
-    if absent; grid spacing [3] in mm); exactly 1 at each landmark's voxel."""
+def heat_spec(lm, start) -> torch.Tensor:
+    """A tile's landmarks for heatmaps(): [n, 6] = their voxels relative to the tile's corner `start` (NaN if absent)
+    and the grid spacing (mm). The tiles carry this, not the maps (27/10: the dense maps of whole fetal scans, built on
+    the CPU by the one drawing thread, were ~5 s of every iteration)."""
     xyz, sp = lm
-    ax = [((torch.arange(p) + int(s))[None] - xyz[:, a:a + 1]) * float(sp[a]) for a, (s, p) in enumerate(zip(start, P))]
+    rel = xyz.float() - torch.as_tensor(np.asarray(start), dtype=torch.float)
+    return torch.cat([rel, torch.as_tensor(np.asarray(sp), dtype=torch.float).expand(len(rel), 3)], 1)
+
+
+def heatmaps(spec: torch.Tensor, P) -> torch.Tensor:
+    """heat_spec [..., n, 6] -> [..., n, *P] Gaussian heatmaps on spec's device; exactly 1 at each landmark's voxel."""
+    ax = [(torch.arange(p, device=spec.device) - spec[..., a:a + 1]) * spec[..., 3 + a:4 + a] for a, p in enumerate(P)]
     g = [torch.exp(-0.5 * (d / LANDMARK_SIGMA_MM) ** 2).nan_to_num(0.0) for d in ax]
-    return (g[0][:, :, None, None] * g[1][:, None, :, None] * g[2][:, None, None, :]).half()
+    return (g[0][..., :, None, None] * g[1][..., None, :, None] * g[2][..., None, None, :]).half()
 
 
 def focal_heatmap(logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
@@ -205,9 +212,10 @@ def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
     at a time, every model's decoder as it is."""
     parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
         [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
+    parts = [(a, heatmaps(b.to(dev), a.shape[2:]), u) for a, b, u in parts]   # the maps on the GPU (heat_spec)
     if getattr(net, "cascade", False):   # ours: every tile in one call, the cascade's levels read for all at once (24/10)
         with amp():
-            loss = net.landmark_sums([a.to(dev).float() for a, _, _ in parts], [b.to(dev) for _, b, _ in parts],
+            loss = net.landmark_sums([a.to(dev).float() for a, _, _ in parts], [b for _, b, _ in parts],
                                      [u.to(dev) for _, _, u in parts], parts[0][1].shape[1] + 1)
         loss.backward()
         return loss.detach()
@@ -318,7 +326,7 @@ class Patches:
                 cs[-1] = torch.cat([cs[-1], torch.tensor(start, dtype=torch.float)])
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
-            ys.append(y[sl] if self.lm[j] is None else heatmaps(self.lm[j], start, P))
+            ys.append(y[sl] if self.lm[j] is None else heat_spec(self.lm[j], start))
         if len({t.shape for t in xs}) > 1:
             return [t[None] for t in xs], [t[None] for t in ys], None if cs[0] is None else [t[None] for t in cs]
         return torch.stack(xs), torch.stack(ys), None if cs[0] is None else torch.stack(cs)
