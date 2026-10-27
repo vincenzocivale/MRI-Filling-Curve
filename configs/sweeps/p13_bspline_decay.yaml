@@ -1,6 +1,6 @@
 # Decay branch of the new model's first epoch (user, 19/10): from p13_bspline's plateau checkpoint (step 9200), 1-sqrt
-# decay over 1000 steps to 10200, then the evaluation, with one more pilot: decoder F fed by the frozen encoder at its
-# 8 / 4 mm levels (the B-spline gain).
+# decay over 1000 steps to 10200, then the evaluation (its extra decoder-F pilot, segdec_extra, removed with decoder F,
+# 27/10).
 name: p13_bspline_decay
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
@@ -13,6 +13,4 @@ runs:
   - {}
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
 dense: {task: tumor_ucsf, iters: 2500}
-segdec_extra:
-  - [segdec_f_fineenc, "args.taps=3 args.refine=2 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true"]
 slurm: {gres: "gpu:2", cpus_per_task: 16, mem: 240G, time: "24:00:00"}

@@ -41,15 +41,12 @@ def draw(space: dict, rng: random.Random) -> dict:
     return out
 
 
-SEGDEC = (("segdec", ""), ("segdec_taps3_refine_image", "args.taps=3 args.refine=true args.image=true"),
-          ("segdec_f", "args.taps=3 args.refine=2 args.image=true args.erase=head args.fine_curves=[raster]"))
-# the segdec pilots of every run (user, 17/10: D2 and little else): Primus' decoder on the last block (the plain
-# reference), and ours: + 3 intermediate blocks, 16 -> 8 mm along the Hilbert curve with the voxels' KernelEmbed at
-# 8 mm (p7: 0.657 vs 0.649 for Primus' decoder on the same blocks), and the same down to 4 mm (p7: 0.648 at 2500
-# iterations, still rising, lowest loss: the user expects it to win with more; official, chosen on full-budget val);
-# since 18/10 with one erase gate per head (stable on whole-tile sequences) and its fine levels read in raster
-# (+0.026 / +0.028 over Hilbert on 2 seeds, epoch 3). Dropped on p7 (17/10): + 2 blocks,
-# neighbour mixing, the patch embedding, the tile's mean token, reversed readings.
+# the segdec pilot of every run: our decoder Dmix exactly as slurm/bench_full.sh runs it (DM; 27/10: the other decoders,
+# Primus' PatchDecode on the last block and decoder F, are removed from fm/sfc.py), its token cache live under the run
+DMIX = ("args.taps=3 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true args.matryoshka=true "
+        "args.head_w=0.2 args.decoder_c=true args.c_local=true args.refine=3 args.cascade=true args.fine_live4=true "
+        "args.fine_split=true args.cascade_g0=16 args.cascade_gmin=4")
+SEGDEC = (("segdec_dmix", DMIX),)
 
 
 def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
@@ -75,8 +72,9 @@ def evaluation(spec: dict, ckpt: Path, run: Path, gpus: int) -> list[str]:
         lines.append(f"python -c {shlex.quote(code)} & c=$!")
     if d := spec.get("dense"):
         seg = [f"sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --tasks {d['task']}"
-               f" --iters {d['iters']} --val-only {fm} {a} --override segdec.out={run}/{out}"
-               for out, a in (*SEGDEC, *map(tuple, spec.get("segdec_extra", [])))]   # + the spec's own decoders
+               f" --iters {d['iters']} --val-only {fm} {a} args.token_cache=live:{run}/tok_{d['task']}"
+               f" --override segdec.out={run}/{out}"
+               for out, a in (*SEGDEC, *map(tuple, spec.get("segdec_extra", [])))]   # + the spec's own (Dmix variants)
         lines += [f"CUDA_VISIBLE_DEVICES={g} bash -c {shlex.quote(' ; '.join(seg[g::gpus]))} & s{g}=$!" for g in range(gpus)]
         lines += [f"wait $s{g} || true" for g in range(gpus)]  # a failed pilot must not skip the probe
     if spec.get("tasks"):

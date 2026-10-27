@@ -3,8 +3,7 @@
 # children's) against the Fourier-MLP kernel; (2) one patch size per step from {12, 16, 20} mm (FlexiViT-style:
 # geometry in tokens, loader budget at 12 mm) against 16 mm fixed. d=512/8, 760 steps, seed 17, mask_cells [1, 2],
 # all arms 4 GPUs x 36 scans. Evaluated at 16 mm (the default); the multi-resolution arms also at 12 mm afterwards
-# (args.patch_mm=12) against p3_12mm #1. Extra pilots: decoder F reading the image through the encoder's kernel at the
-# fine cell (image_kernel encoder) and F fed by the frozen encoder itself run at the fine patches (fine_encoder).
+# (args.patch_mm=12) against p3_12mm #1. (Its extra decoder-F pilots, segdec_extra, removed with decoder F, 27/10.)
 name: p11_res
 root: /leonardo_scratch/large/userexternal/fcorrent/sfc_runs/tune
 config: configs/pretrain_lejepa.yaml
@@ -18,7 +17,4 @@ runs:
   - {data.patches_per_batch: 233472, data.patch_mm_choices: [12, 16, 20], data.budget_patch_mm: 12.0, model.embed.basis: bspline}
 tasks: [age, sex, idh, grade, survival, mrs90, sequence]
 dense: {task: tumor_ucsf, iters: 2500}
-segdec_extra:
-  - [segdec_f_enckernel, "args.taps=3 args.refine=2 args.image=true args.erase=head args.fine_curves=[raster] args.image_kernel=encoder"]
-  - [segdec_f_fineenc, "args.taps=3 args.refine=2 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true"]
 slurm: {gres: "gpu:4", cpus_per_task: 32, mem: 480G, time: "06:00:00"}

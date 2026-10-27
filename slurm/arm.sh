@@ -4,15 +4,14 @@
 #   python slurm/submit.py slurm/presets/1gpu.yaml --job-name <name> --set gres=gpu:2 --set cpus_per_task=16 \
 #     --set mem=240G --set time=09:30:00 -- bash slurm/arm.sh <run dir> <seed> [pretrain override ...]
 # Environment: NGPU (2; 1: steps one after the other), STEPS (default 3000; the pretraining is skipped once encoder_step<STEPS>.pt exists), DECAY (600),
-# TASKS (default "wmh_seg cmb_seg vs_seg fetal_landmarks"), SEG_ITERS (2500), PROBE=0 / CACHE=0 (skip; smoke tests). Every step is skipped when its output
-# exists (tune/tune.csv, tok/, the segdec json) and runs with its own log under <run dir>/logs; a failing step does
+# TASKS (default "wmh_seg cmb_seg vs_seg fetal_landmarks"), SEG_ITERS (2500), PROBE=0 (skip; smoke tests). Every step is skipped when its output
+# exists (tune/tune.csv, the segdec json) and runs with its own log under <run dir>/logs; a failing step does
 # not stop the others; a summary of the exit codes ends the job. A job that times out is resubmitted identical: the
 # pretraining resumes from its ckpt.pt, decoders from their .last.pt.
 set -u
 D=$1; SEED=$2; shift 2
 STEPS=${STEPS:-3000}; DECAY=${DECAY:-600}; SEG_ITERS=${SEG_ITERS:-2500}; NGPU=${NGPU:-2}
 TASKS=${TASKS-"wmh_seg cmb_seg vs_seg fetal_landmarks"}
-R=/leonardo_scratch/large/userexternal/fcorrent/sfc_runs
 MV=/leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench_v2; TV=configs/bench/probe_tasks_v2.yaml
 mkdir -p $D/logs; cd ~/mri-sfc/repo
 step() {   # step <name> <command...>: its log and its exit code in <run dir>/logs (steps run in background subshells)
@@ -35,15 +34,12 @@ probe() {
   [ -f $D/tune/tune.csv ] && { echo "[arm] probe done, skipped"; return 0; }
   step probe bash -c "sfc bench-extract configs/bench/bench.yaml --group sfc_tune --tune --fm-set checkpoint=$D --query \"$Q\" --out $D/features --override out_dir=$MV && sfc bench-probe configs/bench/bench.yaml --models sfc_gdn2 --tune --tasks idh --out $D/tune --override fm.out_root=$D/features out_dir=$MV probe.tasks=$TV"
 }
-cache() {
-  [ "${CACHE:-1}" = 1 ] || return 0
-  [ -d $D/tok ] && [ -f $D/logs/cache.done ] && { echo "[arm] cache done, skipped"; return 0; }
-  step cache python $R/tune/p15_screen/tokjob.py $D && touch $D/logs/cache.done
-}
-F="args.taps=3 args.refine=2 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true args.matryoshka=true args.head_w=0.2 args.decoder_c=true args.c_local=true args.c_wpow=0.5"
+# Dmix as slurm/bench_full.sh (DM; 27/10: decoder C without the cascade removed), its token cache live in $D/tok (the
+# seg steps write it as they go: no separate cache step, whose tokjob.py built the removed decoder)
+F="args.taps=3 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true args.matryoshka=true args.head_w=0.2 args.decoder_c=true args.c_local=true args.refine=3 args.cascade=true args.fine_live4=true args.fine_split=true args.cascade_g0=16 args.cascade_gmin=4"
 seg() {
   [ -f $D/segdec/$1/s0/sfc_gdn2__pretrained.json ] && { echo "[arm] seg $1 done, skipped"; return 0; }
-  step seg_$1 sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --tasks $1 --iters $SEG_ITERS --val-only --fm-set checkpoint=$D $F args.token_cache=$D/tok --override segdec.out=$D/segdec out_dir=$MV probe.tasks=$TV
+  step seg_$1 sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --tasks $1 --iters $SEG_ITERS --val-only --fm-set checkpoint=$D $F args.token_cache=live:$D/tok --override segdec.out=$D/segdec out_dir=$MV probe.tasks=$TV
 }
 pair() {   # pair <cmd for GPU 0> <cmd for GPU 1> (either may be empty); NGPU=1: one after the other
   if [ $NGPU = 1 ]; then for c in "$1" "$2"; do [ -n "$c" ] && eval "$c"; done; return; fi
@@ -51,7 +47,7 @@ pair() {   # pair <cmd for GPU 0> <cmd for GPU 1> (either may be empty); NGPU=1:
   [ -n "$2" ] && { CUDA_VISIBLE_DEVICES=1 eval "$2" & }
   wait
 }
-pair cache probe
+probe
 set -- $TASKS
 while [ $# -gt 0 ]; do pair "seg $1" "${2:+seg $2}"; shift; [ $# -gt 0 ] && shift; done
 echo "[arm] summary (exit codes):"; for f in $D/logs/*.rc; do [ -f $f ] && echo "  $(basename $f .rc) $(cat $f)"; done
