@@ -68,7 +68,7 @@ class SegNet(nn.Module):
                  cascade_g0: float = 16.0, cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
                  cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2, fine_split: bool = False,
                  cascade_warm: int = 0, cascade_topk_eval=(8, 8, 16, 16), fine_live4: bool = False,
-                 cascade_rank: bool = False):
+                 cascade_rank: bool = False, c_patch: bool = False, cascade_ring: bool = False):
         super().__init__()
         from ..model import Encoder, encoder_extractor
 
@@ -106,7 +106,12 @@ class SegNet(nn.Module):
         CF = 32
         self.cfield = nn.ModuleList([nn.Linear(encoder.dim, CF)] + [nn.Linear(128, CF) for _ in range(max(2, self.refine))])
         L = len(self.cfield)
-        self.chead = nn.Sequential(nn.Linear(L * (2 * CF + 3) + 13 if self.c_local else L * CF + 7, 128),
+        # c_patch (1b, 27/10: 95 % of the cochlea's errors 1 voxel off the boundary, the CMB false positives far from any
+        # lesion): the point head sees the voxels' intensities in two 5^3 cubes (stride 1 and 2) through a learned
+        # linear map (a 5^3 convolution at the point: the U-Net's full-resolution stage), not 13 values along the axes
+        self.cpatch = nn.Sequential(nn.Linear(250, 64), nn.GELU()) if c_patch else None
+        img = 64 if c_patch else 13 if self.c_local else 7
+        self.chead = nn.Sequential(nn.Linear((L * (2 * CF + 3) if self.c_local else L * CF) + img, 128),
                                    nn.GELU(), nn.Linear(128, 128), nn.GELU(),
                                    nn.Linear(128, n_out))
         self.extract = encoder_extractor(encoder, curves, "patch", seed, 0.0)   # the live 16 mm reading (no token cache)
@@ -151,6 +156,9 @@ class SegNet(nn.Module):
         # V. Civale's split ranker, 2fd5e4e) on detached tokens, so Dmix trains as before; the val pass goes down twice,
         # with the mixed head's margins and with the scores (own thresholds rtaus, the same calibration)
         self.crank, self.cuse = bool(cascade_rank), "mixed"
+        # cascade_ring (1a, 27/10: 79 % of the CMB misses and half the cochlea's in cells filled whole): the cells next to
+        # a mixed one go down too, never filled at that level (PointRend: refine the uncertain cells and their neighbours)
+        self.cring = bool(cascade_ring)
         if self.crank:
             mk = lambda d: nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 128), nn.GELU(), nn.Linear(128, 1))
             self.rhead = nn.ModuleList([mk(encoder.dim)] + [mk(128) for _ in range(refine)])
@@ -367,7 +375,9 @@ class SegNet(nn.Module):
                     fs += list(_c_local(f, g, k, pts))
             else:   # no 4 mm level (coarse voxels): zeros
                 fs.append(torch.zeros(len(pts), (2 * C + 3) if self.c_local else C, device=pts.device))
-        return self.chead(torch.cat(fs + [_c_image(vol, pts, 2 if self.c_local else 1)], -1))
+        img = self.cpatch(torch.cat([_c_cube(vol, pts, 1), _c_cube(vol, pts, 2)], -1)) if self.cpatch is not None else \
+            _c_image(vol, pts, 2 if self.c_local else 1)
+        return self.chead(torch.cat(fs + [img], -1))
 
     # ------------------------------------------------------------------------- cascade decoding (22/10, variant A)
     def _targets(self, hist: torch.Tensor, n_out: int) -> torch.Tensor:
@@ -508,6 +518,10 @@ class SegNet(nn.Module):
                 mix = tm | fp
             if not train and hc is not None and getattr(self, "oracle", False):   # segrun SFC_CASCADE_ORACLE: no
                 mix = mix | (self._targets(hc, n_out) == n_out)                    # truly mixed cell is ever filled
+            if self.cring and mix.any():   # + the ring: the candidates next to a mixed cell
+                D = torch.zeros_like(cand)
+                D[ci[mix]] = True
+                mix = (self._dilate(D, st["g"]) & cand)[ci]
             st["info"].append((j, ci, st["lg"], hc))
             st.setdefault("rinfo", []).append(st.get("r"))
             st["fill"].append((j, ci[~mix], st["a"][~mix]))
@@ -931,6 +945,14 @@ def _c_local(f: torch.Tensor, g, k, pts: torch.Tensor) -> tuple:
     return f[(n[:, 0] * g[1] + n[:, 1]) * g[2] + n[:, 2]], u - n.float() - 0.5
 
 
+def _c_cube(vol: torch.Tensor, pts: torch.Tensor, step: int) -> torch.Tensor:
+    """The 5^3 voxels around each point at stride `step` (clamped at the border) -> [P, 125]."""
+    S = _dt(vol.shape, vol.device)
+    off = _dt([step * (v - 2) for o in range(125) for v in (o // 25, o // 5 % 5, o % 5)], vol.device).view(125, 3)
+    q = torch.minimum((pts[:, None] + off[None]).clamp_min(0), S - 1)
+    return vol[q[..., 0], q[..., 1], q[..., 2]].float()
+
+
 def _c_image(vol: torch.Tensor, pts: torch.Tensor, r: int = 1) -> torch.Tensor:
     """The voxel's intensity and the voxels at +-1 .. +-r along each axis (clamped at the border) -> [P, 1 + 6 r]."""
     S = _dt(vol.shape, vol.device)
@@ -1125,7 +1147,8 @@ class SFC(Wrapper):
                      cascade_topk=int(a.get("cascade_topk") or 2), fine_split=bool(a.get("fine_split")),
                      cascade_warm=int(a.get("cascade_warm") or 0),
                      cascade_topk_eval=a.get("cascade_topk_eval") or (8, 8, 16, 16),
-                     fine_live4=bool(a.get("fine_live4")), cascade_rank=bool(a.get("cascade_rank")))
+                     fine_live4=bool(a.get("fine_live4")), cascade_rank=bool(a.get("cascade_rank")),
+                     c_patch=bool(a.get("c_patch")), cascade_ring=bool(a.get("cascade_ring")))
         if isinstance(net.cache, TokenCache):   # checked at its first read (segrun also builds a random net it never runs)
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}   # (blocks: always None since block_plan's removal)
