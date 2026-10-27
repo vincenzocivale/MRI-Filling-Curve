@@ -518,7 +518,8 @@ class SegNet(nn.Module):
                 mix = tm | fp
             if not train and hc is not None and getattr(self, "oracle", False):   # segrun SFC_CASCADE_ORACLE: no
                 mix = mix | (self._targets(hc, n_out) == n_out)                    # truly mixed cell is ever filled
-            if self.cring and mix.any():   # + the ring: the candidates next to a mixed cell
+            if self.cring and not train and mix.any():   # + the ring: the candidates next to a mixed cell (inference only:
+                # in training it lifted the cneg cap on the cells read, 27 per isolated lesion cell at every level)
                 D = torch.zeros_like(cand)
                 D[ci[mix]] = True
                 mix = (self._dilate(D, st["g"]) & cand)[ci]
@@ -629,7 +630,7 @@ class SegNet(nn.Module):
         done = (lf >= 0).nonzero()[:, 0]
         out[lf[done].to(out.device), done.to(out.device)] = 1
         rest = (lf < 0).nonzero()[:, 0]   # the cells mixed at the last level read
-        for i in rest.split(1 << 19):
+        for i in rest.split(1 << 17 if self.cpatch is not None else 1 << 19):
             if len(i):
                 pts = torch.stack([i // (S[1] * S[2]), i // S[2] % S[1], i % S[2]], 1)
                 out[:, i.to(out.device)] = self.c_logits(lv, x0, pts).float().softmax(1).T.half().to(out.device)
