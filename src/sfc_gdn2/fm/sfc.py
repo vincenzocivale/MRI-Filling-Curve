@@ -1676,6 +1676,9 @@ class SFC(Wrapper):
                      cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16),
                      fine_live4=bool(self.args.get("fine_live4")), cascade_rank=bool(self.args.get("cascade_rank")))
         bj = Path(str(self.args.get("token_cache") or "").removeprefix("live:")) / "blocks.json"
+        if isinstance(net.cache, TokenCache):   # checked at its first read (segrun also builds a random net it never runs)
+            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
+                             "curves": list(self.curves), "blocks": blocks}
         net.blocks_lv = lv
         if (lv or enc.taps) and getattr(net, "fine_tok", None) is not None:   # each finer level reads its own blocks
             u = 1 if net.unique else 2        # (block_plan's 1 or 2, else last ++ taps: the depth quartiles concatenated as the

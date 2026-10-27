@@ -53,8 +53,25 @@ class TokenCache:
         self._recent = {}
         self.cols = None   # SegNet blocks: the columns of the decoder's blocks in a cache of more (block_plan.layout)
         self.curves = {}   # {mm: curve} the decoder's curve per cached level (block_plan), else the mean
+        self.sig = None    # {checkpoint, taps, curves, pretrained} of the reading encoder (SegNet sets it), checked once
+
+    def check(self) -> None:
+        """The folder's tokens are this encoder's (27/10: a blocks.json copied from another encoder's folder went
+        unnoticed): <root>/cache.json written by the LiveCache that starts the folder, else compared; folders started
+        before it (tokens of an unknown encoder) are never stamped and pass."""
+        if self.sig is None:
+            return
+        f, sig, self.sig = self.root / "cache.json", json.loads(json.dumps(self.sig, default=str)), None
+        if f.exists():
+            old = json.loads(f.read_text())
+            if old != sig:
+                raise ValueError(f"token cache {self.root} holds another encoder's tokens: {old} != {sig}")
+        elif isinstance(self, LiveCache) and not any(self.root.glob("*.npy")):
+            self.root.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps(sig, indent=1))
 
     def meta(self, i: str) -> dict:
+        self.check()
         if i not in self._meta:
             self._meta[i] = json.loads((self.root / f"{i}.json").read_text())
         return self._meta[i]
@@ -242,6 +259,7 @@ class LiveCache(TokenCache):
         self.net = net
 
     def ensure(self, i: str, x: torch.Tensor, ctx: torch.Tensor) -> None:
+        self.check()
         if (self.root / f"{i}.json").exists():
             return
         from .block_plan import apply
