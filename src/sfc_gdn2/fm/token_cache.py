@@ -247,10 +247,12 @@ class LiveCache(TokenCache):
         from .block_plan import apply
         enc = self.net.encoder
         keep, mode = (enc.depth, enc.taps, enc.patch_embed.patch_mm), enc.training
-        pl = json.loads((self.root / "blocks.json").read_text())
+        bj = self.root / "blocks.json"   # without one (no block_plan, 27/10): the decoder's last ++ taps, the curves' mean
+        pl = json.loads(bj.read_text()) if bj.exists() else {}
         cv = {float(m): list(v) if isinstance(v, list) else [v] for m, v in (pl.get("cache_curves") or {}).items()}
         try:
-            apply(enc, pl["cache"])   # the union of the levels' blocks, as the cache job's encoder
+            if "cache" in pl:
+                apply(enc, pl["cache"])   # the union of the levels' blocks, as the cache job's encoder
             enc.eval()                # segrun loads the volumes before its first set_mode()
             with torch.no_grad():
                 write_volume(enc, self.net.enc_curves, self.net.seed, x, ctx, self.root, i, cv, min(self.levels))

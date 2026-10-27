@@ -1677,12 +1677,13 @@ class SFC(Wrapper):
                      fine_live4=bool(self.args.get("fine_live4")), cascade_rank=bool(self.args.get("cascade_rank")))
         bj = Path(str(self.args.get("token_cache") or "").removeprefix("live:")) / "blocks.json"
         net.blocks_lv = lv
-        if lv and getattr(net, "fine_tok", None) is not None:   # each finer level reads its own blocks (1 or 2) straight
-            u = 1 if net.unique else 2                           # into its fine_tok (a projection to d first was a second
-            net.fine_direct = set()                              # linear map in a row: ~2M parameters for nothing)
-            for i, m in enumerate(net.fine_mm[: len(net.fine_tok)]):
-                if float(m) in lv:
-                    net.fine_tok[i] = nn.Linear(len(lv[float(m)]) * enc.dim * u, 128)
+        if (lv or enc.taps) and getattr(net, "fine_tok", None) is not None:   # each finer level reads its own blocks
+            u = 1 if net.unique else 2        # (block_plan's 1 or 2, else last ++ taps: the depth quartiles concatenated as the
+            net.fine_direct = set()           # probe, user 27/10) straight into its fine_tok (a projection to d first was a
+            for i, m in enumerate(net.fine_mm[: len(net.fine_tok)]):   # second linear map in a row: ~2M parameters for nothing)
+                if not lv or float(m) in lv:
+                    nb = len(lv[float(m)]) if lv else 1 + len(enc.taps)
+                    net.fine_tok[i] = nn.Linear(nb * enc.dim * u, 128)
                     net.fine_direct.add(i)
         lc = self.args.get("live_curves")   # block_plan: one curve per live level (a third of the live reading)
         net.curves_lv = {float(m): [c] for m, c in lc.items()} if lc else None

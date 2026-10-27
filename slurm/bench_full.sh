@@ -5,15 +5,16 @@
 #   python slurm/submit.py slurm/presets/1gpu.yaml --set gres=gpu:4 --set cpus_per_task=32 --set mem=480G \
 #     --set time=<estimate> -- bash slurm/bench_full.sh <out dir> <checkpoint>
 # Phases (slurm/par.sh, one command per GPU), each skipped / resumed where its outputs exist, so a rerun continues:
-#   A. 16 mm extraction (4 shards), 12 / 8 mm covariance bases, block_plan of the seg tasks (one token folder per task)
+#   A. 16 mm extraction (4 shards), 12 / 8 mm covariance bases (one token folder per seg task)
 #   D. segdec (Dmix cascade, 16 tasks x SEG_SEEDS, the longest first) in LANES lanes (one per GPU), from here on:
-#      it needs only the block_plan, so B and C run beside it (no GPU waits ~2.5 h for them)
+#      it needs nothing of A, so B and C run beside it (no GPU waits ~2.5 h for them)
 #   B. 12 / 8 mm extractions
 #   C. probe readings (caches)
 #   D. probes (every non-seg task, 5 seeds; the externals keep their earlier probes, user 24/10) in 4 lanes of their own
 # Segmentation data on $FAST (user 24/10): the inputs in $FAST/fcorrent/segdec_inputs, the token cache live (each run
 # reads and writes the 16 / 8 mm tokens its volumes lack: no cache job) in $FAST/fcorrent/tok/<out dir name>/<task>, so
-# the seeds after the first only read. block_plan chooses the blocks on seed 0's train / val volumes for every seed.
+# the seeds after the first only read. Blocks: the depth quartiles (taps 3 + last) concatenated at every level, as the
+# probe (user 27/10: no block_plan).
 set -u
 S=$1; CK=$2
 R=/leonardo_scratch/large/userexternal/fcorrent/sfc_runs; MV=/leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench_v2
@@ -64,26 +65,13 @@ for name, ts in pool.items():
     basis[name] = mu, torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))[1][:, -64:]
 torch.save({"basis": basis, "dim": 64}, f"{S}/basis{int(mm)}.pt")
 PY
-echo "[bench] $(date +%H:%M) A: 16 mm, bases, block_plan"
+echo "[bench] $(date +%H:%M) A: 16 mm, bases"
 { for g in 0 1 2 3; do echo "$X --shard $g/4 --out $S/fm --override out_dir=$MX"; done
   for mm in 12 8; do echo "[ -f $S/basis$mm.pt ] || python $S/cmds/basis.py $mm $S $CK"; done
-  echo "[ -f $TOK/blocks.json ] || { python $R/blocks/mk_job.py $CK $TOK 6 4 $SEG && python -m sfc_gdn2.fm.block_plan $TOK/blocks_job.json; }"
 } > $S/cmds/A.txt
 $PAR $S/cmds/A.txt
 
-python - <<PY   # one token folder per task, its own blocks (the union over 16 tasks made every file ~3x wider)
-import json
-from pathlib import Path
-from sfc_gdn2.fm.block_plan import layout
-pl = json.loads(Path("$TOK/blocks.json").read_text())
-for t, bl in pl["tasks"].items():
-    cache = sorted({b for mm, v in bl.items() if float(mm) >= 8 for b in v})
-    tc = pl["curves"].get(t, {})
-    d = Path("$S/tok" if t in "$BIG".split() else "$TOK") / t
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "blocks.json").write_text(json.dumps({"tasks": {t: bl}, "curves": {t: tc}, "cache": cache, "layout": layout(cache),
-                                               "cache_curves": {mm: [tc.get(mm, "mean")] for mm in ("16", "8")}}, indent=1))
-PY
+for t in $SEG; do mkdir -p $(tokdir $t); done   # one token folder per task
 
 PIDS=""
 lanes() {   # lanes <file> <n> <tag> [env]: n lanes (lane k on GPU k % 4), each taking the file's next line when it frees
@@ -101,8 +89,8 @@ lanes() {   # lanes <file> <n> <tag> [env]: n lanes (lane k on GPU k % 4), each 
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader -l 60 > $S/cmds/gpu.csv 2>&1 &
 G=$!   # GPU use every minute: is any GPU idle, could LANES=8 (2 segdec per GPU) fill it
 
-echo "[bench] $(date +%H:%M) D: segdec (needs only block_plan: runs beside B and C)"
-DM="args.taps=3 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true args.matryoshka=true args.head_w=0.2 args.decoder_c=true args.c_local=true args.refine=3 args.cascade=true args.fine_live4=true args.fine_split=true args.fine_head=mix args.fine_pca=0 args.blocks=auto"
+echo "[bench] $(date +%H:%M) D: segdec (runs beside B and C)"
+DM="args.taps=3 args.image=true args.erase=head args.fine_curves=[raster] args.fine_encoder=true args.matryoshka=true args.head_w=0.2 args.decoder_c=true args.c_local=true args.refine=3 args.cascade=true args.fine_live4=true args.fine_split=true args.fine_head=mix args.fine_pca=0"
 MENU="'probe.menu.sfc_gdn2=[mean, blocks+std, blocks+covsqrt, mean@12mm, blocks+std@12mm, blocks+covsqrt@12mm, mean@8mm, blocks+std@8mm, blocks+covsqrt@8mm]' 'probe.extra.sfc_gdn2={12: $S/fm12/sfc_gdn2, 8: $S/fm8/sfc_gdn2}'"
 P="env SFC_IO_WORKERS=8 sfc bench-probe configs/bench/bench.yaml --seeds 0,1,2,3,4"; O="--override out_dir=$MV probe.tasks=$TV fm.common_root=$R/fm_bench"
 { for sd in $SEG_SEEDS; do for t in $SEG; do   # the finest level per task (summary 24/10): 2 mm for small lesions / landmarks, 8 mm for stroke
