@@ -588,12 +588,13 @@ def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit:
     upper triangle): how the tokens vary together, which their mean drops (notes/loss_stato.md; age 0.374 -> 0.405
     with the mean at two epochs). One pass over the files for both; cached in <d>/_second_order.pt. `fit`: the ids
     the principal directions may come from (the benchmark: tune_subjects' volumes, no test subject of any seed)."""
-    cache = d / "_second_order.pt"
-    if cache.exists() and (c := torch.load(cache))["ids"] == ids:
+    exact = "tricov" in torch.load(d / f"{ids[0]}.pt", map_location="cpu", weights_only=False)["features"]
+    cache = d / ("_second_order_exact.pt" if exact else "_second_order.pt")   # a cache never serves the other method
+    if cache.exists() and (c := torch.load(cache))["ids"] == ids and (not exact or c["fit"] == (sorted(fit) if fit else None)):
         return c["feats"]
-    if "tricov" in torch.load(d / f"{ids[0]}.pt", map_location="cpu", weights_only=False)["features"]:
+    if exact:
         feats = second_order_exact(d, ids, fit=fit)   # dim 16: 16 covariances x 136 ~ one 64-dim covsqrt
-        torch.save({"ids": ids, "feats": feats}, cache)
+        torch.save({"ids": ids, "fit": sorted(fit) if fit else None, "feats": feats}, cache)
         return feats
     g0 = load_globals(d)
     if "covsqrt" in g0[1]:  # computed at extraction (args.cov_basis): nothing to fit or read again
