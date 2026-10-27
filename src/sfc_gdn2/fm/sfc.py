@@ -1131,6 +1131,12 @@ class SFC(Wrapper):
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
         a = self.args
+        if a.get("dense_dec"):   # fm/dense_dec (28/10): the dense control decoder on the cached 16 / 8 mm tokens
+            from .dense_dec import DenseDec
+            net = DenseDec(enc, str(a["token_cache"]).removeprefix("live:"), n_out)
+            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
+                             "curves": list(self.curves), "blocks": None}
+            return net, ["encoder"], SEG_PATCH
         gone = [n for n in SEG_GONE if a.get(n)] + [f"{n}={a[n]}" for n, ok in (("encoder", None), ("fine_head", "mix"),
                                                                                   ("image_kernel", "own")) if a.get(n) not in (None, ok)]
         assert not gone, f"sfc segmentation: decoder args removed in the 27/10 cleanup (Dmix only): {gone}"

@@ -157,7 +157,9 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     for a, b, c in product(*starts):   # one tile at a time
         sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
         with amp():
-            lg = call(net, xp[(slice(None), *sl)][None], None if ctx is None else ctx[None])[0]
+            cx = ctx if ctx is None or not getattr(net, "tile_corner", False) else \
+                torch.cat([ctx.float(), torch.tensor([a, b, c], dtype=torch.float)])   # fm/dense_dec: tokens by corner
+            lg = call(net, xp[(slice(None), *sl)][None], None if cx is None else cx[None])[0]
         out[(slice(None), *sl)] += ((lg.float().sigmoid() if lm else lg.float().softmax(0)) * g).to(out)
         wsum[sl] += g
     wsum = wsum.to(out.device)
@@ -428,6 +430,8 @@ def train(job: dict) -> None:
     if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
         global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
         TILE_CELLS, TILE_MAX = 16, 3e8 * k
+    if hasattr(net, "tile_max"):   # fm/dense_dec: dense activations, tiles of ~160^3 voxels on the token grid
+        TILE_MAX = net.tile_max(k)
     # token cache (SegNet args.token_cache): tiles start on each volume's 16 mm grid and pass (volume, corner) in ctx
     tcache = getattr(net, "cache", None)
     vid = {it["id"]: n for n, it in enumerate(job["items"])}
