@@ -224,16 +224,17 @@ class SegNet(nn.Module):
         from ..data.volume import patch_grid, patchify
 
         kf = self.fine_dims(sp, i)
-        gf = patch_grid(vol.shape, kf).to(z.device)
-        xyz = grid_coords(gf[None], int(gf.prod()))[0][keep]                              # [n, 3]
-        par = ((xyz + 0.5) * torch.tensor(kf, device=z.device) / torch.tensor(k, device=z.device)).long()
-        par = torch.minimum(par, torch.tensor(g, device=z.device) - 1)
+        gl = patch_grid(vol.shape, kf).tolist()
+        gf = _dt(gl, z.device)
+        xyz = grid_coords(gf[None], math.prod(gl))[0][keep]                              # [n, 3]
+        par = ((xyz + 0.5) * _dt(kf, z.device) / _dt(k, z.device)).long()
+        par = torch.minimum(par, _dt(g, z.device) - 1)
         pidx = (par[:, 0] * g[1] + par[:, 1]) * g[2] + par[:, 2]
         t = self.up[i](z)[pidx]
         d = {"xyz": xyz, "gf": gf, "kf": kf, "vol": vol, "sp": sp, "i": i, "keep": keep, "read": None}
         if self._cur is not None and self.fine_tok is not None and i < self.ncached:   # fine_encoder from the cache: the
             ci, corner, _ = self._cur                     # whole-scan reading of this level, last block ++ taps as at 16 mm
-            tf = self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gf.tolist(), kf).to(z.device).float()[keep]
+            tf = self.cache.tokens(ci, 8.0 if i == 0 else 4.0, corner, gl, kf).to(z.device).float()[keep]
             t = t + self.fine_tok[i](self._fproj(i, tf))
         elif self.fine_tok is not None:   # the frozen encoder at this level's patch, live (_read_many); every child (the
             sel = torch.arange(len(xyz), device=z.device)   # extractor's reading without its h ++ h copies and statistics)
@@ -259,7 +260,7 @@ class SegNet(nn.Module):
             return
         pe, mm0 = self.encoder.patch_embed, self.encoder.patch_embed.patch_mm
         pe.patch_mm = self.fine_mm[i]
-        cl = self.enc_curves
+        cl = getattr(self, "live_curves", None) or self.enc_curves
         groups, n = [[]], 0   # calls of at most MIX_MAX tokens (whole tiles), as fine_mix
         for d in rs:
             if groups[-1] and n + len(d["read"][0]) > MIX_MAX:
@@ -391,9 +392,8 @@ class SegNet(nn.Module):
             dev = zd.device
             kf = self.fine_dims(sp, i)
             gf = [-(-v // a) for v, a in zip(vol.shape, kf)]
-            xyz = grid_coords(torch.tensor(gf, device=dev)[None], math.prod(gf))[0]
-            par = torch.minimum(((xyz + 0.5) * torch.tensor(kf, device=dev) / torch.tensor(kp, device=dev)).long(),
-                                torch.tensor(gp, device=dev) - 1)
+            xyz = grid_coords(_dt(gf, dev)[None], math.prod(gf))[0]
+            par = torch.minimum(((xyz + 0.5) * _dt(kf, dev) / _dt(kp, dev)).long(), _dt(gp, dev) - 1)
             pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
             keep = read[pidx].nonzero()[:, 0]
             pre.append((kf, gf, pidx, keep, self._fine_prep(zd, vol, sp, kp, gp, i, keep=keep) if len(keep) else None))
@@ -434,10 +434,11 @@ class SegNet(nn.Module):
         """The current level's head on its candidate cells (the cells without signal: background)."""
         self._cur = st["cur"]
         z, k, j = st["z"], st["k"], st["j"]
-        inside = (patchify_any(st["vol"], k).abs().sum(1) > 0)[: len(z)]
+        cnt, hist = self._cell_counts(st, k, n_out)
+        inside = (cnt > 0)[: len(z)]
         st["fill"].append((j, (st["cand"] & ~inside).nonzero()[:, 0], None))
         st["cand"], st["inside"] = st["cand"] & inside, inside
-        st["hist"] = None if st["yy"] is None else self._hist(*self._cells(st["yy"], k), n_out)
+        st["hist"] = hist
         st["ci"] = st["lg"] = None
         if j >= st["j0"]:
             st["ci"] = st["cand"].nonzero()[:, 0]
@@ -454,6 +455,26 @@ class SegNet(nn.Module):
                     st["r"] = self.rhead[j](z[st["ci"]].detach().float())[:, 0]
                 if self.cuse == "rank":   # filled with the mixed head's best pure class, in the ranker's order
                     st["s"] = -st["r"].detach()
+
+    def _cell_counts(self, st: dict, k, n_out: int) -> tuple:
+        """Per cell of k voxels of the tile / scan: its non-zero voxels and its label counts [N, n_out] (None without
+        labels). The 16 / 8 mm cells (4 k4, 2 k4: the cache's nested grids) are sums of the 4 mm ones, computed once
+        per tile (27/10: every level patchified the whole tile again)."""
+        memo, key = st.setdefault("counts", {}), tuple(int(a) for a in k)
+        if key in memo:
+            return memo[key]
+        k4 = [int(a) for a in st["cur"][2]] if st["cur"] else None
+        f = key[0] // k4[0] if k4 and key[0] % k4[0] == 0 else 0
+        if f in (2, 4) and list(key) == [f * a for a in k4]:
+            gf = [-(-v // a) for v, a in zip(st["vol"].shape, k4)]
+            pool = lambda t: F.pad(t.view(*gf, -1), [0, 0] + [q for a in reversed(gf) for q in (0, -a % f)]) \
+                .view(-(-gf[0] // f), f, -(-gf[1] // f), f, -(-gf[2] // f), f, -1).sum((1, 3, 5)).flatten(0, 2)
+            c4, h4 = self._cell_counts(st, k4, n_out)
+            memo[key] = (pool(c4[:, None].float())[:, 0], None if h4 is None else pool(h4))
+        else:
+            cnt = (patchify_any(st["vol"], k) != 0).sum(1)
+            memo[key] = (cnt, None if st["yy"] is None else self._hist(*self._cells(st["yy"], k), n_out))
+        return memo[key]
 
     def _capply(self, st: dict, n_out: int, train: bool = False, upto=None) -> None:
         """Pure / mixed with this level's threshold; the mixed cells' children read (the next level), or done."""
@@ -691,7 +712,7 @@ class SegNet(nn.Module):
                 sel = torch.zeros(len(z), dtype=torch.bool, device=ci.device)
                 tgt = None
                 if pts is not None:
-                    kk, gg = torch.tensor(k, device=ci.device), torch.tensor(g, device=ci.device)
+                    kk, gg = _dt(k, ci.device), _dt(g, ci.device)
                     ok = ~pts.isnan().any(1)
                     cell = torch.minimum((pts[ok] // kk).long(), gg - 1)
                     cell = (cell[:, 0] * g[1] + cell[:, 1]) * g[2] + cell[:, 2]
@@ -857,6 +878,22 @@ class _Proj:
         return self.lin(self.z[idx].float())
 
 
+_DEV = {}
+
+
+def _dt(vals, dev, dtype=torch.long) -> torch.Tensor:
+    """A small constant (cell dims, grid, offsets) on the device, made once: torch.tensor(list, device=cuda) is a
+    synchronous pageable copy that drains the GPU queue (27/10 profile: ~115 per tile per iteration, ~25 % of the GPU
+    time of the Dmix step, mostly _c_field's 27 offsets)."""
+    key = (tuple(vals) if not isinstance(vals, torch.Tensor) else tuple(vals.tolist()), str(dev), dtype)
+    if (t := _DEV.get(key)) is None:
+        t = _DEV[key] = torch.tensor(key[0], device=dev, dtype=dtype)
+    return t
+
+
+_OFF27 = [v for i in range(3) for j in range(3) for l in range(3) for v in (i - 1, j - 1, l - 1)]
+
+
 def _blocks(cell: torch.Tensor, g, k, S) -> torch.Tensor:
     """A per-cell array [prod(g)] on the grid g of k-voxel cells -> per voxel [*S] (each voxel its cell's value)."""
     v = cell.view(*g)
@@ -869,25 +906,24 @@ def _c_field(f: torch.Tensor, g, k, pts: torch.Tensor) -> torch.Tensor:
     """Tokens' features f [N, C] on grid g of k-voxel cells -> the continuous field at voxels pts [P, 3]: quadratic
     B-spline weights over the 27 nearest cell centres (partition of unity, C1 across cell borders)."""
     dev = f.device
-    kk, gg = torch.tensor(k, device=dev, dtype=torch.float), torch.tensor(g, device=dev)
+    kk, gg = _dt(k, dev, torch.float), _dt(g, dev)
     u = (pts.float() + 0.5) / kk - 0.5                     # position in cell-centre units
     c = u.round()
     d = u - c                                              # [-0.5, 0.5]
     wts = torch.stack([0.5 * (0.5 - d) ** 2, 0.75 - d ** 2, 0.5 * (0.5 + d) ** 2], -1)   # [P, 3 axes, 3]
-    out = 0
-    for i in range(3):
-        for j in range(3):
-            for l in range(3):
-                n = (c.long() + torch.tensor([i - 1, j - 1, l - 1], device=dev)).clamp_min(0)
-                n = torch.minimum(n, gg - 1)
-                ww = wts[:, 0, i] * wts[:, 1, j] * wts[:, 2, l]
-                out = out + ww[:, None] * f[(n[:, 0] * g[1] + n[:, 1]) * g[2] + n[:, 2]]
+    off = _dt(_OFF27, dev).view(27, 3)
+    out, cl = 0, c.long()
+    for o in range(27):   # the 27 neighbours in turn (all at once: a [27, P, C] gather, too large at 2 mm)
+        i, j, l = o // 9, o // 3 % 3, o % 3
+        n = torch.minimum((cl + off[o]).clamp_min(0), gg - 1)
+        ww = wts[:, 0, i] * wts[:, 1, j] * wts[:, 2, l]
+        out = out + ww[:, None] * f[(n[:, 0] * g[1] + n[:, 1]) * g[2] + n[:, 2]]
     return out
 
 
 def _c_local(f: torch.Tensor, g, k, pts: torch.Tensor) -> tuple:
     """The containing cell's features [P, C] and the voxel's offset from that cell's centre, in cells [P, 3]."""
-    kk, gg = torch.tensor(k, device=f.device, dtype=torch.float), torch.tensor(g, device=f.device)
+    kk, gg = _dt(k, f.device, torch.float), _dt(g, f.device)
     u = (pts.float() + 0.5) / kk
     n = torch.minimum(u.floor().long(), gg - 1)
     return f[(n[:, 0] * g[1] + n[:, 1]) * g[2] + n[:, 2]], u - n.float() - 0.5
@@ -895,9 +931,10 @@ def _c_local(f: torch.Tensor, g, k, pts: torch.Tensor) -> tuple:
 
 def _c_image(vol: torch.Tensor, pts: torch.Tensor, r: int = 1) -> torch.Tensor:
     """The voxel's intensity and the voxels at +-1 .. +-r along each axis (clamped at the border) -> [P, 1 + 6 r]."""
-    S = torch.tensor(vol.shape, device=vol.device)
-    off = torch.tensor([[0, 0, 0]] + [[s * d * (a == 0), s * d * (a == 1), s * d * (a == 2)]
-                                      for d in range(1, r + 1) for a in range(3) for s in (1, -1)], device=vol.device)
+    S = _dt(vol.shape, vol.device)
+    off = _dt([v for o in [[0, 0, 0]] + [[s * d * (a == 0), s * d * (a == 1), s * d * (a == 2)]
+                                         for d in range(1, r + 1) for a in range(3) for s in (1, -1)] for v in o],
+              vol.device).view(-1, 3)
     q = torch.minimum((pts[:, None] + off[None]).clamp_min(0), S - 1)
     return vol[q[..., 0], q[..., 1], q[..., 2]].float()
 
@@ -946,13 +983,13 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
     out, prev, budget, kp, gp = {}, None, None, None, None   # prev: the level above's cell scores (-inf: not a parent)
     for mm in FINE:
         k = patch_dims(sp.tolist(), mm)
-        g = patch_grid(vol.shape, k).to(dev)
+        g = _dt(patch_grid(vol.shape, k).tolist(), dev)
         p = patchify(vol, k)
         xyz = grid_coords(g[None], len(p))[0]
         if prev is None:   # 8 mm: every cell
             sel = torch.arange(len(p), device=dev)
         else:              # the children of the top parents, at most `budget` cells
-            par = torch.minimum(((xyz + 0.5) * torch.tensor(k, device=dev) / torch.tensor(kp, device=dev)).long(), gp - 1)
+            par = torch.minimum(((xyz + 0.5) * _dt(k, dev) / _dt(kp, dev)).long(), gp - 1)
             pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
             order = prev.argsort(descending=True)
             n = torch.bincount(pidx, minlength=len(prev))[order].cumsum(0)
@@ -1096,6 +1133,9 @@ class SFC(Wrapper):
             for i in range(len(net.fine_tok)):
                 net.fine_tok[i] = nn.Linear((1 + len(enc.taps)) * enc.dim * u, 128)
                 net.fine_direct.add(i)
+        # the live levels (4 / 2 mm) read along one curve, not the mean of the run's curves (27/10 profile: the live
+        # reading was ~half of the step, 3 curves x 16 blocks per level; the Dmix runs of 24/10 read one, block_plan's)
+        net.live_curves = [a.get("live_curve") or "hilbert"]
         return net, ["encoder"], SEG_PATCH
 
     def extractor(self):
