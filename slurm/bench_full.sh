@@ -57,7 +57,7 @@ DM="args.taps=3 args.image=true args.erase=head args.fine_curves=[raster] args.f
 P="env SFC_IO_WORKERS=8 sfc bench-probe configs/bench/bench.yaml --seeds 0,1,2,3,4"; O="--override out_dir=$MV probe.tasks=$TV fm.common_root=$R/fm_bench"
 { for sd in $SEG_SEEDS; do for t in $SEG; do   # the finest level per task (summary 24/10): 2 mm for small lesions / landmarks, 8 mm for stroke
     case $t in vs_seg|wmh_seg|cmb_seg|fetal_landmarks) gmin=2;; stroke) gmin=8;; *) gmin=4;; esac
-    echo "sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --seeds $sd --resume --tasks $t --fm-set checkpoint=$CK $DM args.cascade_g0=16 args.cascade_gmin=$gmin args.token_cache=live:$(tokdir $t) --override segdec.out=$S/seg segdec.cache=$F/segdec_inputs out_dir=$MV probe.tasks=$TV"
+    echo "sfc bench-segdec configs/bench/bench.yaml --stage train --models sfc_gdn2 --init pretrained --seeds $sd --resume --tasks $t --fm-set checkpoint=$CK $DM args.cascade_g0=16 args.cascade_gmin=$gmin args.token_cache=live:$(tokdir $t) --override segdec.patience=2 segdec.out=$S/seg segdec.cache=$F/segdec_inputs out_dir=$MV probe.tasks=$TV"
   done; done
 } > $S/cmds/Dseg.txt
 # segdec: LANES lanes, one per GPU (its training is CPU-bound: 24/10, two fetal runs on 8 CPUs 2.25 s/it each, ~1 alone)
