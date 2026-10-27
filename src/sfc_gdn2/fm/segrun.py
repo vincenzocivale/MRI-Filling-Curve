@@ -460,20 +460,6 @@ def train(job: dict) -> None:
     rng = np.random.default_rng(job["seed"])
     k, cache = int(job["k"]), Path(job["cache"])
     args = job["cfg"].get("args") or {}
-    if args.get("cascade") and "auto" in (str(args.get("cascade_g0")), str(args.get("cascade_gmin"))):
-        # the cascade's plan from the train / val labels and cached tokens, once per task (<out>.plan.json, reused)
-        pp = Path(job["out"]).with_suffix(".plan.json")
-        if pp.exists():
-            pl = json.loads(pp.read_text())
-        else:
-            from .cascade_plan import plan
-            pl = plan(job["items"], cache, args["token_cache"], task=Path(job["out"]).parts[-3])
-            pp.parent.mkdir(parents=True, exist_ok=True)
-            pp.write_text(json.dumps(pl, indent=1))
-        for a in ("g0", "gmin"):
-            if str(args.get(f"cascade_{a}")) == "auto":
-                args[f"cascade_{a}"] = pl[a]
-        print(f"[seg] cascade plan {pp.name}: g0 {pl['g0']:.0f} mm, g_min {pl['gmin']:.0f} mm, {pl['per_g0']}", flush=True)
     if args.get("blocks") == "auto":   # fm/block_plan's choice for this task, next to the token cache (24/10)
         task = Path(job["out"]).parts[-3]
         pl = json.loads((Path(str(args["token_cache"]).removeprefix("live:")) / "blocks.json").read_text())
