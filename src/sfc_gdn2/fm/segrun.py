@@ -694,6 +694,20 @@ def train(job: dict) -> None:
         return
     load_trained(best.pop("state"))
     net.eval()
+    if os.environ.get("SFC_CASCADE_ORACLE") and getattr(net, "cascade", False) and not LM:
+        # diagnosis (user 27/10): the val Dice / lesion F1 with the cascade as trained and with an oracle gate (every truly
+        # mixed cell read down, the thresholds as calibrated) -> how much the gate loses; nothing written but the log
+        val_v = [load(it) for it in split["val"]]
+        for net.oracle in (False, True):
+            preds = net.cascade_val(val_v, k, amp)
+            dv = float(np.nanmean([dice_on(p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]))
+            pc = [_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), False) for p, v in zip(preds, val_v)], False)
+                  for c in range(1, k)]
+            f1 = [_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), True) for p, v in zip(preds, val_v)], True)
+                  for c in range(1, k)]
+            print(f"[seg] oracle gate {net.oracle}: val Dice {dv:.4f}, pooled per class {np.round(pc, 4).tolist()}, "
+                  f"lesion F1 per class {np.round(f1, 4).tolist()}, refined {net.last_refined:.4f}", flush=True)
+        return
     if "lm_topk" in best:   # the val-chosen cells per landmark for the test and the saved val predictions
         net.ctopk_eval = best["lm_topk"]
     rule, f1 = {}, job.get("select") == "f1"

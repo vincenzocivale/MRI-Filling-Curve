@@ -506,6 +506,8 @@ class SegNet(nn.Module):
                 if int(fp.sum()) > m:
                     fp &= torch.rand(len(fp), device=fp.device) < m / int(fp.sum())
                 mix = tm | fp
+            if not train and hc is not None and getattr(self, "oracle", False):   # segrun SFC_CASCADE_ORACLE: no
+                mix = mix | (self._targets(hc, n_out) == n_out)                    # truly mixed cell is ever filled
             st["info"].append((j, ci, st["lg"], hc))
             st.setdefault("rinfo", []).append(st.get("r"))
             st["fill"].append((j, ci[~mix], st["a"][~mix]))
