@@ -990,7 +990,8 @@ def tricov(t: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor, thr: float, above: dict) -> dict:
+def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor, thr: float, above: dict,
+               keep: dict | None = None) -> dict:
     """The features every head reads on our model (user, 27/10; segmentation decoders keep their own reading): below the
     16 mm extraction, 8 mm on every cell, then 4 and 2 mm only under the cells of the level above whose voxels vary most
     (intensity std of the foreground cells: label-free, the same for every task), as many cells as the level above has
@@ -1036,6 +1037,8 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
                 o = (lab * (int(kk.max()) + 1) + kk).argsort()
                 h = h + enc.flat(x[o], cu, pos=q[o]).float()[o.argsort()]
         pe.patch_mm = mm0
+        if keep is not None:   # fm/dense_dec: each level's cells read and their tokens (the decoder's multigrain input)
+            keep[mm] = (q.short().cpu(), (h / len(curves)).half().cpu(), list(k))
         h = h[fg] / len(curves)
         for j, nm in enumerate(names):
             s, m = torch.std_mean(h[:, j * d: (j + 1) * d], 0, correction=0)
@@ -1134,7 +1137,7 @@ class SFC(Wrapper):
         a = self.args
         if a.get("dense_dec"):   # fm/dense_dec (28/10): the dense control decoder on the cached 16 / 8 mm tokens
             from .dense_dec import DenseDec
-            net = DenseDec(enc, str(a["token_cache"]).removeprefix("live:"), n_out)
+            net = DenseDec(enc, str(a["token_cache"]).removeprefix("live:"), n_out, a.get("dense_mg"))
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}
             return net, ["encoder"], SEG_PATCH
