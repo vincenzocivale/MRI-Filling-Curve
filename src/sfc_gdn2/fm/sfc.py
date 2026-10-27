@@ -68,7 +68,7 @@ class SegNet(nn.Module):
                  cascade_gmin: float = 4.0, cascade_r: float = 0.995, cascade_eps: float = 0.01,
                  cascade_rare: float = 1e-3, cascade_neg: float = 2.0, cascade_topk: int = 2,
                  fine_split: bool = False, fine_head: str = "mix", cascade_warm: int = 0, cascade_topk_eval=(8, 8, 16, 16), fine_live4: bool = False,
-                 dec_cpe: bool = False):
+                 dec_cpe: bool = False, cascade_rank: bool = False):
         super().__init__()
         from dynamic_network_architectures.building_blocks.patch_encode_decode import LayerNormNd, PatchDecode
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
@@ -241,6 +241,16 @@ class SegNet(nn.Module):
             self.register_buffer("taus", torch.full((refine + 1,), 0.0))   # logit margins (0: probability 0.5)
             self.register_buffer("cfreq", torch.zeros(n_out))
             self.register_buffer("tcount", torch.zeros(n_out + 1))
+            # cascade_rank (27/10, user: decoder Delta's test, paired with Dmix in one run): beside the mixed head, a score
+            # per cell trained with ListNet on the gain of reading it further (class-weighted voxels outside its majority,
+            # V. Civale's split ranker, 2fd5e4e) on detached tokens, so Dmix trains as before; the val pass goes down twice,
+            # with the mixed head's margins and with the scores (own thresholds rtaus, the same calibration)
+            self.crank, self.cuse = bool(cascade_rank), "mixed"
+            if self.crank:
+                mk = lambda d: nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 128), nn.GELU(), nn.Linear(128, 1))
+                self.rhead = nn.ModuleList([mk(encoder.dim)] + [mk(128) for _ in range(refine)])
+                self.register_buffer("rtaus", torch.full((refine + 1,), 0.0))
+                self._rloss = None
         # decoder D (23/10, user, notes/decoder_cascade.md): fine_split: the encoder's live 2 mm reading as one sequence
         # per connected group of the cells read (no jump between far regions read as neighbours along one sequence);
         # fine_head "mlp": the cascade's levels without the refine blocks along the curve, a per-token MLP on [parent,
@@ -822,6 +832,11 @@ class SegNet(nn.Module):
             lg = st["lg"].detach().float()
             st["a"] = lg[:, :n_out].argmax(1)
             st["s"] = lg.gather(1, st["a"][:, None])[:, 0] - lg.scatter(1, st["a"][:, None], float("-inf")).logsumexp(1)
+            if getattr(self, "crank", False):   # the ranker's score (high: read further); "rank": the fill order is -score
+                with torch.autocast(z.device.type, enabled=False):
+                    st["r"] = self.rhead[j](z[st["ci"]].detach().float())[:, 0]
+                if self.cuse == "rank":   # filled with the mixed head's best pure class, in the ranker's order
+                    st["s"] = -st["r"].detach()
 
     def _capply(self, st: dict, n_out: int, train: bool = False, upto=None) -> None:
         """Pure / mixed with this level's threshold; the mixed cells' children read (the next level), or done."""
@@ -845,7 +860,7 @@ class SegNet(nn.Module):
             S = cand
         else:
             ci, hc = st["ci"], None if st["hist"] is None else st["hist"][st["ci"]]
-            mix = st["s"] < self.taus[j]
+            mix = st["s"] < (self.rtaus if getattr(self, "cuse", "mixed") == "rank" else self.taus)[j]
             if train:   # the true mixed cells + at most cneg x as many predicted mixed (hard negatives)
                 tm = self._targets(hc, n_out) == n_out
                 fp = mix & ~tm
@@ -854,6 +869,7 @@ class SegNet(nn.Module):
                     fp &= torch.rand(len(fp), device=fp.device) < m / int(fp.sum())
                 mix = tm | fp
             st["info"].append((j, ci, st["lg"], hc))
+            st.setdefault("rinfo", []).append(st.get("r"))
             st["fill"].append((j, ci[~mix], st["a"][~mix]))
             S = torch.zeros_like(cand)
             S[ci[mix]] = True
@@ -904,10 +920,17 @@ class SegNet(nn.Module):
         # every tile of the batch down the levels together (24/10: one live reading per level, not per tile)
         add = lambda a, b: b if a is None else [u + v for u, v in zip(a, b)]
         fin, aux = None, [None] * len(self.lhead)
+        rl, nl = 0.0, 0
+        wc = torch.where(self.cfreq > 0, self.cfreq.clamp_min(1).rsqrt(), torch.zeros_like(self.cfreq))
         for (z, k, g, vol, _, cur, yy), c in zip(tiles, self._cascade_many(tiles, n_out, train=True)):
             lv, S, kl, gl = c["lv"], c["S"], c["k"], c["g"]
-            for j, ci, lg, hc in c["info"]:
+            for (j, ci, lg, hc), r in zip(c["info"], c.get("rinfo", [None] * len(c["info"]))):
                 keep = hc.sum(1) > 0
+                if r is not None and int(keep.sum()) > 1:   # ListNet: the cells' scores against their gains in the tile
+                    hw = hc[keep].float() * wc
+                    gain = hw.sum(1) - hw.max(1).values
+                    if float(gain.sum()) > 0:
+                        rl, nl = rl - (gain / gain.sum() * r[keep].float().log_softmax(0)).sum(), nl + 1
                 t = self._targets(hc[keep], n_out)
                 self.tcount += torch.bincount(t, minlength=n_out + 1).float()
                 f = self.tcount / self.tcount.sum()
@@ -925,6 +948,9 @@ class SegNet(nn.Module):
         if fin is None:   # nothing mixed in the batch
             dev = parts[0][0].device
             fin = [torch.zeros((), device=dev), torch.zeros((), device=dev)] + [torch.zeros(n_out, device=dev)] * 3
+        if getattr(self, "crank", False):   # segrun.matryoshka_step adds it to the loss (its own parameters, detached input)
+            r0 = sum(p.sum() * 0 for p in self.rhead.parameters())   # every ranker parameter in the graph (DDP, unused levels)
+            self._rloss = (self._rloss if self._rloss is not None else 0) + r0 + (rl / nl if nl else 0)
         return fin, [a for a in aux if a is not None]
 
     @torch.no_grad()
@@ -1002,8 +1028,10 @@ class SegNet(nn.Module):
                         o = s.argsort(descending=True)
                         okp = (ls[o].cumsum(0)[:, 1:] <= (1 - self.cr) * tot[None, 1:]).all(1)
                         m = int(okp.long().cumprod(0).sum())   # the longest prefix of most confident cells that may be filled
-                        self.taus[j] = float(s[o[m - 1]]) if m else float("inf")
-                        print(f"[cascade] level {j}: tau {float(self.taus[j]):.4f}, filled {m}/{len(s)} cells", flush=True)
+                        taus = self.rtaus if getattr(self, "cuse", "mixed") == "rank" else self.taus
+                        taus[j] = float(s[o[m - 1]]) if m else float("inf")
+                        print(f"[cascade] {getattr(self, 'cuse', 'mixed')} level {j}: tau {float(taus[j]):.4f}, filled {m}/{len(s)} cells",
+                              flush=True)
                 for i in live:
                     st = {a: mv(b, dev) for a, b in sts[i].items()}
                     with amp():
@@ -1572,7 +1600,7 @@ class SFC(Wrapper):
                      fine_split=bool(self.args.get("fine_split")), fine_head=self.args.get("fine_head") or "mix",
                      cascade_warm=int(self.args.get("cascade_warm") or 0),
                      cascade_topk_eval=self.args.get("cascade_topk_eval") or (8, 8, 16, 16),
-                     fine_live4=bool(self.args.get("fine_live4")))
+                     fine_live4=bool(self.args.get("fine_live4")), cascade_rank=bool(self.args.get("cascade_rank")))
         bj = Path(str(self.args.get("token_cache") or "").removeprefix("live:")) / "blocks.json"
         net.blocks_lv = lv
         if lv and getattr(net, "fine_tok", None) is not None:   # each finer level reads its own blocks (1 or 2) straight

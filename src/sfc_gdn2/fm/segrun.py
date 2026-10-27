@@ -420,6 +420,8 @@ def matryoshka_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
         fin = f if fin is None else [u + v for u, v in zip(fin, f)]
         aux = a if aux is None else [[u + v for u, v in zip(p, q)] for p, q in zip(aux, a)] + (aux[len(a):] or a[len(aux):])
     loss = sums_loss(fin) + getattr(net, "head_w", 1.0) * sum(sums_loss(a) for a in aux)
+    if getattr(net, "_rloss", None) is not None:   # cascade_rank: the ranker's ListNet (its own parameters)
+        loss, net._rloss = loss + net._rloss, None
     loss.backward()
     return loss.detach()
 
@@ -658,6 +660,12 @@ def train(job: dict) -> None:
                 net.eval()
                 if getattr(net, "cascade", False) and not LM:   # one pass: the levels' thresholds on val and the val predictions
                     preds = net.cascade_val(val_v, k, amp)
+                    if getattr(net, "crank", False):   # cascade_rank: the same val pass with the ranker's order (logged only)
+                        net.cuse = "rank"
+                        try:
+                            rds = [dice_on(p, v["y"].to(dev), k) for p, v in zip(net.cascade_val(val_v, k, amp), val_v)]
+                        finally:
+                            net.cuse = "mixed"
                 else:   # probabilities kept for the landmark tasks (a point per landmark from each class's map)
                     preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).to(dev)
                              for v in val_v]
@@ -667,6 +675,10 @@ def train(job: dict) -> None:
                 val = float(np.nanmean(ds))
                 rec = {"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
+                if getattr(net, "crank", False) and getattr(net, "cascade", False) and not LM:
+                    rec |= {"val_dice_vol": [float(d) for d in ds], "rank_dice_vol": [float(d) for d in rds],
+                            "rank_dice": float(np.nanmean(rds))}
+                    msg += f" rank dice {rec['rank_dice']:.4f}"
                 if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
                     mre = float(np.mean([mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
                     rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
