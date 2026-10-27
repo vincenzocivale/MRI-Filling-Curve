@@ -664,7 +664,10 @@ class SegNet(nn.Module):
                         ls = torch.cat([sts[i]["hist"][sts[i]["ci"]].scatter(1, sts[i]["a"][:, None], 0.0)
                                         for i in live if sts[i]["ci"] is not None]).to(dev)
                         o = s.argsort(descending=True)
-                        okp = (ls[o].cumsum(0)[:, 1:] <= (1 - self.cr) * tot[None, 1:]).all(1)
+                        lim = (1 - self.cr) * tot[None, 1:]
+                        if getattr(self, "csmin", None) is not None:   # segrun SFC_CASCADE_FP: never a whole small lesion
+                            lim = torch.minimum(lim, 0.5 * self.csmin[None, 1:].to(dev))
+                        okp = (ls[o].cumsum(0)[:, 1:] <= lim).all(1)
                         m = int(okp.long().cumprod(0).sum())   # the longest prefix of most confident cells that may be filled
                         taus = self.rtaus if getattr(self, "cuse", "mixed") == "rank" else self.taus
                         taus[j] = float(s[o[m - 1]]) if m else float("inf")
