@@ -61,7 +61,7 @@ def job_script(spec: dict, cfg: dict, run: Path, gpus: int) -> str:
 def evaluation(spec: dict, ckpt: Path, run: Path, gpus: int) -> list[str]:
     """The one evaluation of a checkpoint (user, 16/10: always the full reading, chosen on val), outputs in `run`: the
     tuning extraction split over the GPUs (--shard); on the CPU the probe's readings (`probe.readings`: means of the
-    last and intermediate blocks, stds, covariance square roots, the 2x-reading means) while the GPUs share the SEGDEC
+    last and intermediate blocks, stds, covariance square roots) while the GPUs share the SEGDEC
     pilots; then the probe over every reading on all GPUs. `collect` keeps the best val Dice."""
     fm, lines = f"--fm-set checkpoint={ckpt} {spec.get('eval_fm', '')}".rstrip(), []  # eval_fm: e.g. args.patch_mm=12
     if spec.get("tasks"):

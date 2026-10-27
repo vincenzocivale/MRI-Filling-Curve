@@ -1022,7 +1022,6 @@ class SFC(Wrapper):
             self.run_cfg["data"]["patch_mm"] = float(self.args["patch_mm"])
         self.curves = list(self.args.get("curves") or self.run_cfg["objective"]["view_curves"])
         self._extract = None  # built on first use: preprocessing workers never load GDN-2
-        self._cov = None      # args.cov_basis: {basis: {name: (mu, P)}, dim} of probe.second_order
 
     def preprocess(self, image: Image) -> dict:
         if not isinstance(image, str):
@@ -1103,6 +1102,8 @@ class SFC(Wrapper):
         if self._extract is None:
             from ..model import encoder_extractor
 
+            gone = [a for a in ("tta", "cov_basis", "per_curve") if a in self.args]   # removed 27/10 (no probe read them)
+            assert not gone, f"sfc extraction: args removed in the 27/10 cleanup: {gone}"
             enc = self._encoder().to(self.device).eval().requires_grad_(False)
             if self.args.get("encoder") != "none":  # also the depth quartiles n/4, n/2, 3n/4 (probe menu: mean_b<block>;
                 n = len(enc.blocks)                  # 27/10, the rule of every token model in the benchmark)
@@ -1111,9 +1112,7 @@ class SFC(Wrapper):
             obj = self.run_cfg["objective"]
             self._extract = encoder_extractor(enc, self.curves, "both", int(self.run_cfg["seed"]),
                                               obj.get("fg_threshold", 0.05), crop=bool(self.args.get("crop")),
-                                              embed_only=self.args.get("encoder") == "none",
-                                              reverse=bool(self.args.get("tta")),  # also the *_tta readings
-                                              per_curve_stats=self.args.get("per_curve", True))
+                                              embed_only=self.args.get("encoder") == "none")
             self._extract_enc = enc
         return self._extract
 
@@ -1138,26 +1137,11 @@ class SFC(Wrapper):
 
         bi, g = block(out["bi"][0, : len(x)], 0), grid.tolist()
         feats = {"map": bi.T.reshape(bi.shape[1], *g), "fg": out["fg"][0, : len(x)].view(*g)}  # last block's tokens
-        stats = ("mean", "std", "mean_tta", "std_tta", *(k for k in out if "@" in k))   # k@<curve>: one curve's
-        for stat in stats:  # per block: last (no suffix), taps (_b<block>)
-            if stat in out:
-                feats |= {stat + ("" if j == 0 else f"_b{self._taps[j - 1] + 1}"): block(out[stat][0], j) for j in range(n)}
-        if self.args.get("cov_basis"):  # the second-order reading computed here, without storing the token map (20/10)
-            if self._cov is None:
-                self._cov = torch.load(self.args["cov_basis"], map_location=dev)
-            t, dim = bi.float(), self._cov["dim"]
-            keep = t.norm(dim=1) > 0
-            iu = torch.triu_indices(dim, dim, device=dev)
-            for name, sel in (("covsqrt", keep), ("covsqrt_fg", keep & out["fg"][0, : len(x)])):
-                mu, pr = self._cov["basis"][name]
-                z = (t[sel] - mu) @ pr
-                z = z - z.mean(0)
-                e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dim, device=dev))
-                feats[name] = ((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half()
+        for stat in ("mean", "std"):  # per block: last (no suffix), taps (_b<block>)
+            feats |= {stat + ("" if j == 0 else f"_b{self._taps[j - 1] + 1}"): block(out[stat][0], j) for j in range(n)}
         # multigrain (27/10): the head features below 16 mm; off for another patch size (args.patch_mm) or encoder none
         if self.args.get("multigrain", True) and not self.args.get("patch_mm") and self.args.get("encoder") != "none":
-            above = {s: v[: self._dim].half() for s, v in feats.items() if s.startswith(("mean", "std")) and "@" not in s
-                     and "tta" not in s}
+            above = {s: v[: self._dim].half() for s, v in feats.items() if s.startswith(("mean", "std"))}
             fgk = out["fg"][0, : len(x)]   # 16 mm covariances per block, foreground tokens (exact: bench.probe.second_order)
             fgk = fgk if fgk.any() else torch.ones_like(fgk)
             for j in range(n):
