@@ -6,7 +6,8 @@ bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in ou
 - features: model.encoder_extractor (the read of every evaluation): the whole patch grid along each curve of
   `args.curves` (default: the run's view_curves, averaged), forward + reversed. `map` = bi tokens on the patch grid
   [2d, gx, gy, gz]; `mean` = bi averaged over the foreground patches (the pyramid top, what volume probes read:
-  canonical).
+  canonical). Below it (multigrain, 27/10: the only reading under a head; args.multigrain false: off) 8 mm dense and
+  4 / 2 mm in the most varied cells, g<mm>:mean / std per block, concatenated by bench.probe (see `multigrain`).
 - meta: `source_to_input` (source voxel index -> canonical voxel index), returned by `seg_input`.
 - segmentation (bench-segdec, fm/segrun.py): the frozen encoder + Primus' decoder (`PatchDecode`, the decoder of the
   OpenMind / nnFoundation token models: transposed convs, LayerNorm, GELU, He init 1e-2) from each token to a 16^3
@@ -1483,6 +1484,71 @@ def sums(logits: torch.Tensor, lab: torch.Tensor, w, k: int) -> list:
             z.scatter_add(0, lab, torch.ones_like(lab, dtype=torch.float)) * w]
 
 
+FINE = (8.0, 4.0, 2.0)   # multigrain levels below the 16 mm extraction
+
+
+@torch.no_grad()
+def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor, thr: float, above: dict) -> dict:
+    """The features every head reads on our model (user, 27/10; segmentation decoders keep their own reading): below the
+    16 mm extraction, 8 mm on every cell, then 4 and 2 mm only under the cells of the level above whose voxels vary most
+    (intensity std of the foreground cells: label-free, the same for every task), as many cells as the level above has
+    foreground cells (each level costs about the 8 mm one). The cells read as one sequence per 26-connected group along each curve
+    (averaged), as the cascade's live reading. Per level the foreground mean and std of each block (last ++ taps, one
+    copy of h) -> g<mm>:mean, g<mm>:std_b<k>, ...; a level the scan cannot hold (cells under 8 voxels, nothing left)
+    repeats the level above (`above`: the 16 mm statistics, same names). bench.probe concatenates the levels."""
+    from ..curves import grid_coords, keys
+    from ..data.volume import patch_dims, patch_grid, patchify
+
+    assert enc.bidir != "late", "multigrain: one-stream encoders (bi = h ++ h)"
+    dev, d, pe, mm0 = vol.device, enc.dim, enc.patch_embed, enc.patch_embed.patch_mm
+    names = ["", *(f"_b{t + 1}" for t in enc.taps)]
+    out, prev, budget, kp, gp = {}, None, None, None, None   # prev: the level above's cell scores (-inf: not a parent)
+    for mm in FINE:
+        k = patch_dims(sp.tolist(), mm)
+        g = patch_grid(vol.shape, k).to(dev)
+        p = patchify(vol, k)
+        xyz = grid_coords(g[None], len(p))[0]
+        if prev is None:   # 8 mm: every cell
+            sel = torch.arange(len(p), device=dev)
+        else:              # the children of the top parents, at most `budget` cells
+            par = torch.minimum(((xyz + 0.5) * torch.tensor(k, device=dev) / torch.tensor(kp, device=dev)).long(), gp - 1)
+            pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
+            order = prev.argsort(descending=True)
+            n = torch.bincount(pidx, minlength=len(prev))[order].cumsum(0)
+            top = order[(n <= budget) & (prev[order] > -torch.inf)]
+            sel = torch.isin(pidx, top).nonzero()[:, 0]
+        if not fine_ok(k) or not len(sel):
+            prev = None
+            break
+        q, fg = xyz[sel], p[sel].mean(1) > thr
+        nfg, fg = int(fg.sum()), fg if fg.any() else torch.ones_like(fg)
+        lab = SegNet._groups(q, g) if len(sel) < len(p) else torch.zeros(len(sel), dtype=torch.long, device=dev)
+        pe.patch_mm = mm
+        h = 0
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            x = pe(p[sel], pe.weights(sp, k))
+            cu = torch.cat([lab.new_zeros(1), torch.bincount(lab).cumsum(0)]).int()
+            for c in curves:
+                kk = keys(c, q, g, seed)
+                o = (lab * (int(kk.max()) + 1) + kk).argsort()
+                h = h + enc.flat(x[o], cu, pos=q[o]).float()[o.argsort()]
+        pe.patch_mm = mm0
+        h = h[fg] / len(curves)
+        for j, nm in enumerate(names):
+            s, m = torch.std_mean(h[:, j * d: (j + 1) * d], 0, correction=0)
+            out[f"g{int(mm)}:mean{nm}"], out[f"g{int(mm)}:std{nm}"] = m.half(), s.half()
+        prev = torch.full((len(p),), -torch.inf, device=dev)
+        prev[sel[fg]] = p[sel[fg]].float().std(1)
+        budget, kp, gp = max(nfg, 1), k, g
+    for mm in FINE:   # the levels not read: the level above's
+        for nm in names:
+            for st in ("mean", "std"):
+                key = f"g{int(mm)}:{st}{nm}"
+                if key not in out:
+                    out[key] = out.get(f"g{int(mm) * 2}:{st}{nm}", above.get(f"{st}{nm}"))
+    return out
+
+
 def checkpoint_path(path: str | Path, step: int | None = None) -> Path:
     p = Path(path)
     if p.is_file():
@@ -1649,7 +1715,8 @@ class SFC(Wrapper):
         pe.patch_mm = prepared["meta"].get("patch_mm", pe.patch_mm)
         a, c = prepared["value"]
         k, grid = prepared["k"], prepared["grid"]
-        x = patchify(prepared["volume"].to(dev).float() * a + c, k.tolist())
+        vol = prepared["volume"].to(dev).float() * a + c
+        x = patchify(vol, k.tolist())
         out = self.extractor()({"patches": [x], "grid": grid[None].to(dev), "k": k[None].to(dev),
                                 "spacing": prepared["spacing"][None].to(dev)})
         d, n = self._dim, len(self._taps) + 1
@@ -1675,6 +1742,15 @@ class SFC(Wrapper):
                 z = z - z.mean(0)
                 e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dim, device=dev))
                 feats[name] = ((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half()
+        # multigrain (27/10): the head features below 16 mm; off for another patch size (args.patch_mm) or encoder none
+        if self.args.get("multigrain", True) and not self.args.get("patch_mm") and self.args.get("encoder") != "none":
+            above = {s: v[: self._dim].half() for s, v in feats.items() if s.startswith(("mean", "std")) and "@" not in s
+                     and "tta" not in s}
+            if pe.patch_mm == self.run_cfg["data"]["patch_mm"]:
+                feats |= multigrain(self._extract_enc, self.curves, int(self.run_cfg["seed"]), vol,
+                                    prepared["spacing"].to(dev), self.run_cfg["objective"].get("fg_threshold", 0.05), above)
+            else:   # read at fallback_mm (whole-body scans): every level repeats it
+                feats |= {f"g{int(m)}:{s}": v for m in FINE for s, v in above.items()}
         return {"features": feats, "canonical": "mean", "derived": [],
                 "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt)}}
 

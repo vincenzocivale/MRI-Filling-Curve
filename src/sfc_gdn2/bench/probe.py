@@ -668,6 +668,9 @@ def readings(m: str, d: Path, fit: set | None = None, extra: dict | None = None)
     w = f["mean"].shape[1] // 2
     if torch.equal(f["mean"][:, :w], f["mean"][:, w:]):  # one-stream encoder: bi = h ++ h, keep h (half the fits)
         f = {k: v[:, :w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
+    for k in [k for k in f if f"g8:{k}" in f]:   # multigrain (fm/sfc.multigrain, 27/10): each statistic of every level
+        f[k] = torch.cat([f[k], *(f[f"g{m}:{k}"] for m in (8, 4, 2))], 1)   # (16 / 8 / 4 / 2 mm), concatenated
+    # ponytail: covsqrt stays the 16 mm tokens' (second_order reads the 16 mm map), per level if it ever matters
     so = second_order(d, ids, fit=fit)
     cov = so["covsqrt"]
 
