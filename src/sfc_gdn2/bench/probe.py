@@ -414,12 +414,12 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
 
 def run(models: dict[str, Path], tasks: dict[str, dict], vols: pd.DataFrame, splits: pd.DataFrame,
         out_dir: Path, seeds: list[int], device: str = "cuda", common: dict[str, Path] | None = None,
-        menu: dict[str, list[str]] | None = None, extra: dict | None = None) -> pd.DataFrame:
+        menu: dict[str, list[str]] | None = None) -> pd.DataFrame:
     """Every task x seed x model; only the volumes all `common` models (default `models`) have.
     `menu`: per model, the only stored features its probes may choose from (default: all of them).
     Writes `<out>/<task>/s<seed>/<model>.json`."""
     fit = set(vols.loc[vols["subject"].isin(tune_subjects(splits)), "id"])  # second order: PCA from these only
-    loaded = {m: readings(m, d, fit, (extra or {}).get(m)) for m, d in models.items()}
+    loaded = {m: readings(m, d, fit) for m, d in models.items()}
     for m, keep in (menu or {}).items():
         if m in loaded:
             ids, feats = loaded[m]
@@ -529,22 +529,6 @@ def _init_basis(basis, dim):
     _BASIS = basis, dim
 
 
-def _covsqrt_one(path: Path) -> dict:
-    basis, dim = _BASIS
-    f = torch.load(path, map_location="cpu", weights_only=False)["features"]
-    t = f["map"].float().flatten(1).T
-    keep = t.norm(dim=1) > 0
-    toks = {"covsqrt": t[keep]} | ({"covsqrt_fg": t[keep & f["fg"].flatten()]} if "fg" in f else {})
-    iu, out = torch.triu_indices(dim, dim), {}
-    for name, tk in toks.items():
-        mu, p = basis[name]
-        z = (tk - mu) @ p
-        z = z - z.mean(0)
-        e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dim))
-        out[name] = ((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].half()
-    return out
-
-
 def _unpack(v: torch.Tensor) -> torch.Tensor:
     """Upper triangles [..., d (d + 1) / 2] -> symmetric matrices [..., d, d]."""
     d = int((math.isqrt(8 * v.shape[-1] + 1) - 1) // 2)
@@ -567,65 +551,27 @@ def _tri_sqrt_one(path: Path) -> dict:
     return {"S": ((v * e.clamp(min=0).sqrt()[:, None]) @ v.transpose(1, 2))[:, iu[0], iu[1]].half()}
 
 
-def second_order_exact(d: Path, ids: list[str], dim: int = 16, fit: set | None = None) -> dict[str, torch.Tensor]:
-    """second_order from the covariances stored at extraction (fm/sfc multigrain, 27/10; user: exact, every level): the
-    `dim` principal directions per level and block (16, user 27/10: the 16 together ~ the 2080 numbers of the other
-    models' one covsqrt per map) = eigenvectors of the mean covariance of the `fit` volumes (exact, every
-    foreground token; the within-volume variation the reading describes, not the spread between scans), then per volume
-    the square root of P^T C P of each, upper triangle, concatenated -> "covsqrt" (16 / 8 / 4 / 2 mm x the depth
-    quartiles). Every covariance of a volume in one batched matmul + eigh, the files read by SFC_IO_WORKERS processes."""
+def second_order(d: Path, ids: list[str], dim: int = 16, fit: set | None = None) -> dict[str, torch.Tensor]:
+    """{"covsqrt": [N, covariances x dim (dim + 1) / 2]} of our model, from the covariances stored at extraction (fm/sfc
+    multigrain, 27/10; user: exact, every level): the `dim` principal directions per level and block (16, user 27/10:
+    the 16 together ~ the 2080 numbers of the other models' one covsqrt per map) = eigenvectors of the mean covariance
+    of the `fit` volumes (exact, every foreground token; the within-volume variation the reading describes, not the
+    spread between scans; the benchmark: tune_subjects' volumes, no test subject of any seed), then per volume the
+    square root of P^T C P of each (iSQRT-COV normalisation), upper triangle, concatenated (16 / 8 / 4 / 2 mm x the
+    depth quartiles). Every covariance of a volume in one batched matmul + eigh, the files read by SFC_IO_WORKERS
+    processes; cached in <d>/_second_order_exact.pt (with the fit set)."""
+    cache = d / "_second_order_exact.pt"
+    key = sorted(fit) if fit else None
+    if cache.exists() and (c := torch.load(cache))["ids"] == ids and c["fit"] == key:
+        return c["feats"]
+    assert "tricov" in torch.load(d / f"{ids[0]}.pt", map_location="cpu", weights_only=False)["features"], \
+        f"{d}: no stored covariances (an extraction before the multigrain one, 27/10)"
     cand = [d / f"{i}.pt" for i in ids if fit is None or i in fit]
     tot = sum(r["C"] for r in _pmap(_tri_one, cand)) / len(cand)
     P = torch.linalg.eigh(_unpack(tot))[1][..., -dim:].contiguous()
     S = torch.stack([r["S"] for r in _pmap(_tri_sqrt_one, [d / f"{i}.pt" for i in ids], (P, dim))])   # [N, cov, T]
-    return {"covsqrt": S.flatten(1)}
-
-
-def second_order(d: Path, ids: list[str], dim: int = 64, sample: int = 400, fit: set | None = None) -> dict[str, torch.Tensor]:
-    """{"covsqrt": [N, dim (dim + 1) / 2], and "covsqrt_fg" when the files hold `fg`}: per volume the square root of
-    the covariance of its tokens (`map`: every patch; _fg: foreground patches only) projected on the first `dim`
-    principal directions of 200 such tokens from each of `sample` random volumes (no label; iSQRT-COV normalisation,
-    upper triangle): how the tokens vary together, which their mean drops (notes/loss_stato.md; age 0.374 -> 0.405
-    with the mean at two epochs). One pass over the files for both; cached in <d>/_second_order.pt. `fit`: the ids
-    the principal directions may come from (the benchmark: tune_subjects' volumes, no test subject of any seed)."""
-    exact = "tricov" in torch.load(d / f"{ids[0]}.pt", map_location="cpu", weights_only=False)["features"]
-    cache = d / ("_second_order_exact.pt" if exact else "_second_order.pt")   # a cache never serves the other method
-    if cache.exists() and (c := torch.load(cache))["ids"] == ids and (not exact or c["fit"] == (sorted(fit) if fit else None)):
-        return c["feats"]
-    if exact:
-        feats = second_order_exact(d, ids, fit=fit)   # dim 16: 16 covariances x 136 ~ one 64-dim covsqrt
-        torch.save({"ids": ids, "fit": sorted(fit) if fit else None, "feats": feats}, cache)
-        return feats
-    g0 = load_globals(d)
-    if "covsqrt" in g0[1]:  # computed at extraction (args.cov_basis): nothing to fit or read again
-        pos = {i: k for k, i in enumerate(g0[0])}
-        return {k: g0[1][k][[pos[i] for i in ids]] for k in ("covsqrt", "covsqrt_fg") if k in g0[1]}
-
-    def tokens(i):  # {"covsqrt": all tokens, "covsqrt_fg": foreground tokens}
-        f = torch.load(d / f"{i}.pt", map_location="cpu", weights_only=False)["features"]
-        t = f["map"].float().flatten(1).T
-        keep = t.norm(dim=1) > 0
-        return {"covsqrt": t[keep]} | ({"covsqrt_fg": t[keep & f["fg"].flatten()]} if "fg" in f else {})
-
-    g = torch.Generator().manual_seed(0)
-    pool: dict[str, list] = {}
-    cand = [i for i in ids if fit is None or i in fit]
-    for k in torch.randperm(len(cand), generator=g)[:sample].tolist():
-        for name, t in tokens(cand[k]).items():
-            pool.setdefault(name, []).append(t[torch.randperm(len(t), generator=g)[:200]])
-    basis = {}
-    for name, ts in pool.items():
-        x = torch.cat(ts)
-        mu = x.mean(0)
-        basis[name] = mu, torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))[1][:, -dim:]
-    out = {name: [] for name in basis}
-    for n, r in enumerate(_pmap(_covsqrt_one, [d / f"{i}.pt" for i in ids], (basis, dim))):
-        for name, c in r.items():
-            out[name].append(c)
-        if n % 1000 == 0:
-            print(f"[tune] second order {n}/{len(ids)}", flush=True)
-    feats = {name: torch.stack(v) for name, v in out.items()}
-    torch.save({"ids": ids, "feats": feats}, cache)
+    feats = {"covsqrt": S.flatten(1)}
+    torch.save({"ids": ids, "fit": key, "feats": feats}, cache)
     return feats
 
 
@@ -691,11 +637,11 @@ def second_order_ext(d: Path, ids: list[str], keys: list[str], dim: int = 64, sa
     return feats
 
 
-def readings(m: str, d: Path, fit: set | None = None, extra: dict | None = None) -> tuple[list[str], dict[str, torch.Tensor]]:
-    """The readings a model's tuning probe chooses from on val, together with head and L2 (user, 16/10: try them all,
-    keep the best on val). Ours: the last block's foreground mean (`mean`), the intermediate blocks' (mean_b<k>), all
-    of them concatenated (`blocks`), each with the per-channel std, with the covariance square root (`second_order`,
-    all patches or foreground only). Another model: its stored features."""
+def readings(m: str, d: Path, fit: set | None = None) -> tuple[list[str], dict[str, torch.Tensor]]:
+    """The readings a model's probe chooses from on val, together with head and L2. Ours (the official menu, bench.yaml
+    probe.menu): `mean` (the last block's foreground mean), `blocks+std` (the depth quartiles' means and stds),
+    `blocks+covsqrt` (their means and the exact covariance square roots, second_order), each statistic with its
+    multigrain levels 16 / 8 / 4 / 2 mm concatenated. Another model: its stored features, each map +std / +covsqrt."""
     ids, f = load_globals(d)
     if not m.startswith("sfc_gdn2"):   # its stored features, plus each map's std / covariance (as ours, 21/10)
         keys = [k for k in _map_keys(d, ids) if k in f]   # the maps every volume holds (load_globals' intersection)
@@ -712,42 +658,12 @@ def readings(m: str, d: Path, fit: set | None = None, extra: dict | None = None)
         f = {k: v[:, :w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
     for k in [k for k in f if f"g8:{k}" in f]:   # multigrain (fm/sfc.multigrain, 27/10): each statistic of every level
         f[k] = torch.cat([f[k], *(f[f"g{m}:{k}"] for m in (8, 4, 2))], 1)   # (16 / 8 / 4 / 2 mm), concatenated
-    so = second_order(d, ids, fit=fit)
-    cov = so["covsqrt"]
-
-    def cat(*xs):
-        return torch.cat(xs, 1)
-
-    inter = sorted(k[4:] for k in f if k.startswith("mean_b"))  # "_b8", "_b12"
-    menu = {"mean": f["mean"], "mean+covsqrt": cat(f["mean"], cov)}
-    if inter:
-        blocks = cat(*(f["mean" + b] for b in inter), f["mean"])
-        menu |= {"mean" + b: f["mean" + b] for b in inter} | {"blocks": blocks, "blocks+covsqrt": cat(blocks, cov)}
-    if "std" in f:
-        menu |= {"mean+std": cat(f["mean"], f["std"]), "mean+std+covsqrt": cat(f["mean"], f["std"], cov)}
-        if inter:
-            menu["blocks+std"] = cat(blocks, *(f["std" + b] for b in inter), f["std"])
-    if "covsqrt_fg" in so:
-        menu["mean+covsqrt_fg"] = cat(f["mean"], so["covsqrt_fg"])
-    for c in sorted({k.split("@")[1].split("_b")[0] for k in f if k.startswith("mean@")}):  # one curve, not the average
-        menu[f"mean@{c}"] = f[f"mean@{c}"]
-        if inter and f"std@{c}" in f:
-            menu[f"blocks+std@{c}"] = cat(*(f[f"mean@{c}" + b] for b in inter), f[f"mean@{c}"],
-                                          *(f[f"std@{c}" + b] for b in inter), f[f"std@{c}"])
-    for mm, dd in (extra or {}).items():  # the same model read at another patch size (probe.extra, 20/10): mean@<mm>mm, ...
-        ids2, g = load_globals(Path(dd))
-        pos = {i: k for k, i in enumerate(ids2)}
-        assert set(ids) <= set(pos), (dd, len(set(ids) - set(pos)))
-        g = {k: v[[pos[i] for i in ids]] for k, v in g.items()}
-        g = {k: v[:, :w] if k.startswith(("mean", "std")) and v.shape[1] == 2 * w else v for k, v in g.items()}
-        menu[f"mean@{mm}mm"] = g["mean"]
-        if "covsqrt" in g:
-            menu[f"mean+covsqrt@{mm}mm"] = cat(g["mean"], g["covsqrt"])
-        if inter and "std" in g:
-            menu[f"blocks+std@{mm}mm"] = cat(*(g["mean" + b] for b in inter), g["mean"], *(g["std" + b] for b in inter), g["std"])
-            if "covsqrt" in g:
-                menu[f"blocks+covsqrt@{mm}mm"] = cat(*(g["mean" + b] for b in inter), g["mean"], g["covsqrt"])
-    return ids, menu  # the 2x-reading means (*_tta) were never chosen on p7 (17/10): dropped
+    cov = second_order(d, ids, fit=fit)["covsqrt"]
+    inter = sorted((k[4:] for k in f if k.startswith("mean_b")), key=lambda b: int(b[2:]))  # "_b4", "_b8", "_b12"
+    blocks = torch.cat([*(f["mean" + b] for b in inter), f["mean"]], 1)
+    menu = {"mean": f["mean"], "blocks+std": torch.cat([blocks, *(f["std" + b] for b in inter), f["std"]], 1),
+            "blocks+covsqrt": torch.cat([blocks, cov], 1)}
+    return ids, menu
 
 
 def _tune_one(m: str, d: Path, tname: str, cfg: dict, rows: pd.DataFrame, device: str, keep=None) -> dict:

@@ -105,7 +105,7 @@ def bench_probe(cfg: dict, args) -> None:
     missing = [str(d) for d in (common or {}).values() if not d.is_dir()]
     assert not missing, f"--common: no features in {missing} (set fm.common_root)"
     bp.run(models, tasks, vols, splits, Path(args.out or cfg["probe"]["out"]), seeds, args.device, common,
-           cfg["probe"].get("menu"), cfg["probe"].get("extra"))
+           cfg["probe"].get("menu"))
 
 
 def bench_segdec(cfg: dict, args) -> None:
