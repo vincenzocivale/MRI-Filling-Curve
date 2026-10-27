@@ -123,6 +123,10 @@ class NnsslWrapper(Wrapper):
         if self.is_primus:
             self._tokens = None
             self.network.eva.register_forward_hook(lambda m, i, o: setattr(self, "_tokens", o[0]))
+            n = len(self.network.eva.blocks)   # + the quarter blocks n/4, n/2, 3n/4 (the probes' ViT rule, 27/10)
+            self._taps = {}
+            for b in (n // 4, n // 2, 3 * n // 4):
+                self.network.eva.blocks[b - 1].register_forward_hook(lambda m, i, o, b=b: self._taps.__setitem__(b, o))
 
     def _build(self, n_out: int):
         arch = self._ap["architecture_plans"]
@@ -180,7 +184,8 @@ class NnsslWrapper(Wrapper):
         if self.is_primus:
             self.network(x)
             w, h, d = (s // p for s, p in zip(x.shape[2:], self.network.down_projection.proj.kernel_size))
-            return {"tokens": rearrange(self._tokens, "b (w h d) c -> b c w h d", w=w, h=h, d=d)[0]}
+            return {k: rearrange(t, "b (w h d) c -> b c w h d", w=w, h=h, d=d)[0]
+                    for k, t in {"tokens": self._tokens, **{f"tokens_b{b}": t for b, t in self._taps.items()}}.items()}
         skips = self.network.encoder(x)
         return {f"stage{i}": skips[i][0] for i in sorted({*self.stages, len(skips) - 1})}
 
