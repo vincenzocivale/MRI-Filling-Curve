@@ -55,7 +55,6 @@ from .worker import build, fail, prepared
 TILE_CELLS = 10
 AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
-JOINT_MAX = 2e8   # voxels x classes of a batch that joint_step keeps in graphs (~5 GB of fp32 logits and softmax)
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
 
@@ -136,52 +135,31 @@ def tile_of(patch, align, k: int = 2):
 
 
 @torch.no_grad()
-def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None, align=None) -> torch.Tensor:
-    """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch). align: tile corners
-    on that grid (token cache), the volume padded so that the last tile ends on it."""
+def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Tensor:
+    """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch); ours (fm/sfc.SegNet,
+    the cascade) the whole scan in one pass, coarse to fine."""
     lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
-    if lm and getattr(net, "decoder_c", False) and ctx is not None:   # our landmark cascade: whole scan, coarse to fine
+    if getattr(net, "cascade", False) and ctx is not None:
         with amp():
-            return net.landmark_predict(x, ctx.to(x.device), n_out)
-    if getattr(net, "matryoshka", False) and ctx is not None and not lm:   # the whole scan in one pass (no tiles)
-        with amp():
-            return net.matryoshka_predict(x, ctx.to(x.device), n_out)
-    if getattr(net, "adaptive", False) and ctx is not None and not lm:
-        with amp():
-            return net.adaptive_predict(x, ctx.to(x.device), n_out)
+            return net.landmark_predict(x, ctx.to(x.device), n_out) if lm else net.cascade_predict(x, ctx.to(x.device), n_out)
     S = tuple(x.shape[1:])
-    patch = tile_of(patch, align, n_out)
     patch = S if patch is None else tuple(patch)
-    if align is not None:
-        tgt = [p + -(-max(s - p, 0) // a) * a for s, p, a in zip(S, patch, align)]
-        xp, _ = pad_to(x, None, tgt)
-    else:
-        xp, _ = pad_to(x, None, patch)
+    xp, _ = pad_to(x, None, patch)
     P = tuple(xp.shape[1:])
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
               for s, p in zip(P, patch)]
-    if align is not None:
-        starts = [np.unique(np.append(np.asarray(st) // a * a, s - p)) for st, a, s, p in zip(starts, align, P, patch)]
     g = gaussian(patch, x.device)
     # fp16 accumulator on the device if it takes <= 1/4 of the free memory, else on the CPU (nnU-Net's predictor does
     # both; "fits at all" left the tiles' forward no room: nnF CNN OOM on whole-body TotalSeg grids)
     fits = x.is_cuda and n_out * math.prod(P) * 2 <= torch.cuda.mem_get_info(x.device)[0] / 4
     out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device if fits else "cpu")
     wsum = torch.zeros(P, device=x.device)
-    corners = list(product(*starts))
-    # token-cache decoders take a batch of tiles at once (their refine levels pack the tiles' sequences): up to 8, at
-    # most ~JOINT_MAX voxels x classes; the others one tile at a time, as before
-    nb = 1 if align is None else max(1, min(8, int(JOINT_MAX // (n_out * math.prod(patch)))))
-    for j in range(0, len(corners), nb):
-        cs = corners[j: j + nb]
-        sls = [(slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2])) for a, b, c in cs]
+    for a, b, c in product(*starts):   # one tile at a time
+        sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
         with amp():
-            cx = None if ctx is None else torch.stack([ctx if align is None else
-                                                       torch.cat([ctx, torch.tensor(co, dtype=ctx.dtype)]) for co in cs])
-            logits = call(net, torch.stack([xp[(slice(None), *sl)] for sl in sls]), cx)
-        for lg, sl in zip(logits, sls):
-            out[(slice(None), *sl)] += ((lg.float().sigmoid() if lm else lg.float().softmax(0)) * g).to(out)
-            wsum[sl] += g
+            lg = call(net, xp[(slice(None), *sl)][None], None if ctx is None else ctx[None])[0]
+        out[(slice(None), *sl)] += ((lg.float().sigmoid() if lm else lg.float().softmax(0)) * g).to(out)
+        wsum[sl] += g
     wsum = wsum.to(out.device)
     for c in range(n_out):  # one class at a time: dividing the whole fp16 accumulator by an fp32 tensor made an fp32
         out[c].div_(wsum)   # copy of it (whole-body nnF grids: 60 GB accumulator, RAM OOM at 240 GB)
@@ -227,7 +205,7 @@ def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
     at a time, every model's decoder as it is."""
     parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
         [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
-    if getattr(net, "decoder_c", False):   # ours: every tile in one call, the cascade's levels read for all at once (24/10)
+    if getattr(net, "cascade", False):   # ours: every tile in one call, the cascade's levels read for all at once (24/10)
         with amp():
             loss = net.landmark_sums([a.to(dev).float() for a, _, _ in parts], [b.to(dev) for _, b, _ in parts],
                                      [u.to(dev) for _, _, u in parts], parts[0][1].shape[1] + 1)
@@ -358,8 +336,8 @@ def batch_sums(logits: torch.Tensor, y: torch.Tensor, k: int) -> tuple:
 
 
 def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
-    """The gradient of loss_fn on the whole batch, one scan at a time (wrappers with `seg_microbatch`, many classes:
-    decoder F on TotalSeg did not fit with 2 tiles). The soft Dice sums over the batch before dividing, so a first
+    """The gradient of loss_fn on the whole batch, one scan at a time (volumes of several shapes: whole-volume
+    models, patch None; or a wrapper's `seg_microbatch` with many classes). The soft Dice sums over the batch before dividing, so a first
     pass without gradient gives the batch's sums; then each scan backpropagates a loss linear in its own sums with
     the batch's derivatives as coefficients: the same gradient as the batch of 2, one more forward pass."""
     parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
@@ -383,60 +361,24 @@ def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
     return sum(s[0] for s in sums) / n + 1 - dice.mean()
 
 
-def joint_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
-    """micro_step's loss and gradient with every scan's graph kept: one forward per scan and one backward (tiles of
-    several shapes that fit together: the token-cache runs' 16 cm tiles; micro_step's no-grad pass doubled the work)."""
-    parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
-        [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
-    sums = []
-    for xi, yi, ci in parts:
-        with amp():
-            logits = call(net, xi.to(dev).float(), ci)
-        sums.append(batch_sums(logits, yi.to(dev), k))
-    n = sum(s[1] for s in sums)
-    inter, psum, tsum = (sum(s[j] for s in sums) for j in (2, 3, 4))
-    dice = (2 * inter[1:] + 1e-5) / (psum[1:] + tsum[1:] + 1e-5)
-    loss = sum(s[0] for s in sums) / n + 1 - dice.mean()
-    loss.backward()
-    return loss.detach()
-
-
 def sums_loss(t: list) -> torch.Tensor:
-    """SegNet.adaptive_sums' sums -> CE per voxel + 1 - mean soft Dice of the classes > 0 (loss_fn's)."""
+    """SegNet.cascade_sums' sums -> CE per voxel + 1 - mean soft Dice of the classes > 0 (loss_fn's)."""
     ce, n, inter, psum, tsum = t
     return ce / n.clamp_min(1) + 1 - ((2 * inter[1:] + 1e-5) / (psum[1:] + tsum[1:] + 1e-5)).mean()
 
 
-def matryoshka_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
-    """Decoder F matryoshka (21/10): the final prediction's loss plus each cell head's (16, 8, 4 mm), one backward."""
-    parts = [(t, u, v) for t, u, v in zip(x, y, c)] if isinstance(x, list) else [(x, y, c)]
-    if getattr(net, "cascade", False) and len(parts) > 1:   # the cascade takes tiles of several shapes in one call (24/10:
-        parts = [([t.to(dev).float() for t, _, _ in parts], [u.to(dev) for _, u, _ in parts],   # its levels read for all)
-                  [v.to(dev) for _, _, v in parts])]
-    fin, aux = None, None
-    for xi, yi, ci in parts:
-        with amp():
-            f, a = net.matryoshka_sums(*((xi, yi, ci) if isinstance(xi, list) else (xi.to(dev).float(), yi.to(dev), ci.to(dev))), k)
-        fin = f if fin is None else [u + v for u, v in zip(fin, f)]
-        aux = a if aux is None else [[u + v for u, v in zip(p, q)] for p, q in zip(aux, a)] + (aux[len(a):] or a[len(aux):])
-    loss = sums_loss(fin) + getattr(net, "head_w", 1.0) * sum(sums_loss(a) for a in aux)
+def cascade_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
+    """Ours (fm/sfc.SegNet, the Dmix cascade): the point head's loss plus head_w x each level head's, one backward; tiles
+    of several shapes in one call (24/10: the levels read for all of them at once)."""
+    if isinstance(x, list):
+        x, y, c = [t.to(dev).float() for t in x], [u.to(dev) for u in y], [v.to(dev) for v in c]
+    else:
+        x, y, c = x.to(dev).float(), y.to(dev), c.to(dev)
+    with amp():
+        fin, aux = net.cascade_sums(x, y, c, k)
+    loss = sums_loss(fin) + net.head_w * sum(sums_loss(a) for a in aux)
     if getattr(net, "_rloss", None) is not None:   # cascade_rank: the ranker's ListNet (its own parameters)
         loss, net._rloss = loss + net._rloss, None
-    loss.backward()
-    return loss.detach()
-
-
-def adaptive_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
-    """Decoder F adaptive (21/10): the batch's sums (final prediction, cell head) in one pass (a list of tiles of
-    several shapes: one pass each), one backward of both losses."""
-    parts = [(t, u, v) for t, u, v in zip(x, y, c)] if isinstance(x, list) else [(x, y, c)]
-    fin = aux = None
-    for xi, yi, ci in parts:
-        with amp():
-            f, a = net.adaptive_sums(xi.to(dev).float(), yi.to(dev), ci.to(dev), k)
-        fin = f if fin is None else [u + v for u, v in zip(fin, f)]
-        aux = a if aux is None else [u + v for u, v in zip(aux, a)]
-    loss = sums_loss(fin) + sums_loss(aux)
     loss.backward()
     return loss.detach()
 
@@ -475,7 +417,7 @@ def train(job: dict) -> None:
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
-    if getattr(net, "decoder_c", False):   # decoder C trains on large tiles (whole scans mostly): 16 cells of 16 mm per
+    if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
         global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
         TILE_CELLS, TILE_MAX = 16, 3e8 * k
     # token cache (SegNet args.token_cache): tiles start on each volume's 16 mm grid and pass (volume, corner) in ctx
@@ -599,20 +541,11 @@ def train(job: dict) -> None:
                 queue.append(drawer.submit(draw))
             tb = time.time()
             opt.zero_grad(set_to_none=True)
-            # cm tiles of a few voxels: both graphs fit, one backward (20/10); TotalSeg's 0.3 mm scans make 16 cm tiles
-            # of ~1e7 voxels x 50 classes: then micro_step (the two graphs of joint_step went OOM)
-            vox = sum(t.numel() for t in x) if isinstance(x, list) else x.numel()
             if LM:
                 loss = landmark_step(net, x, y, c, amp, dev)
                 logits = torch.zeros(1, device=dev)
-            elif getattr(net, "matryoshka", False):
-                loss = matryoshka_step(net, x, y, c, k, amp, dev)
-                logits = torch.zeros(1, device=dev)
-            elif getattr(net, "adaptive", False):
-                loss = adaptive_step(net, x, y, c, k, amp, dev)
-                logits = torch.zeros(1, device=dev)
-            elif tcache is not None and (isinstance(x, list) or k > 10) and vox * k <= JOINT_MAX:
-                loss = joint_step(net, x, y, c, k, amp, dev)
+            elif getattr(net, "cascade", False):
+                loss = cascade_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             elif isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
                 loss = micro_step(net, x, y, c, k, amp, dev)
@@ -643,7 +576,7 @@ def train(job: dict) -> None:
                         finally:
                             net.cuse = "mixed"
                 else:   # probabilities kept for the landmark tasks (a point per landmark from each class's map)
-                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).to(dev)
+                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).to(dev)
                              for v in val_v]
                     if job.get("select") != "mre":
                         preds = [p.argmax(0) for p in preds]
@@ -694,7 +627,7 @@ def train(job: dict) -> None:
         by = {1.0: best["val_mre"]}
         for f in (0.5, 2.0):
             net.ctopk_eval = [max(1, round(t * f)) for t in t0k]
-            by[f] = float(np.mean([mre_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]).to(dev),
+            by[f] = float(np.mean([mre_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).to(dev),
                                           v["y"].to(dev), v["sp"], k) for v in val_v]))
         f = min(by, key=lambda t: (by[t], t))
         best |= {"lm_topk": [max(1, round(t * f)) for t in t0k], "val_mre": by[f],
@@ -714,7 +647,7 @@ def train(job: dict) -> None:
             for it in split["val"]:
                 if not (pv / f"{it['id']}.npz").exists():
                     v = load(it)
-                    save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]),
+                    save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]),
                               v["grid_from_gt"])
                     del v
         best.pop("state")
@@ -737,7 +670,7 @@ def train(job: dict) -> None:
             f = pv / f"{it['id']}.npz"
             if not f.exists():
                 v = load(it)
-                save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]),
+                save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]),
                           v["grid_from_gt"])
                 del v
             z = np.load(f)
@@ -766,7 +699,7 @@ def train(job: dict) -> None:
             continue
         t1 = time.time()
         v = load(it)
-        probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"])
+        probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])
         lab, _, _ = gt_labels(it["seg"], it.get("classes"), it.get("ignore"))
         pl = None
         if rule:   # the val-chosen post-processing, then scored as the argmax of its one-hot
@@ -792,7 +725,7 @@ def train(job: dict) -> None:
         if (pv / f"{it['id']}.npz").exists():
             continue
         v = load(it)
-        save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"], v["align"]), v["grid_from_gt"])
+        save_pred(pv, it["id"], sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]), v["grid_from_gt"])
         del v
     provenance(job, split, out_p, ckpt, {"best": best, "test_dice": out["test_dice"], "postproc": out["postproc"]})
     part.unlink(missing_ok=True)   # the decoder checkpoint (.best.pt) is kept (user, 23/10)
