@@ -52,7 +52,7 @@ class DenseDec(nn.Module):
                 k = [a * int(mm // 4) for a in k4]
                 c0 = [c // kk for c, kk in zip(corner, k)]
                 n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
-                t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float()
+                t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float().reshape(*n, -1)
                 g = self.tok[j](t).permute(3, 0, 1, 2)[None]                       # [1, TOK, *n] on the cell grid
                 # cell centres -> voxels: the cells' grid spans n*k voxels from c0*k; the tile is a crop of it
                 full = [a * kk for a, kk in zip(n, k)]
