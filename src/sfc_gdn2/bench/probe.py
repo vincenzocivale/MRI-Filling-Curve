@@ -265,25 +265,25 @@ def fit(x: torch.Tensor, y: torch.Tensor, kind: Kind, l2: float, hidden: int, se
     return head.eval().requires_grad_(False)
 
 
-GRID_PARAMS = 12e6  # ponytail: stacked parameters per L-BFGS (its 100-step history ~ 200x that in fp32, ~10 GB); bigger grids in chunks
+HIST_BYTES = 12e9   # L-BFGS history (2 fp32 vectors of the stacked parameters per step) of one fit_grid call
 
 
 def fit_grid(x: torch.Tensor, y: torch.Tensor, kind: Kind, hidden: int, l2s=L2_GRID, seed: int = 0) -> list[Head]:
     """fit() for every L2 of `l2s` at once (user, 24/10: the one-by-one fits, launch-bound, timed the cv5 probes out):
-    the heads (same init as fit) are stacked and one L-BFGS minimises the sum of their independent objectives. The shared
+    the heads (same init as fit) are stacked and one L-BFGS minimises the sum of their independent objectives, always the
+    whole grid in one batch (user, 27/10: also the multigrain heads, ~8M parameters each): the history is shortened to fit
+    HIST_BYTES (100 steps up to ~15M stacked parameters, ~25 for 7 heads of 8.4M), the same rule for every model. The shared
     line search makes the optimum slightly different from fit()'s (the external models keep their earlier fit() probes: same test, user 24/10). A non-finite
     head (one diverged L2 poisons the shared steps) -> that chunk is fitted one by one with fit()."""
     def new():
         torch.manual_seed(seed)
         return Head(x.shape[1], kind.outputs(), hidden, getattr(kind, "ordinal", False)).to(x.device)
-    per = max(1, int(GRID_PARAMS // sum(p.numel() for p in new().parameters())))
-    if len(l2s) > per:
-        return [h for i in range(0, len(l2s), per) for h in fit_grid(x, y, kind, hidden, l2s[i:i + per], seed)]
     heads = [new() for _ in l2s]
+    hist = int(min(100, max(10, HIST_BYTES // (8 * len(l2s) * sum(p.numel() for p in heads[0].parameters())))))
     params, _ = torch.func.stack_module_state(heads)
     base = copy.deepcopy(heads[0]).to("meta")
     lam = torch.tensor(l2s, device=x.device)
-    opt = torch.optim.LBFGS(list(params.values()), max_iter=500, line_search_fn="strong_wolfe")
+    opt = torch.optim.LBFGS(list(params.values()), max_iter=500, history_size=hist, line_search_fn="strong_wolfe")
 
     def closure():
         opt.zero_grad()
