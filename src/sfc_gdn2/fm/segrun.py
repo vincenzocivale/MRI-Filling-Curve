@@ -423,6 +423,18 @@ def train(job: dict) -> None:
         net.csmin = torch.tensor([float("inf")] + [float(sz[c][0]) if c in sz else float("inf") for c in range(1, k)],
                                  device=dev)
         print(f"[seg] cascade fingerprint: smallest train lesion per class {net.csmin.tolist()[1:]} voxels", flush=True)
+    if os.environ.get("SFC_CASCADE_MARGIN") and getattr(net, "cascade", False) and job.get("select") != "mre":
+        # each level reads further cmult x the cells its val calibration asks for (user 27/10, CMB: thresholds set on
+        # the val's 4 lesions filled 6 of 22 test lesions as background; a cell read too many costs a little compute,
+        # one filled too many a lesion): cmult = 1 + 2 / sqrt(n), n = the val's components of its rarest class
+        n = {c: 0 for c in range(1, k)}
+        for it in [it for it in job["items"] if it["split"] == "val"]:
+            y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
+            y = y[0] if y.ndim == 4 else y
+            for c in n:
+                n[c] += _components(y == c)[1]
+        net.cmult = 1 + 2 / math.sqrt(max(1, min(n.values())))
+        print(f"[seg] cascade margin: val components per class {n}, each level reads x{net.cmult:.2f}", flush=True)
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
     if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
@@ -694,7 +706,8 @@ def train(job: dict) -> None:
         return
     load_trained(best.pop("state"))
     net.eval()
-    if getattr(net, "csmin", None) is not None:   # SFC_CASCADE_FP: the levels' thresholds again on val, by that rule
+    if getattr(net, "csmin", None) is not None or getattr(net, "cmult", None):   # SFC_CASCADE_FP / _MARGIN: the levels'
+        # thresholds again on val, by that rule
         val_v = [load(it) for it in split["val"]]
         net.cascade_val(val_v, k, amp)
         del val_v
