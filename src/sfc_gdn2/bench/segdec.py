@@ -64,7 +64,7 @@ def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init
           fm_set: list[str] | None = None) -> dict:
     """`resume`: a run whose json is written (same iters) is skipped, for chained jobs (a killed run always resumes
     from its checkpoints, fm/segrun.py). `val_only` (pretraining tuning): the best val Dice, no test volume read."""
-    s = bench["segdec"] | ({"iters": iters, "val_every": max(iters // 2, 1)} if iters else {})
+    s = bench["segdec"] | ({"iters": iters, "val_every": min(int(bench["segdec"]["val_every"]), iters)} if iters else {})
     if s.get("screen"):   # exploratory: short, dead runs stopped, kept apart from the tables (bench.yaml)
         s |= {"val_every": 1250, "out": str(s["out"]).rstrip("/") + "_screen"}
     out = Path(s["out"]) / task / f"s{seed}" / f"{model}__{init}.json"
