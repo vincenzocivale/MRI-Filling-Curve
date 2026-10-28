@@ -421,12 +421,14 @@ class Pretrainer:
                 self.skipped += 1
             event = None
             if self.gp:   # the step's watched terms averaged over the GPUs: every rank takes the same decision
-                keys = [k for k in self.gp.watched if k in out]
-                lo = torch.stack([out[k].detach().float().reshape(()) for k in keys])
+                # (value, present) for every watched term: the same shape on every rank, a term a rank lacks this step
+                # (no rec row in its batch: lejepa's `if r:`) counts on the others only (Simone's review: a rank-dependent
+                # length would hang NCCL)
+                lo = torch.tensor([[float(out[k]), 1.0] if k in out else [0.0, 0.0] for k in self.gp.watched],
+                                  device=self.device)
                 if dist.is_initialized():
                     dist.all_reduce(lo)
-                    lo /= self.world
-                event = self.gp.update(step, mm, dict(zip(keys, lo.tolist())))   # a cut reaches the lr at sched.step()
+                event = self.gp.update(step, mm, {k: s / n for k, (s, n) in zip(self.gp.watched, lo.tolist()) if n > 0})
             self.sched.step()
             self.step, self.consumed = step, self.consumed + self.world
             if step % t.get("log_every", 50) == 0 or step == t["steps"]:
