@@ -269,7 +269,7 @@ class NativeDec(nn.Module):
             h = self.dec[s - 1](torch.cat([self.up[s - 1](h), skips[s - 1]], 1))
         return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
 
-    tile_max = DenseDec.tile_max
+    tile_max = staticmethod(DenseDec.tile_max)
 
     @torch.no_grad()
     def place(self, x: torch.Tensor, ctx: torch.Tensor, level: int, predict) -> None:
