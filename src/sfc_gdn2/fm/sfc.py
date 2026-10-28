@@ -828,12 +828,18 @@ class SegNet(nn.Module):
                     d = lg.min(0).values.expand(math.prod(gj), -1).clone()
                     d[ci] = lg
                     cells.append((F.logsigmoid(d), _dt(kj, dev), _dt(gj, dev), gj))
+            sc = torch.full((n_out - 1, *S), -math.inf, device=dev) if cells else None
             for qq in q.split(1 << 18):
                 s = self.c_logits(lv, x[0], qq)[:, 1:n_out].float()
+                if sc is None:
+                    out[1:, qq[:, 0], qq[:, 1], qq[:, 2]] = s.sigmoid().T.half()
+                    continue
                 for d, kk, gg, gj in cells:
                     c = torch.minimum(qq // kk, gg - 1)
                     s = s + lam * d[(c[:, 0] * gj[1] + c[:, 1]) * gj[2] + c[:, 2]]
-                out[1:, qq[:, 0], qq[:, 1], qq[:, 2]] = s.sigmoid().T.half()
+                sc[:, qq[:, 0], qq[:, 1], qq[:, 2]] = s.T
+            if sc is not None:   # exp(score - its max): the sigmoid of the sum underflows the uint8 saves (whole-map ties)
+                out[1:] = (sc - sc.flatten(1).amax(1).view(-1, 1, 1, 1)).exp().half()
             self.last_refined = float(len(q) / math.prod(S))
             return out
         finally:
