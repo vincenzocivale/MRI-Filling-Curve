@@ -137,18 +137,26 @@ class GrainPlateau:
     ends. Plateau: every `every` steps, the mean loss of the watched steps over the last `window` steps against the
     same mean `gap` steps before improves by less than `rate` per 1000 steps, `patience` checks in a row (both windows
     inside the stage: >= window + gap steps per stage). The loss is the step's mean over the GPUs (the same decision on
-    every rank); a run resumed from a checkpoint without this state replays its history.csv (the logged steps)."""
+    every rank); a run resumed from a checkpoint without this state replays its history.csv (the logged steps).
+    A stage is a list of grains, or (28/10, sub-token targets in cascade) a dict {grains, set: {LeJEPA attribute: value},
+    watch: a loss term of out}: the sets of every stage up to the current one hold (rec_contrast 0.2, rec_cells 8, ...)
+    and the plateau is read on the watched term over every step (watch "loss", the default: the finest grain's steps).
+    fresh: true (a new cascade from a checkpoint of another schedule): no state or history taken over, the first
+    stage starts at the resumed step."""
 
-    def __init__(self, g: dict, hist: list[dict], patch_mm: float):
-        self.stages = [[float(m) for m in st] for st in g["stages"]]
+    def __init__(self, g: dict, hist: list[dict], patch_mm: float, start: int = 0):
+        self.stages = [{**st, "grains": [float(m) for m in st["grains"]]} if isinstance(st, dict)
+                       else {"grains": [float(m) for m in st]} for st in g["stages"]]
+        self.watched = sorted({st.get("watch", "loss") for st in self.stages} | {"loss"})
         self.window, self.gap, self.every = int(g.get("window", 250)), int(g.get("gap", 500)), int(g.get("every", 250))
         self.rate, self.patience = float(g.get("rate", 0.03)), int(g.get("patience", 2))
         self.min_samples = int(g.get("min_samples", 5))   # per window (a smoke's toy windows: 1)
         self.factor, self.max_cuts = float(g.get("lr_factor", 0.3)), int(g.get("lr_cuts", 3))
-        self.stage, self.cuts, self.start, self.hits, self.done = int(g.get("start_stage", 0)), 0, 0, 0, False
+        self.stage, self.cuts, self.start, self.hits, self.done = int(g.get("start_stage", 0)), 0, start, 0, False
         self.rec, self.events = [], []
         for h in hist:   # replayed: the checks of the logged steps give the state the rule had on them
-            self.update(int(h["step"]), float(h.get("mm", patch_mm)), float(h["loss"]))
+            self.update(int(h["step"]), float(h.get("mm", patch_mm)),
+                        {k: float(h[k]) for k in self.watched if k in h and h[k] == h[k]})
 
     def state_dict(self) -> dict:
         return {k: getattr(self, k) for k in ("stage", "cuts", "start", "hits", "done", "rec", "events")}
@@ -158,21 +166,29 @@ class GrainPlateau:
 
     @property
     def choices(self) -> list[float]:
-        return self.stages[self.stage]
+        return self.stages[self.stage]["grains"]
+
+    def sets(self) -> dict:
+        """The LeJEPA attributes the stages so far set (later stages win)."""
+        return {k: v for st in self.stages[: self.stage + 1] for k, v in (st.get("set") or {}).items()}
 
     @property
     def scale(self) -> float:
         return self.factor ** self.cuts
 
-    def update(self, step: int, mm: float, loss: float) -> str | None:
-        """Records the step; returns the event of a plateau (next stage, lr cut, done) or None."""
-        self.rec.append((step, mm, loss))
+    def update(self, step: int, mm: float, terms) -> str | None:
+        """Records the step (terms: {loss term: the step's value}, or the loss alone); returns the event of a plateau
+        (next stage, lr cut, done) or None."""
+        terms = terms if isinstance(terms, dict) else {"loss": float(terms)}
+        self.rec.append((step, mm, terms))
         if self.done or step % self.every or step - self.start < self.window + self.gap:
             return None
-        watch = min(self.choices) if self.cuts == 0 else None   # grain stages: the finest grain; lr cuts: every step
+        key = self.stages[self.stage].get("watch", "loss") if self.cuts == 0 else "loss"
+        # grain stages: the finest grain's steps (a watched term: every step); lr cuts: the whole loss, every step
+        watch = min(self.choices) if self.cuts == 0 and key == "loss" else None
 
         def mean(a, b):
-            v = [lo for s, m, lo in self.rec if a < s <= b and (watch is None or m == watch)]
+            v = [t[key] for s, m, t in self.rec if a < s <= b and key in t and (watch is None or m == watch)]
             return sum(v) / len(v) if len(v) >= self.min_samples else None
         now, before = mean(step - self.window, step), mean(step - self.gap - self.window, step - self.gap)
         if now is None or before is None:
@@ -184,7 +200,9 @@ class GrainPlateau:
         self.hits, self.start = 0, step
         if self.cuts == 0 and self.stage < len(self.stages) - 1:
             self.stage += 1
-            ev = f"stage {self.stage}: grains {self.choices}"
+            st = self.stages[self.stage]
+            ev = f"stage {self.stage}: grains {self.choices}" + (f", set {st['set']}, watch {st.get('watch', 'loss')}"
+                                                                    if st.get("set") else "")
         elif self.cuts < self.max_cuts:
             self.cuts += 1
             ev = f"lr cut {self.cuts}: x{self.scale:.3g}"
@@ -262,18 +280,31 @@ class Pretrainer:
             r = self.net.load_state_dict(sd, strict=False)
             self.log(f"[lejepa] init from {t['init_from']}: new {r.missing_keys}, dropped {r.unexpected_keys}", flush=True)
         if g := t.get("grain_plateau"):
-            self.gp = GrainPlateau(g, self.hist, float(cfg["data"]["patch_mm"]))
-            if self._gp_state:
+            fresh = bool(g.get("fresh")) and not ckpt.exists()   # a new cascade: the source run's state and history ignored
+            self.gp = GrainPlateau(g, [] if fresh else self.hist, float(cfg["data"]["patch_mm"]), self.step if fresh else 0)
+            if self._gp_state and not fresh:
                 self.gp.load_state_dict(self._gp_state)
+            self._gp_apply()
             for pg in self.opt.param_groups:   # the restored lr times the scheduler's cuts
                 pg["lr"] = t["lr"] * lr_factor(self.step, t) * self.gp.scale
             self.log(f"[lejepa] grain_plateau: stage {self.gp.stage} {self.gp.choices}, lr cuts {self.gp.cuts}, "
                      f"{len(self.gp.rec)} steps of record", flush=True)
 
+    def _gp_apply(self) -> None:
+        """The grain_plateau stages' sets (rec_contrast, rec_edge, rec_cells ...) on the model, at start and on each event."""
+        for k, v in self.gp.sets().items():
+            assert hasattr(self.net, k), f"grain_plateau set: LeJEPA has no attribute {k}"
+            setattr(self.net, k, v)
+        if self.gp.sets():
+            self.log(f"[lejepa] grain_plateau sets {self.gp.sets()}", flush=True)
+
     def _restore(self, path: Path) -> None:
         c = torch.load(path, map_location="cpu", weights_only=False)
-        self.net.load_state_dict(c["model"])
-        self.opt.load_state_dict(c["opt"])
+        if self.cfg["train"].get("resume_partial") and not (self.run / "ckpt.pt").exists():
+            self._restore_partial(c)   # a checkpoint of a model without the new heads (28/10): see there
+        else:
+            self.net.load_state_dict(c["model"])
+            self.opt.load_state_dict(c["opt"])
         self.sched.load_state_dict(c["sched"])
         self._gp_state = c.get("grain")
         t = self.cfg["train"]  # the lr of this config's schedule, not the source's (a run that ended its decay saved 0)
@@ -288,6 +319,26 @@ class Pretrainer:
         except (FileNotFoundError, pd.errors.EmptyDataError):
             pass
         self.log(f"[lejepa] resumed {path} at step {self.step} ({c['world']} -> {self.world} GPUs)", flush=True)
+
+    def _restore_partial(self, c: dict) -> None:
+        """train.resume_partial (28/10): the model of another objective config. Its rec heads grown to
+        objective.rec_head_cells (LeJEPA.expand_rec_heads: the same pooled prediction), new modules keep their init;
+        Adam's moments carried over by parameter name for every parameter of the same shape (the new heads and a grown
+        head start with none)."""
+        from .lejepa import LeJEPA
+        sd = LeJEPA.expand_rec_heads(dict(c["model"]), self.net.rec_head_cells)
+        r = self.net.load_state_dict(sd, strict=False)
+        self.log(f"[lejepa] partial resume: new {r.missing_keys}, dropped {r.unexpected_keys}", flush=True)
+        old = c["opt"]
+        names = {id(p): n for n, p in self.net.named_parameters()}
+        new = self.opt.state_dict()
+        for gi, g in enumerate(self.opt.param_groups):   # the old run's group gi held the same parameters minus the new ones
+            mine = [p for p in g["params"] if names[id(p)] in c["model"]]
+            for p, oi in zip(mine, old["param_groups"][gi]["params"]):
+                st = old["state"].get(oi)
+                if st is not None and st["exp_avg"].shape == p.shape:
+                    new["state"][new["param_groups"][gi]["params"][g["params"].index(p)]] = st
+        self.opt.load_state_dict(new)
 
     def _checkpoint(self) -> None:
         """Rank 0; written to a temporary file, then renamed."""
@@ -369,12 +420,13 @@ class Pretrainer:
             else:
                 self.skipped += 1
             event = None
-            if self.gp:   # the step's loss averaged over the GPUs: every rank takes the same decision
-                lo = out["loss"].detach().float().reshape(1)
+            if self.gp:   # the step's watched terms averaged over the GPUs: every rank takes the same decision
+                keys = [k for k in self.gp.watched if k in out]
+                lo = torch.stack([out[k].detach().float().reshape(()) for k in keys])
                 if dist.is_initialized():
                     dist.all_reduce(lo)
                     lo /= self.world
-                event = self.gp.update(step, mm, lo.item())   # a cut reaches the lr at sched.step() (its lambda)
+                event = self.gp.update(step, mm, dict(zip(keys, lo.tolist())))   # a cut reaches the lr at sched.step()
             self.sched.step()
             self.step, self.consumed = step, self.consumed + self.world
             if step % t.get("log_every", 50) == 0 or step == t["steps"]:
@@ -398,6 +450,7 @@ class Pretrainer:
                 return
             if event:   # a branch point: encoder, full checkpoint kept, the event in events.json
                 self.log(f"[lejepa] grain_plateau at step {step}: {event}", flush=True)
+                self._gp_apply()
                 if save:
                     torch.save(self.net.encoder.state_dict(), self.run / f"encoder_step{step:06d}.pt")
                     self._checkpoint()
