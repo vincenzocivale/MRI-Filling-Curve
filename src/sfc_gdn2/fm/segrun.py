@@ -972,7 +972,7 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
         best, br = base, None
         taus = (None,) + (TAUS if vals[0][1] is not None else ())
         for tau in taus:   # the thresholded masks' components once per tau, the filters on top of them
-            comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, _ in vals]
+            comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, *_ in vals]
             for smin in sorted({0, *sizes.get(c, ())}) if f1 != "det" else (0,):   # det: the threshold only
                 for largest in (False, True) if f1 != "det" else (False,):
                     if tau is None and not smin and not largest:
