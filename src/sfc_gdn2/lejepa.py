@@ -125,6 +125,7 @@ class LeJEPA(nn.Module):
                  proj_norm: str = "batch", sigreg_queue: int = 0,
                  w_top: float = 1.0, w_tok: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0, coarse_max: int = 1,
+                 rec_head_cells: int = 0, rec_extra: bool = False, rec_contrast: float = 0.0, rec_edge: float = 0.0,
                  coarse_prob: float = 0.3, cov_dim: int = 0, tok_joint_bn: bool = False,
                  volume_locals: bool = True, child: int = 0, child_adaptive: bool = False,
                  child_frac: tuple = (0.25, 0.25), child_explore: float = 0.1, child_max: int = 216,
@@ -157,8 +158,19 @@ class LeJEPA(nn.Module):
         self.cell = nn.ModuleList(Projector(2 * encoder.dim, proj_hidden, proj_dim, proj_norm) for _ in self.levels)
         self.top = nn.ModuleDict({n: Projector(2 * encoder.dim, proj_hidden, proj_dim, proj_norm) for n in top_levels})
         self.rec_weight, self.rec_cells, self.rec_eps, self.rec_visible = rec_weight, rec_cells, rec_eps, rec_visible
-        self.rec = nn.Sequential(nn.Linear(2 * encoder.dim, proj_hidden), nn.GELU(),
-                                 nn.Linear(proj_hidden, rec_cells ** 3)) if rec_weight or rec_visible else None
+        # rec_head_cells C (28/10, cascade of sub-token targets): the heads predict C^3 cells, pooled to the current
+        # rec_cells (C divisible by it), so grain_plateau raises rec_cells mid-run with no parameter changing shape (DDP,
+        # Adam); a checkpoint with fewer cells -> expand_rec_heads (each new cell = its parent: the same pooled output)
+        self.rec_head_cells = int(rec_head_cells) or rec_cells
+        mk = lambda n: nn.Sequential(nn.Linear(2 * encoder.dim, proj_hidden), nn.GELU(), nn.Linear(proj_hidden, n))
+        self.rec = mk(self.rec_head_cells ** 3) if rec_weight or rec_visible else None
+        # rec_extra: on the rec rows also the patch's mean and log-std on the volume's scale (rec_contrast: what rec's
+        # per-patch normalisation drops, a token brighter than its neighbours) and its gradient magnitude in the cells
+        # (rec_edge: where the edges run inside the token). Both heads always run (logged before their stage; every
+        # parameter in the graph for DDP); their weights, 0 until grain_plateau opens their stage, scale the loss
+        self.rec_contrast, self.rec_edge = rec_contrast, rec_edge
+        self.rec_con_head = mk(2) if rec_extra and self.rec is not None else None
+        self.rec_edge_head = mk(self.rec_head_cells ** 3) if rec_extra and self.rec is not None else None
         self.sigreg = SIGReg(sigreg_slices, sigreg_knots)
         # child n (18/10, user): the pyramid also goes down. In the B view of each scan's first local group (at most
         # child_max patches) patches are read finer: n = 1, every patch as its 8 sub-blocks of patch_mm/2; n = 2,
@@ -405,19 +417,32 @@ class LeJEPA(nn.Module):
         vols, grid, _, fg, ws = fine
         def rec_target(scan, pid, vols):
             """Sub-patch targets of the rows (scan [R], patch [R]): each patch's native voxels in rec_cells^3 cells,
-            normalised per patch. Only the rows a loss uses (22/10: all patches of the batch held a copy of every voxel
-            at 4 mm cells, ~10 GB and OOM)."""
-            out = None
+            normalised per patch ("rec"); with rec_extra also "contrast" (the patch's mean and log-std, both on the
+            scan's foreground scale) and "edge" (log1p of the gradient magnitude on that scale, central differences
+            inside the patch, in the same cells). Only the rows a loss uses (22/10: all patches of the batch held a copy
+            of every voxel at 4 mm cells, ~10 GB and OOM)."""
+            out, pool = {}, lambda t: nn.functional.adaptive_avg_pool3d(t, self.rec_cells).flatten(1)
             with torch.no_grad(), torch.autocast(grid.device.type, enabled=False):
                 for b in scan.unique().tolist():
                     s = (scan == b).nonzero()[:, 0]
                     x, k = vols["patches"][b], vols["k_list"][b]
-                    t = nn.functional.adaptive_avg_pool3d(x[pid[s]].view(-1, 1, *k), self.rec_cells).flatten(1)
-                    t = (t - t.mean(1, keepdim=True)) / (t.var(1, keepdim=True, unbiased=False) + self.rec_eps).sqrt()
-                    out = t.new_empty(len(scan), t.shape[1]) if out is None else out
-                    out[s] = t
+                    xs = x[pid[s]].view(-1, 1, *k).float()
+                    t = pool(xs)
+                    got = {"rec": (t - t.mean(1, keepdim=True)) / (t.var(1, keepdim=True, unbiased=False) + self.rec_eps).sqrt()}
+                    if self.rec_con_head is not None:
+                        nz = x[x != 0].float()
+                        vm, vs = (nz.mean(), nz.std().clamp_min(1e-6)) if len(nz) > 1 else (x.float().mean(), x.float().std().clamp_min(1e-6))
+                        f = xs.flatten(1)
+                        got["contrast"] = torch.stack([(f.mean(1) - vm) / vs, (f.std(1, unbiased=False) / vs + self.rec_eps).log()], 1)
+                        q = nn.functional.pad(xs, (1, 1, 1, 1, 1, 1), mode="replicate")
+                        g = ((q[:, :, 2:, 1:-1, 1:-1] - q[:, :, :-2, 1:-1, 1:-1]).square()
+                             + (q[:, :, 1:-1, 2:, 1:-1] - q[:, :, 1:-1, :-2, 1:-1]).square()
+                             + (q[:, :, 1:-1, 1:-1, 2:] - q[:, :, 1:-1, 1:-1, :-2]).square()).sqrt() / (2 * vs)
+                        got["edge"] = pool(g).log1p()
+                    for n, t in got.items():
+                        out.setdefault(n, t.new_empty(len(scan), t.shape[1]))[s] = t
             return out
-        rec, recv = [], []
+        rec, recv, con, edg = [], [], [], []
         corner, edge = self.jittered(*self.boxes(fg, grid, gen), grid, gen)               # [B,G,2,3]
         if coarse is not fine:   # the global boxes on the coarse grid (the fine draw's globals unused)
             gc, ge = self.jittered(*self.boxes(coarse[3], coarse[1], gen), coarse[1], gen)
@@ -491,7 +516,11 @@ class LeJEPA(nn.Module):
                 if w:
                     r = r.nonzero()[:, 0]
                     if len(r):
-                        acc.append((self.rec(bi.index_select(0, r)).float() - rec_target(v[tv[r]], idx[r], pv)).square().mean(1))
+                        h, tg = bi.index_select(0, r), rec_target(v[tv[r]], idx[r], pv)
+                        acc.append((self.rec_cells_of(self.rec(h)) - tg["rec"]).square().mean(1))
+                        if self.rec_con_head is not None:
+                            con.append((self.rec_con_head(h).float() - tg["contrast"]).square().mean(1))
+                            edg.append((self.rec_cells_of(self.rec_edge_head(h)) - tg["edge"]).square().mean(1))
         zg = torch.cat(zg, 1)                                                              # [B,G,2,D]
         inv_g = (zg - zg.mean(2, keepdim=True)).square().mean()
         # symmetric, as LeJEPA: both tokens pulled to their mean, no stop-grad (with a stop-grad target and
@@ -574,7 +603,7 @@ class LeJEPA(nn.Module):
         w = [self.w_top, self.w_tok, *(1.0 for _ in self.levels), *(self.w_top for _ in [*self.top, *cov]), *(1.0 for _ in ch), *w_extra]
         ws_ = w[: len(sigs)]   # the extra invariances add no SIGReg (their embeddings are the token head's)
         wmean = lambda xs: sum(a * x for a, x in zip(w if len(xs) == len(w) else ws_, xs)) / sum(w if len(xs) == len(w) else ws_)
-        for k, r in (("rec", rec), ("rec_visible", recv)):
+        for k, r in (("rec", rec), ("rec_visible", recv), ("rec_contrast", con), ("rec_edge", edg)):
             if r:
                 out[k] = (r := torch.cat(r)).sum() / max(len(r), 1)
         score = sum(out[f"score_{n}"] for n in ch if f"score_{n}" in out)   # trains only the score heads
@@ -583,9 +612,28 @@ class LeJEPA(nn.Module):
                                                               *self.child_head.parameters(),
                                                               *(self.child_score.parameters() if self.child_score else [])])
         return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs) + self.rec_weight * out.get("rec", 0) + score
-                + self.rec_visible * out.get("rec_visible", 0),
+                + self.rec_visible * out.get("rec_visible", 0) + self.rec_contrast * out.get("rec_contrast", 0)
+                + self.rec_edge * out.get("rec_edge", 0),
                 "inv_global": inv_g, "inv_token": inv_t, "sigreg_global": sig_g, "sigreg_token": sig_t, **out,
                 "vol_share": vol_share, "len_global": lens[0], "len_local": lens[1]}
+
+    def rec_cells_of(self, p: torch.Tensor) -> torch.Tensor:
+        """A rec head's rec_head_cells^3 prediction [R, C^3] -> the current rec_cells^3 (mean of each cell's children)."""
+        C = self.rec_head_cells
+        p = p.float()
+        return p if C == self.rec_cells else nn.functional.adaptive_avg_pool3d(p.view(-1, 1, C, C, C), self.rec_cells).flatten(1)
+
+    @staticmethod
+    def expand_rec_heads(sd: dict, cells: int) -> dict:
+        """A state dict's rec heads (last Linear of rec / rec_edge_head, c^3 outputs) -> cells^3 outputs, each new cell a
+        copy of its parent (c | cells), so rec_cells_of pooled back to c gives the old prediction exactly (28/10)."""
+        for key in [k for k in sd if k.split(".")[-3:-1] in (["rec", "2"], ["rec_edge_head", "2"])]:
+            c = round(sd[key].shape[0] ** (1 / 3))
+            if c != cells:
+                i, f = torch.arange(cells), cells // c
+                parent = ((i[:, None, None] // f) * c + i[None, :, None] // f) * c + i[None, None, :] // f
+                sd[key] = sd[key][parent.flatten().to(sd[key].device)]
+        return sd
 
     def view_cov(self, bi, tv, w, off, n_h):
         """Order-free second-order reading of every view (notes/loss_stato.md: the covariance of the tokens holds age
