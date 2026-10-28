@@ -34,8 +34,10 @@ class DenseDec(nn.Module):
 
     tile_corner = True
 
-    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None):
+    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, width: float = 1.0):
         super().__init__()
+        global CH, TOK   # ponytail: module-level widths scaled per run (one decoder per process); args.dense_width
+        CH, TOK = tuple(int(c * width) for c in (16, 32, 64)), int(64 * width)
         self.encoder = encoder
         self.cache = TokenCache(cache)
         self.cache.levels = LEVELS
