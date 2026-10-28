@@ -525,6 +525,10 @@ def train(job: dict) -> None:
                 torch.cuda.set_rng_state(state["cuda_rng"])
             best, curve, start, t0 = state["best"], state["curve"], state["it"] + 1, t0 - state["min"] * 60
             print(f"[seg] resumed from {last} at iter {state['it']} ({state['min']:.1f} min done)", flush=True)
+            if hasattr(net, "on_val"):   # fm/dense_dec cubes: the training scans' cubes live in RAM, placed again
+                net.eval()
+                net.on_val(0, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
+                           lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv), resume=True)
         t_save = time.time()
 
         def save_last(it: int) -> None:

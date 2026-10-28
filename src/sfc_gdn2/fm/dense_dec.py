@@ -329,19 +329,21 @@ class NativeDec(nn.Module):
         for level in range(1, int(self.stage) + 1):
             self.place(x, ctx, level, predict)
 
-    def on_val(self, it: int, every: int, scans, predict) -> None:
+    def on_val(self, it: int, every: int, scans, predict, resume: bool = False) -> None:
         """segrun, after the validation at `it`: the first two raise the stage and place that level on every training scan
-        (scans: (x, ctx); predict(x, ctx) -> probabilities)."""
-        n = it // every
-        if not self.cube or n > len(MG) or n <= int(self.stage):
+        (scans: (x, ctx); predict(x, ctx) -> probabilities). resume: a resumed run (debug chunks) places again every level
+        its state has, with the resumed model (the cubes live in RAM only)."""
+        n = int(self.stage) if resume else it // every
+        if not self.cube or n > len(MG) or (not resume and n <= int(self.stage)):
             return
         t0 = __import__("time").time()
         self.stage.fill_(n)
-        for x, c in scans:
-            self.place(x, c, n, lambda x=x, c=c: predict(x, c))
-        cells = sum(len(v[MG[n - 1]][0]) for v in self.cubes.values() if MG[n - 1] in v)
-        print(f"[seg] cubes: {MG[n - 1]:g} mm from it {it} on {len(scans)} training scans, {cells} cells "
-              f"({__import__('time').time() - t0:.0f} s)", flush=True)
+        for level in range(1 if resume else n, n + 1):
+            for x, c in scans:
+                self.place(x, c, level, lambda x=x, c=c: predict(x, c))
+            cells = sum(len(v[MG[level - 1]][0]) for v in self.cubes.values() if MG[level - 1] in v)
+            print(f"[seg] cubes: {MG[level - 1]:g} mm {'again on resume' if resume else f'from it {it}'} on {len(scans)} "
+                  f"training scans, {cells} cells ({__import__('time').time() - t0:.0f} s)", flush=True)
 
 
 @torch.no_grad()
