@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .token_cache import TokenCache
+from .token_cache import TokenCache, fine_ok
 
 LEVELS = (16.0, 8.0)
 MG = (4.0, 2.0)     # variant B's sparse levels
@@ -34,20 +34,21 @@ class DenseDec(nn.Module):
 
     tile_corner = True
 
-    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, width: float = 1.0):
+    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, width: float = 1.0, dense4: bool = False):
         super().__init__()
         global CH, TOK   # ponytail: module-level widths scaled per run (one decoder per process); args.dense_width
         CH, TOK = tuple(int(c * width) for c in (16, 32, 64)), int(64 * width)
         self.encoder = encoder
         self.cache = TokenCache(cache)
-        self.cache.levels = LEVELS
+        self.levels = (*LEVELS, 4.0) if dense4 else LEVELS   # simpleC: + 4 mm dense (a cache with the level: --dense4)
+        self.cache.levels = self.levels
         c = encoder.dim * (1 + len(encoder.taps))
-        self.tok = nn.ModuleList(nn.Sequential(nn.LayerNorm(c), nn.Linear(c, TOK)) for _ in LEVELS)
+        self.tok = nn.ModuleList(nn.Sequential(nn.LayerNorm(c), nn.Linear(c, TOK)) for _ in self.levels)
         self.e0, self.e1, self.e2 = block(1, CH[0]), block(CH[0], CH[1], 2), block(CH[1], CH[2], 2)
         self.mg, self._mg = mg, {}
         if mg:
             self.tok_mg = nn.ModuleList(nn.Sequential(nn.LayerNorm(c), nn.Linear(c, TOK)) for _ in MG)
-        self.mid = block(CH[2] + (TOK + 1) * len(MG) * bool(mg) + TOK * len(LEVELS), CH[2])
+        self.mid = block(CH[2] + (TOK + 1) * len(MG) * bool(mg) + TOK * len(self.levels), CH[2])
         self.u1, self.d1 = nn.ConvTranspose3d(CH[2], CH[1], 2, 2), block(2 * CH[1], CH[1])
         self.u0, self.d0 = nn.ConvTranspose3d(CH[1], CH[0], 2, 2), block(2 * CH[0], CH[0])
         self.out = nn.Conv3d(CH[0], n_out, 1)
@@ -58,8 +59,11 @@ class DenseDec(nn.Module):
         for r in ctx.tolist():
             i, corner = self.cache.ids[int(r[6])], [int(v) for v in r[7:10]]
             k4, lv = self.cache.meta(i)["k4"], []
-            for j, mm in enumerate(LEVELS):
+            for j, mm in enumerate(self.levels):
                 k = [a * int(mm // 4) for a in k4]
+                if mm < 8 and not fine_ok(k):   # a scan too coarse for 4 mm cells (no file): an empty level
+                    lv.append(torch.zeros(1, TOK, *[t // 4 for t in T], device=dev))
+                    continue
                 c0 = [c // kk for c, kk in zip(corner, k)]
                 n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
                 t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float().reshape(*n, -1)
@@ -139,6 +143,7 @@ def main() -> None:
     from .api import load_config
     from .sfc import SFC, multigrain
     task, out, ck = sys.argv[1:4]
+    dense4 = sys.argv[4:5] == ["--dense4"]   # simpleC: <out> = the Dmix cache's 16 / 8 mm (links) + 4 mm dense, written here
     MV = Path("/leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench_v2")
     SI = Path("/leonardo_scratch/fast/IscrC_SFMRI/fcorrent/segdec_inputs/sfc_gdn2")
     vols = pd.read_csv(MV / "volumes.csv", low_memory=False, dtype={"session": str})
@@ -150,8 +155,21 @@ def main() -> None:
     w.extractor()
     enc, seed, thr = w._extract_enc, int(w.run_cfg["seed"]), w.run_cfg["objective"].get("fg_threshold", 0.05)
     Path(out).mkdir(parents=True, exist_ok=True)
+    if dense4:
+        from .token_cache import write_volume
+        src = Path("/leonardo_scratch/fast/IscrC_SFMRI/fcorrent/tok/bench_p28") / task
+        enc.taps = (3, 7, 11)   # the Dmix cache's columns: last ++ the depth quartiles (args.taps 3)
+        for g in src.iterdir():
+            if not (Path(out) / g.name).exists():
+                (Path(out) / g.name).symlink_to(g)
     for n, it in enumerate(items):
         f = Path(out) / f"{it['id']}.pt"
+        if dense4:
+            if (Path(out) / f"{it['id']}.4.mean.npy").exists() or not (SI / f"{it['id']}.pt").exists():
+                continue
+            r = torch.load(SI / f"{it['id']}.pt", map_location="cpu", weights_only=False)
+            write_volume(enc, w.curves, seed, r["x"].float(), r["ctx"][:3], Path(out), it["id"], {}, 4.0)
+            continue
         if f.exists() or not (SI / f"{it['id']}.pt").exists():
             continue
         r = torch.load(SI / f"{it['id']}.pt", map_location="cpu", weights_only=False)
