@@ -144,6 +144,9 @@ class DenseDec(nn.Module):
 NCH = (16, 32, 64, 64, 64)                              # args.dense_native: stages at 1, 2, 4, 8, 16 voxels (~mm)
 NTOK = {16.0: 32, 8.0: 32, 4.0: 16, 2.0: 8}             # channels per token level: 4 / 2 mm overcomplete, cut to image density
 NSTAGE = {16.0: 4, 8.0: 3, 4.0: 2, 2.0: 1}
+# args.dense_cubes: the fine levels read in cubes of the pretraining view (16^3 cells: 6.4 cm at 4 mm, 3.2 cm at 2 mm) where
+# the decoder itself sees foreground; one rule for every task (user 28/10: nothing per dataset)
+CUBE, CAP, TAU, DROP = 16, 8, 0.1, 0.3   # cells per axis, cubes per volume and level, min foreground prob, cubes dropped in training
 
 
 def gather(g: torch.Tensor, c0, k, corner, T, s: int) -> torch.Tensor:
@@ -159,17 +162,26 @@ class NativeDec(nn.Module):
     """args.dense_native=true (user 28/10: "keep simpleA small, so it has to use the tokens"): a small 5-stage U-Net on the
     image (1, 2, 4, 8, 16 voxels, NCH channels), each token level concatenated, projected, at the stage of its own
     resolution (16 mm -> stage 4, 8 mm -> 3; with args.dense_mg the multigrain 4 / 2 mm, sparse + read mask, -> 2 / 1),
-    so the skips carry them up; args.dense_notok: the same U-Net without tokens (its control)."""
+    so the skips carry them up; args.dense_notok: the same U-Net without tokens (its control).
+    args.dense_cubes (user 28/10): the 4 / 2 mm levels in cubes placed by the decoder, in the budget of the others: up to the
+    first validation 16 / 8 mm only; after it (on_val) the model predicts every training scan, cubes go greedily on its
+    foreground probability (TAU, CAP) and the frozen encoder reads them as pretraining views; 4 mm from the first validation,
+    2 mm from the second (`stage`, a buffer: the best state carries it). Val / test (`prepare`, from segrun.sliding): the
+    same passes on the scan, coarse to fine, no label. Training drops DROP of the cubes (the model meets unread cells)."""
 
     tile_corner = True
 
-    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, notok: bool = False):
+    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, notok: bool = False, cubes: bool = False,
+                 curves=(), seed: int = 17):
         super().__init__()
         self.encoder, self.cache = encoder, TokenCache(cache)
         self.dense = () if notok else LEVELS
         self.cache.levels = self.dense or LEVELS
         self.mg, self._mg = (None if notok else mg), {}
-        lv = (*self.dense, *(MG if self.mg else ()))
+        self.cube, self.curves, self.seed = cubes and not notok, list(curves), seed
+        self.cubes, self.active, self.preparing = {}, None, False   # {volume index: {mm: (cells, tokens, k, cube)}}
+        self.register_buffer("stage", torch.zeros((), dtype=torch.long))
+        lv = (*self.dense, *(MG if self.mg or self.cube else ()))
         c = encoder.dim * (1 + len(encoder.taps))
         self.tok = nn.ModuleDict({f"g{mm:g}": nn.Sequential(nn.LayerNorm(c), nn.Linear(c, NTOK[mm])) for mm in lv})
         extra = [0] * len(NCH)
@@ -196,23 +208,40 @@ class NativeDec(nn.Module):
                 n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
                 t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float().reshape(*n, -1)
                 per.setdefault(NSTAGE[mm], []).append(gather(self.tok[f"g{mm:g}"](t), c0, k, corner, T, NSTAGE[mm]))
-            if self.mg:
-                for mm, f in self.sparse(i, corner, T, dev).items():
+            src = self._mg_of(i) if self.mg else self._cubes_of(int(r[6])) if self.cube else None
+            if src is not None:
+                for mm, f in self.sparse(src, corner, T, dev).items():
                     per.setdefault(NSTAGE[mm], []).append(f)
         return {s: torch.cat(v) for s, v in per.items()}   # one level per stage: one entry per tile
 
-    def sparse(self, i, corner, T, dev) -> dict:
-        """The multigrain 4 / 2 mm levels at their stages: the read cells' projected tokens, zero elsewhere, + the mask."""
+    def _mg_of(self, i) -> dict:
         from pathlib import Path
         if i not in self._mg:
             self._mg = dict(list(self._mg.items())[-15:]) | {i: torch.load(Path(self.mg) / f"{i}.pt", weights_only=False)}
+        return self._mg[i]
+
+    def _cubes_of(self, vid: int) -> dict:
+        """The volume's cube cells of the active levels (training: DROP of its cubes left out)."""
+        a, out = int(self.stage) if self.active is None else self.active, {}
+        for mm in MG[:a]:
+            if mm in self.cubes.get(vid, {}):
+                q, h, k, cid = self.cubes[vid][mm]
+                if self.training:
+                    keep = (torch.rand(int(cid.max()) + 1) >= DROP)[cid]
+                    q, h = q[keep], h[keep]
+                out[mm] = (q, h, k)
+        return out
+
+    def sparse(self, src: dict, corner, T, dev) -> dict:
+        """The 4 / 2 mm levels at their stages (src {mm: (cells, tokens, k)}): the read cells' projected tokens, zero
+        elsewhere, + the mask."""
         out = {}
         for mm in MG:
             s, w = NSTAGE[mm], NTOK[mm] + 1
-            if mm not in self._mg[i]:
+            if mm not in src:
                 out[mm] = torch.zeros(1, w, *[t // 2 ** s for t in T], device=dev)
                 continue
-            q, h, k = self._mg[i][mm]
+            q, h, k = src[mm]
             q = q.to(dev).long()
             c0 = [c // kk for c, kk in zip(corner, k)]
             n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
@@ -222,7 +251,7 @@ class NativeDec(nn.Module):
             if ok.any():
                 f = self.tok[f"g{mm:g}"](h[ok.cpu()].to(dev).float())
                 qi = q[ok] - lo
-                g[qi[:, 0], qi[:, 1], qi[:, 2]] = torch.cat([f, f.new_ones(len(f), 1)], 1)
+                g[qi[:, 0], qi[:, 1], qi[:, 2]] = torch.cat([f, f.new_ones(len(f), 1)], 1).float()
             out[mm] = gather(g, c0, k, corner, T, s)
         return out
 
@@ -241,6 +270,78 @@ class NativeDec(nn.Module):
         return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
 
     tile_max = DenseDec.tile_max
+
+    @torch.no_grad()
+    def place(self, x: torch.Tensor, ctx: torch.Tensor, level: int, predict) -> None:
+        """Level `level` (1: 4 mm, 2: 2 mm) of the scan x [1, *S] (ctx: spacing, shape, volume index): predict() with the
+        levels above, cubes greedily on the foreground probability (each cube's cells excluded from the next centres),
+        each cube read by the frozen encoder as one view (box-local curve keys, the curves averaged)."""
+        from ..curves import grid_coords, keys
+        from ..data.volume import patch_dims, patchify
+        vid, mm = int(ctx[6]), MG[level - 1]
+        self.active, self.preparing = level - 1, True
+        try:
+            p = predict()
+        finally:
+            self.active, self.preparing = None, False
+        dev, sp = p.device, ctx[:3].float()
+        k = patch_dims(sp.tolist(), mm)
+        self.cubes.setdefault(vid, {}).pop(mm, None)
+        if not fine_ok(k):
+            return
+        sc = F.max_pool3d(p[1:].float().amax(0)[None, None], k, k, ceil_mode=True)[0, 0]   # per cell: max foreground
+        g, boxes = sc.shape, []
+        while len(boxes) < CAP and float(sc.max()) >= TAU:
+            c = [int(a) for a in torch.unravel_index(sc.argmax(), g)]
+            lo = [max(0, min(a - CUBE // 2, n - CUBE)) for a, n in zip(c, g)]
+            hi = [min(n, a + CUBE) for a, n in zip(lo, g)]
+            sc[lo[0]: hi[0], lo[1]: hi[1], lo[2]: hi[2]] = -1
+            boxes.append((torch.tensor(lo, device=dev), torch.tensor(hi, device=dev)))
+        if not boxes:
+            return
+        pt = patchify(x[0].to(dev).float(), k)
+        xyz = grid_coords(torch.tensor(g, device=dev)[None], len(pt))[0]
+        seen, qs, hs, cs = torch.zeros(len(pt), dtype=torch.bool, device=dev), [], [], []
+        pe = self.encoder.patch_embed
+        mm0, pe.patch_mm = pe.patch_mm, mm
+        try:
+            wt = pe.weights(sp.to(dev), k)
+            for j, (lo, hi) in enumerate(boxes):
+                sel = ((xyz >= lo) & (xyz < hi)).all(1).nonzero()[:, 0]
+                q, h = xyz[sel], 0
+                cu = torch.tensor([0, len(sel)], dtype=torch.int32, device=dev)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    xe = pe(pt[sel], wt)
+                    for c in self.curves:
+                        o = keys(c, q - lo, hi - lo, self.seed).argsort()
+                        h = h + self.encoder.flat(xe[o], cu, pos=q[o]).float()[o.argsort()]
+                new = ~seen[sel]
+                seen[sel] = True
+                qs.append(q[new].short().cpu())
+                hs.append((h[new] / len(self.curves)).half().cpu())
+                cs.append(torch.full((int(new.sum()),), j))
+        finally:
+            pe.patch_mm = mm0
+        self.cubes[vid][mm] = (torch.cat(qs), torch.cat(hs), list(k), torch.cat(cs))
+
+    def prepare(self, x: torch.Tensor, ctx: torch.Tensor, predict) -> None:
+        """Val / test (segrun.sliding, before its pass): the scan's cubes of every level the state has, coarse to fine."""
+        for level in range(1, int(self.stage) + 1):
+            self.place(x, ctx, level, predict)
+
+    def on_val(self, it: int, every: int, scans, predict) -> None:
+        """segrun, after the validation at `it`: the first two raise the stage and place that level on every training scan
+        (scans: (x, ctx); predict(x, ctx) -> probabilities)."""
+        n = it // every
+        if not self.cube or n > len(MG) or n <= int(self.stage):
+            return
+        t0 = __import__("time").time()
+        self.stage.fill_(n)
+        for x, c in scans:
+            self.place(x, c, n, lambda x=x, c=c: predict(x, c))
+        cells = sum(len(v[MG[n - 1]][0]) for v in self.cubes.values() if MG[n - 1] in v)
+        print(f"[seg] cubes: {MG[n - 1]:g} mm from it {it} on {len(scans)} training scans, {cells} cells "
+              f"({__import__('time').time() - t0:.0f} s)", flush=True)
 
 
 @torch.no_grad()

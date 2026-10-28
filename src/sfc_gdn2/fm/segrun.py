@@ -140,6 +140,8 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch); ours (fm/sfc.SegNet,
     the cascade) the whole scan in one pass, coarse to fine."""
     lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
+    if getattr(net, "cube", False) and not net.preparing and ctx is not None:   # fm/dense_dec cubes: placed on this scan
+        net.prepare(x, ctx, lambda: sliding(net, x, patch, n_out, amp, ctx))
     if getattr(net, "cascade", False) and ctx is not None:
         with amp():
             return net.landmark_predict(x, ctx.to(x.device), n_out) if lm else net.cascade_predict(x, ctx.to(x.device), n_out)
@@ -653,6 +655,9 @@ def train(job: dict) -> None:
                     best = {"val": val, "iter": it, "score": score, "state": trained()} | \
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
                         ({"val_f1": rec["val_f1"]} if "val_f1" in rec else {})
+                if hasattr(net, "on_val"):   # fm/dense_dec cubes: the next fine level placed on the training scans
+                    net.on_val(it, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
+                               lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv))
                 set_mode()
                 pat = int(job.get("patience") or 0)   # screening: once learning (> 0), no new best for `pat` validations,
                 # never before 60 % of the budget (CMB p20 d4 Dmix, 24/10: F1 .018 / .024 then 0, learns after 7500)

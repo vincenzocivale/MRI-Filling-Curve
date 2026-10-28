@@ -1158,7 +1158,8 @@ class SFC(Wrapper):
             from .dense_dec import DenseDec, NativeDec
             tc = str(a["token_cache"]).removeprefix("live:")
             if a.get("dense_native"):   # tokens at the U-Net stage of their own resolution (user 28/10)
-                net = NativeDec(enc, tc, n_out, a.get("dense_mg"), bool(a.get("dense_notok")))
+                net = NativeDec(enc, tc, n_out, a.get("dense_mg"), bool(a.get("dense_notok")), bool(a.get("dense_cubes")),
+                                self.curves, int(self.run_cfg["seed"]))
             else:
                 net = DenseDec(enc, tc, n_out, a.get("dense_mg"), float(a.get("dense_width") or 1), bool(a.get("dense_4mm")),
                                bool(a.get("dense_sub")), bool(a.get("dense_notok")))
