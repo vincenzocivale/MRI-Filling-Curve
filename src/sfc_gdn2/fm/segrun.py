@@ -427,6 +427,7 @@ def train(job: dict) -> None:
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
+    net.lm_prior = float(os.environ.get("SFC_LM_PRIOR", "0"))   # landmark_predict: + the level heads' log-sigmoid (diagnosis)
     if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
         global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
         TILE_CELLS, TILE_MAX = 16, 3e8 * k

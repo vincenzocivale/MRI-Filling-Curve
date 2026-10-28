@@ -743,7 +743,7 @@ class SegNet(nn.Module):
                 tk = self.ctopk if pts is not None else self.ctopk_eval[min(j, len(self.ctopk_eval) - 1)]
                 top = lg.detach().topk(min(tk, len(ci)), 0).indices.flatten()
                 sel[ci[top]] = True
-                st["info"].append((lg, tgt))
+                st["info"].append((lg, tgt, ci))
                 if j == st["jmin"]:
                     st["out"] = (st["lv"], st["info"], sel, k, g)
                 else:
@@ -795,7 +795,7 @@ class SegNet(nn.Module):
                 heat.append(hb)
         loss = 0.0
         for (_, _, _, vol, _, _, _), hb, (lv, info, sel, kl, gl) in zip(tiles, heat, self._lm_levels_many(tiles, n_out)):
-            for lg, tgt in info:
+            for lg, tgt, _ in info:
                 pos = tgt > 0
                 ll = -F.logsigmoid(-lg)[~pos].mean()
                 if pos.any():
@@ -816,11 +816,24 @@ class SegNet(nn.Module):
         fs, self.fine_seg = self.fine_seg, self.fine_seg or 1 << 16
         try:
             z, k, g, cur, sp = self._whole(x, ctx)
-            lv, _, sel, kl, gl = self._lm_levels(z, k, g, x[0], sp, cur, n_out)
+            lv, info, sel, kl, gl = self._lm_levels(z, k, g, x[0], sp, cur, n_out)
             out = torch.zeros(n_out, *S, dtype=torch.half, device=dev)
             q = self._lm_region(sel, kl, gl, S)
+            # lm_prior (segrun SFC_LM_PRIOR, user 28/10): + lm_prior x the log-sigmoid of each level head on the voxel's
+            # ancestor cells, so a far cell read only for the top-k cannot win with the point head alone (Dmix test:
+            # 15/360 landmarks > 10 mm off, the dense decoder 2); cells not scored at a level get its lowest logit
+            lam, cells = float(getattr(self, "lm_prior", 0.0)), []
+            if lam:
+                for (_, kj, gj), (lg, _, ci) in zip(lv, info):
+                    d = lg.min(0).values.expand(math.prod(gj), -1).clone()
+                    d[ci] = lg
+                    cells.append((F.logsigmoid(d), _dt(kj, dev), _dt(gj, dev), gj))
             for qq in q.split(1 << 18):
-                out[1:, qq[:, 0], qq[:, 1], qq[:, 2]] = self.c_logits(lv, x[0], qq)[:, 1:n_out].float().sigmoid().T.half()
+                s = self.c_logits(lv, x[0], qq)[:, 1:n_out].float()
+                for d, kk, gg, gj in cells:
+                    c = torch.minimum(qq // kk, gg - 1)
+                    s = s + lam * d[(c[:, 0] * gj[1] + c[:, 1]) * gj[2] + c[:, 2]]
+                out[1:, qq[:, 0], qq[:, 1], qq[:, 2]] = s.sigmoid().T.half()
             self.last_refined = float(len(q) / math.prod(S))
             return out
         finally:
