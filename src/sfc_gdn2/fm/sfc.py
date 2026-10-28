@@ -1155,10 +1155,13 @@ class SFC(Wrapper):
         enc.taps = tuple(taps)
         a = self.args
         if a.get("dense_dec"):   # fm/dense_dec (28/10): the dense control decoder on the cached 16 / 8 mm tokens
-            from .dense_dec import DenseDec
-            net = DenseDec(enc, str(a["token_cache"]).removeprefix("live:"), n_out, a.get("dense_mg"),
-                           float(a.get("dense_width") or 1), bool(a.get("dense_4mm")), bool(a.get("dense_sub")),
-                           bool(a.get("dense_notok")))
+            from .dense_dec import DenseDec, NativeDec
+            tc = str(a["token_cache"]).removeprefix("live:")
+            if a.get("dense_native"):   # tokens at the U-Net stage of their own resolution (user 28/10)
+                net = NativeDec(enc, tc, n_out, a.get("dense_mg"), bool(a.get("dense_notok")))
+            else:
+                net = DenseDec(enc, tc, n_out, a.get("dense_mg"), float(a.get("dense_width") or 1), bool(a.get("dense_4mm")),
+                               bool(a.get("dense_sub")), bool(a.get("dense_notok")))
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}
             return net, ["encoder"], SEG_PATCH

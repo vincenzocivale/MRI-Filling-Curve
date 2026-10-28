@@ -141,6 +141,108 @@ class DenseDec(nn.Module):
         return float(160 ** 3 * n_out)
 
 
+NCH = (16, 32, 64, 64, 64)                              # args.dense_native: stages at 1, 2, 4, 8, 16 voxels (~mm)
+NTOK = {16.0: 32, 8.0: 32, 4.0: 16, 2.0: 8}             # channels per token level: 4 / 2 mm overcomplete, cut to image density
+NSTAGE = {16.0: 4, 8.0: 3, 4.0: 2, 2.0: 1}
+
+
+def gather(g: torch.Tensor, c0, k, corner, T, s: int) -> torch.Tensor:
+    """g [*n, C] on the cell grid from cell c0 (cells of k voxels) -> [1, C, *T / 2^s]: each voxel of stage s takes the cell
+    its centre lies in (nearest, no interpolation: a token is a cell, not a point sample)."""
+    st, dev = 2 ** s, g.device
+    idx = [((torch.arange(t // st, device=dev) * st + st // 2 + c) // kk - a).clamp(0, n - 1)
+           for t, c, kk, a, n in zip(T, corner, k, c0, g.shape[:3])]
+    return g[idx[0][:, None, None], idx[1][None, :, None], idx[2][None, None, :]].permute(3, 0, 1, 2)[None]
+
+
+class NativeDec(nn.Module):
+    """args.dense_native=true (user 28/10: "keep simpleA small, so it has to use the tokens"): a small 5-stage U-Net on the
+    image (1, 2, 4, 8, 16 voxels, NCH channels), each token level concatenated, projected, at the stage of its own
+    resolution (16 mm -> stage 4, 8 mm -> 3; with args.dense_mg the multigrain 4 / 2 mm, sparse + read mask, -> 2 / 1),
+    so the skips carry them up; args.dense_notok: the same U-Net without tokens (its control)."""
+
+    tile_corner = True
+
+    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, notok: bool = False):
+        super().__init__()
+        self.encoder, self.cache = encoder, TokenCache(cache)
+        self.dense = () if notok else LEVELS
+        self.cache.levels = self.dense or LEVELS
+        self.mg, self._mg = (None if notok else mg), {}
+        lv = (*self.dense, *(MG if self.mg else ()))
+        c = encoder.dim * (1 + len(encoder.taps))
+        self.tok = nn.ModuleDict({f"g{mm:g}": nn.Sequential(nn.LayerNorm(c), nn.Linear(c, NTOK[mm])) for mm in lv})
+        extra = [0] * len(NCH)
+        for mm in lv:
+            extra[NSTAGE[mm]] += NTOK[mm] + (mm in MG)   # + the read mask
+        conv = lambda a, b, st=1: nn.Sequential(nn.Conv3d(a, b, 3, st, 1), nn.InstanceNorm3d(b, affine=True),
+                                                nn.LeakyReLU(0.01, True))
+        self.down = nn.ModuleList(conv(1 if s == 0 else NCH[s - 1], NCH[s], 1 if s == 0 else 2) for s in range(len(NCH)))
+        self.body = nn.ModuleList(conv(NCH[s] + extra[s], NCH[s]) for s in range(len(NCH)))
+        self.up = nn.ModuleList(nn.ConvTranspose3d(NCH[s], NCH[s - 1], 2, 2) for s in range(1, len(NCH)))
+        self.dec = nn.ModuleList(nn.Sequential(conv(2 * NCH[s - 1], NCH[s - 1]), conv(NCH[s - 1], NCH[s - 1]))
+                                 for s in range(1, len(NCH)))
+        self.out = nn.Conv3d(NCH[0], n_out, 1)
+
+    def tokens(self, ctx: torch.Tensor, T, dev) -> dict:
+        """{stage: [B, channels, *T / 2^stage]} of the tile's token levels."""
+        per = {}
+        for r in ctx.tolist():
+            i, corner = self.cache.ids[int(r[6])], [int(v) for v in r[7:10]]
+            k4 = self.cache.meta(i)["k4"]
+            for mm in self.dense:
+                k = [a * int(mm // 4) for a in k4]
+                c0 = [c // kk for c, kk in zip(corner, k)]
+                n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
+                t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float().reshape(*n, -1)
+                per.setdefault(NSTAGE[mm], []).append(gather(self.tok[f"g{mm:g}"](t), c0, k, corner, T, NSTAGE[mm]))
+            if self.mg:
+                for mm, f in self.sparse(i, corner, T, dev).items():
+                    per.setdefault(NSTAGE[mm], []).append(f)
+        return {s: torch.cat(v) for s, v in per.items()}   # one level per stage: one entry per tile
+
+    def sparse(self, i, corner, T, dev) -> dict:
+        """The multigrain 4 / 2 mm levels at their stages: the read cells' projected tokens, zero elsewhere, + the mask."""
+        from pathlib import Path
+        if i not in self._mg:
+            self._mg = dict(list(self._mg.items())[-15:]) | {i: torch.load(Path(self.mg) / f"{i}.pt", weights_only=False)}
+        out = {}
+        for mm in MG:
+            s, w = NSTAGE[mm], NTOK[mm] + 1
+            if mm not in self._mg[i]:
+                out[mm] = torch.zeros(1, w, *[t // 2 ** s for t in T], device=dev)
+                continue
+            q, h, k = self._mg[i][mm]
+            q = q.to(dev).long()
+            c0 = [c // kk for c, kk in zip(corner, k)]
+            n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
+            lo, hi = torch.tensor(c0, device=dev), torch.tensor(c0, device=dev) + torch.tensor(n, device=dev)
+            ok = ((q >= lo) & (q < hi)).all(1)
+            g = torch.zeros(*n, w, device=dev)
+            if ok.any():
+                f = self.tok[f"g{mm:g}"](h[ok.cpu()].to(dev).float())
+                qi = q[ok] - lo
+                g[qi[:, 0], qi[:, 1], qi[:, 2]] = torch.cat([f, f.new_ones(len(f), 1)], 1)
+            out[mm] = gather(g, c0, k, corner, T, s)
+        return out
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        T0, m = tuple(x.shape[2:]), 2 ** (len(NCH) - 1)
+        x = F.pad(x, [p for t in reversed(T0) for p in (0, -t % m)])   # stage 4: multiples of 16
+        T = tuple(x.shape[2:])
+        tk = self.tokens(ctx, T, x.device) if self.dense or self.mg else {}
+        skips, h = [], x
+        for s in range(len(NCH)):
+            h = self.down[s](h)
+            h = self.body[s](torch.cat([h, tk[s].to(h.dtype)], 1) if s in tk else h)
+            skips.append(h)
+        for s in range(len(NCH) - 1, 0, -1):
+            h = self.dec[s - 1](torch.cat([self.up[s - 1](h), skips[s - 1]], 1))
+        return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
+
+    tile_max = DenseDec.tile_max
+
+
 @torch.no_grad()
 def main() -> None:
     """Variant B's tokens: python -m sfc_gdn2.fm.dense_dec <task> <out folder> <checkpoint> -> <out>/<id>.pt = {mm: (cells
