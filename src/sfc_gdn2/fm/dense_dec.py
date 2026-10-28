@@ -11,7 +11,8 @@ budget), precomputed once per volume (python -m sfc_gdn2.fm.dense_dec <task> <fo
 taking its cell's projected token where that cell was read, zero elsewhere, with a read / not-read mask channel.
 Sub-cell decoding (args.dense_sub=true, user 28/10: vs's small tumours under-segmented, trilinear treats a token as a
 point sample at its cell's centre and smears it over the neighbours): each 8 mm token is decoded into its own 4^3 sub-cells
-of 2 mm (a linear map, as a ViT's patch decoder / pixel shuffle), only then interpolated onto the 1/4 voxel grid."""
+of 2 mm (a linear map, as a ViT's patch decoder / pixel shuffle), only then interpolated onto the 1/4 voxel grid.
+No tokens (args.dense_notok=true, user 28/10: how much of the dense decoder is the U-Net alone?): the image path only."""
 from __future__ import annotations
 
 import torch
@@ -39,13 +40,13 @@ class DenseDec(nn.Module):
     tile_corner = True
 
     def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, width: float = 1.0, dense4: bool = False,
-                 sub: bool = False):
+                 sub: bool = False, notok: bool = False):
         super().__init__()
         global CH, TOK   # ponytail: module-level widths scaled per run (one decoder per process); args.dense_width
         CH, TOK = tuple(int(c * width) for c in (16, 32, 64)), int(64 * width)
         self.encoder = encoder
         self.cache = TokenCache(cache)
-        self.levels = (*LEVELS, 4.0) if dense4 else LEVELS   # simpleC: + 4 mm dense (a cache with the level: --dense4)
+        self.levels = () if notok else (*LEVELS, 4.0) if dense4 else LEVELS   # simpleC: + 4 mm dense (--dense4)
         self.cache.levels = self.levels
         c = encoder.dim * (1 + len(encoder.taps))
         self.tok = nn.ModuleList(nn.Sequential(nn.LayerNorm(c), nn.Linear(c, TOK)) for _ in self.levels)
@@ -126,8 +127,10 @@ class DenseDec(nn.Module):
         f0 = self.e0(x)
         f1 = self.e1(f0)
         f2 = self.e2(f1)
-        tk = self.fields(ctx, T, x.device)   # the projections train; the cached tokens are data
-        h = self.mid(torch.cat([f2, tk.to(f2.dtype)], 1))
+        if self.levels or self.mg:
+            tk = self.fields(ctx, T, x.device)   # the projections train; the cached tokens are data
+            f2 = torch.cat([f2, tk.to(f2.dtype)], 1)
+        h = self.mid(f2)
         h = self.d1(torch.cat([self.u1(h), f1], 1))
         h = self.d0(torch.cat([self.u0(h), f0], 1))
         return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
