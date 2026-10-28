@@ -427,6 +427,7 @@ def train(job: dict) -> None:
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
+    DET = job.get("select") == "det"   # point detection (cmbpts, user 28/10): component centroids matched within DET_MM
     net.lm_prior = float(os.environ.get("SFC_LM_PRIOR", "0"))   # landmark_predict: + the level heads' log-sigmoid (diagnosis)
     if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
         global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
@@ -462,9 +463,10 @@ def train(job: dict) -> None:
                 tcache.ensure(it["id"], r["x"], r["ctx"])
         v = {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx,
              "align": None if tcache is None else [4 * a for a in tcache.meta(it["id"])["k4"]]}
+        if DET:
+            v["sp"] = grid_spacing(r["grid_from_gt"], it["seg"])
         if LM:   # model-grid spacing (mm: GT zooms through the grid mapping) and each landmark's voxel on the grid
-            A = np.linalg.inv(np.asarray(r["grid_from_gt"], dtype=float)[:3, :3])
-            sp = np.linalg.norm(A * np.asarray(nib.load(it["seg"]).header.get_zooms()[:3], dtype=float)[:, None], axis=0)
+            sp = grid_spacing(r["grid_from_gt"], it["seg"])
             y = r["y"][0] if r["y"].dim() == 4 else r["y"]
             xyz = torch.stack([(y == c).nonzero().float().mean(0).round() for c in range(1, k)])   # NaN if absent
             v["sp"], v["lm"] = sp, (xyz, sp)
@@ -630,9 +632,11 @@ def train(job: dict) -> None:
                 if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
                     mre = float(np.mean([mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
                     rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
-                if job.get("select") == "f1":   # small lesions (CMB, user 23/10): chosen on the val lesion-wise F1
-                    f1v = float(np.nanmean([_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), True)
-                                                     for p, v in zip(preds, val_v)], True) for c in range(1, k)]))
+                if job.get("select") in ("f1", "det"):   # small lesions (CMB, user 23/10): chosen on the val lesion-wise F1
+                    md = "det" if job["select"] == "det" else True   # det: detection F1 (centroids within DET_MM)
+                    f1v = float(np.nanmean([_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), md,
+                                                            sp=v.get("sp")) for p, v in zip(preds, val_v)], True)
+                                            for c in range(1, k)]))
                     rec["val_f1"], score, msg = f1v, f1v, msg + f" val F1 {f1v:.3f}"
                 del preds
                 curve.append(rec)
@@ -715,7 +719,7 @@ def train(job: dict) -> None:
         return
     if "lm_topk" in best:   # the val-chosen cells per landmark for the test and the saved val predictions
         net.ctopk_eval = best["lm_topk"]
-    rule, f1 = {}, job.get("select") == "f1"
+    rule, f1 = {}, "det" if DET else job.get("select") == "f1"
     pv = out_p.with_suffix(".pred_val")
     if not LM:   # val predictions of the best state -> the post-processing rule (chosen on val only)
         vals = []
@@ -729,7 +733,8 @@ def train(job: dict) -> None:
             z = np.load(f)
             y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
             y = y[0] if y.ndim == 4 else y
-            vals.append((z["pred"], z["prob"] if len(z["prob"]) == k else None, np.where(y == 255, 0, y)))
+            vals.append((z["pred"], z["prob"] if len(z["prob"]) == k else None, np.where(y == 255, 0, y),
+                         grid_spacing(z["grid_from_gt"], it["seg"]) if DET else None))
         sizes = {}   # train components' sizes (voxels on the model grid): 1st / 5th percentile per class
         for it in split["train"][:20]:
             y = np.asarray(torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)["y"])
@@ -760,6 +765,10 @@ def train(job: dict) -> None:
             pl = postproc(probs.argmax(0).to(torch.uint8).cpu().numpy(), q, rule)
             probs_s = F.one_hot(torch.from_numpy(pl).long(), k).permute(3, 0, 1, 2).half()
         d, per = dice_full_res(probs_s if rule else probs, v["grid_from_gt"], lab, k, dev)
+        if DET:   # detection sums (tp, points, false detections) per class on the model grid, as the val selection
+            pm = pl if pl is not None else probs.argmax(0).cpu().numpy()
+            yy = (v["y"][0] if v["y"].dim() == 4 else v["y"]).numpy()
+            res.setdefault("det", []).append([_score(pm == c, yy == c, "det", sp=v["sp"]) for c in range(1, k)])
         save_pred(out_p.with_suffix(".pred"), it["id"], probs, v["grid_from_gt"], lab=pl)
         res["per_volume"].append(d)
         res["per_class"].append(per)
@@ -773,6 +782,8 @@ def train(job: dict) -> None:
            "frozen_prefixes": frozen, "params_frozen": n_frozen, "params_trained": n_train, "best": best,
            "curve": curve, "n": {s: len(v) for s, v in split.items()},
            "test_dice": float(np.nanmean(res["per_volume"])), "postproc": {str(c): r for c, r in rule.items()}, **res}
+    if DET:
+        out["test_det_f1"] = float(np.nanmean([_metric([d[c] for d in res["det"]], True) for c in range(k - 1)]))
     out_p.write_text(json.dumps(out, indent=1))
     for it in split["val"]:   # the val predictions of the best state (landmarks: not done above)
         if (pv / f"{it['id']}.npz").exists():
@@ -816,9 +827,37 @@ def postproc(lab: np.ndarray, q: np.ndarray | None, rule: dict) -> np.ndarray:
     return out
 
 
-def _score(m: np.ndarray, t: np.ndarray, f1: bool, gt=None) -> tuple:
-    """A class on one volume -> sums: Dice (tp, pred, true) or lesion F1 (hit lesions, lesions, false components);
-    gt: the true mask's components if already computed."""
+DET_MM = 5.0   # detection (select: det): a predicted centroid within this distance of a true point is a hit
+
+
+def grid_spacing(grid_from_gt, seg) -> np.ndarray:
+    """The model grid's spacing (mm): the GT's zooms through the grid mapping."""
+    A = np.linalg.inv(np.asarray(grid_from_gt, dtype=float)[:3, :3])
+    return np.linalg.norm(A * np.asarray(nib.load(seg).header.get_zooms()[:3], dtype=float)[:, None], axis=0)
+
+
+def _score(m: np.ndarray, t: np.ndarray, f1, gt=None, comp=None, sp=None) -> tuple:
+    """A class on one volume -> sums: Dice (tp, pred, true), lesion F1 (hit lesions, lesions, false components) or,
+    f1 == "det", detection (true points matched, points, unmatched predictions: the centroids of the components of
+    m and t, one to one, greedy by distance, within DET_MM on the grid of spacing sp); gt / comp: the true / predicted
+    mask's components if already computed."""
+    if f1 == "det":
+        from scipy import ndimage
+        gl, ng = gt if gt is not None else _components(t)
+        pl, npred = comp if comp is not None else _components(m)
+        if not ng or not npred:
+            return 0.0, float(ng), float(npred)
+        a = np.asarray(ndimage.center_of_mass(t, gl, range(1, ng + 1))) * sp
+        b = np.asarray(ndimage.center_of_mass(m, pl, range(1, npred + 1))) * sp
+        d = np.linalg.norm(a[:, None] - b[None], axis=-1)
+        ui, uj, tp = set(), set(), 0
+        for i, j in zip(*np.unravel_index(np.argsort(d, None), d.shape)):
+            if d[i, j] > DET_MM:
+                break
+            if i not in ui and j not in uj:
+                ui.add(i), uj.add(j)
+                tp += 1
+        return float(tp), float(ng), float(npred - tp)
     if not f1:
         return float((m & t).sum()), float(m.sum()), float(t.sum())
     gl, ng = gt if gt is not None else _components(t)
@@ -845,17 +884,18 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
         if not any(x.any() for x in t):
             continue
         gts = [_components(tt) if f1 else None for tt in t]
-        base = _metric([_score(lab == c, tt, f1, g) for (lab, _, _), tt, g in zip(vals, t, gts)], f1)
+        base = _metric([_score(lab == c, tt, f1, g, sp=sp) for (lab, _, _, sp), tt, g in zip(vals, t, gts)], f1)
         best, br = base, None
         taus = (None,) + (TAUS if vals[0][1] is not None else ())
         for tau in taus:   # the thresholded masks' components once per tau, the filters on top of them
             comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, _ in vals]
-            for smin in sorted({0, *sizes.get(c, ())}):
-                for largest in (False, True):
+            for smin in sorted({0, *sizes.get(c, ())}) if f1 != "det" else (0,):   # det: the threshold only
+                for largest in (False, True) if f1 != "det" else (False,):
                     if tau is None and not smin and not largest:
                         continue
-                    sc = _metric([_score(_pp_class(lab, q, c, tau, smin, largest, cp), tt, f1, g)
-                                  for (lab, q, _), tt, g, cp in zip(vals, t, gts, comps)], f1)
+                    sc = _metric([_score(_pp_class(lab, q, c, tau, smin, largest, cp), tt, f1, g,
+                                         cp if f1 == "det" else None, sp)
+                                  for (lab, q, _, sp), tt, g, cp in zip(vals, t, gts, comps)], f1)
                     if sc > best + 1e-4:
                         best, br = sc, (tau, int(smin), largest)
         if br is not None:
