@@ -333,11 +333,11 @@ class Pretrainer:
         names = {id(p): n for n, p in self.net.named_parameters()}
         new = self.opt.state_dict()
         for gi, g in enumerate(self.opt.param_groups):   # the old run's group gi held the same parameters minus the new ones
-            mine = [p for p in g["params"] if names[id(p)] in c["model"]]
-            for p, oi in zip(mine, old["param_groups"][gi]["params"]):
+            mine = [(j, p) for j, p in enumerate(g["params"]) if names[id(p)] in c["model"]]   # j, not list.index (== on tensors)
+            for (j, p), oi in zip(mine, old["param_groups"][gi]["params"]):
                 st = old["state"].get(oi)
                 if st is not None and all(v.shape == p.shape for v in st.values() if torch.is_tensor(v) and v.ndim):
-                    new["state"][new["param_groups"][gi]["params"][g["params"].index(p)]] = st
+                    new["state"][new["param_groups"][gi]["params"][j]] = st
         self.opt.load_state_dict(new)
 
     def _checkpoint(self) -> None:
