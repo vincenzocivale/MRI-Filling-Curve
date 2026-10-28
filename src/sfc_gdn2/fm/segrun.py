@@ -44,7 +44,6 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -446,7 +445,7 @@ def train(job: dict) -> None:
     DET = job.get("select") == "det"   # point detection (cmbpts, user 28/10): component centroids matched within DET_MM
     # the true points: the task's points csv (id, i, j, k: GT voxels) when given, else the label's components' centroids
     # (2 mm spheres closer than ~4 mm merge: ~3 % of the cmbpts lesions, Ettore 28/10)
-    PTS = pd.read_csv(job["items"][0]["points"]).groupby("id")[["i", "j", "k"]] if DET and job["items"][0].get("points") else None
+    PTS = read_points(job["items"][0]["points"]) if DET and job["items"][0].get("points") else None
     net.lm_prior = float(os.environ.get("SFC_LM_PRIOR", "0"))   # landmark_predict: + the level heads' log-sigmoid (diagnosis)
     if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
         global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
@@ -870,15 +869,26 @@ def grid_spacing(grid_from_gt, seg) -> np.ndarray:
     return np.linalg.norm(A * np.asarray(nib.load(seg).header.get_zooms()[:3], dtype=float)[:, None], axis=0)
 
 
+def read_points(path: str) -> dict[str, np.ndarray]:
+    """The task's points csv (id, i, j, k GT voxels) -> {id: [n, 3]}; csv, not pandas: segrun runs in the models' own
+    envs, some without pandas (fm-asparagus, fm-medicalnet: the externals' prep failed on a top-level import, 28/10)."""
+    import csv
+    out = {}
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            out.setdefault(r["id"], []).append([float(r["i"]), float(r["j"]), float(r["k"])])
+    return {k: np.asarray(v) for k, v in out.items()}
+
+
 def true_points(pts, i: str, grid_from_gt) -> np.ndarray | None:
-    """The task's true points of volume i (GT voxels, points csv grouped by id) on the model grid [n, 3]; None without
-    a points csv (the label's components then)."""
+    """The task's true points of volume i (GT voxels, read_points) on the model grid [n, 3]; None without a points csv
+    (the label's components then)."""
     if pts is None:
         return None
-    if i not in pts.groups:
+    if i not in pts:
         return np.zeros((0, 3))
     M = np.asarray(grid_from_gt, dtype=float)
-    return pts.get_group(i).to_numpy(float) @ M[:3, :3].T + M[:3, 3]
+    return pts[i] @ M[:3, :3].T + M[:3, 3]
 
 
 def _score(m: np.ndarray, t: np.ndarray, f1, gt=None, comp=None, sp=None, pts=None) -> tuple:
