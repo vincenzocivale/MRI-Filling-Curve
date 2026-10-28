@@ -483,6 +483,8 @@ def train(job: dict) -> None:
     # on disk as the run goes, so a killed job resumes: the training state every 10 min (.last.pt), the best state
     # until the test is written (.best.pt), the test volumes done (.test.json)
     out_p = Path(job["out"])
+    if hasattr(net, "cube_dir"):   # fm/dense_dec cubes: the training scans' cubes kept next to the result (resumes reload them)
+        net.cube_dir = out_p.with_suffix(".cubes")
     ckpt, last, part = (out_p.with_suffix(s) for s in (".best.pt", ".last.pt", ".test.json"))
     out_p.parent.mkdir(parents=True, exist_ok=True)
     # + the wrapper's whole config and the tile rule: a run of another decoder in the same folder is never resumed

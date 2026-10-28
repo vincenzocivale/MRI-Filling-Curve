@@ -180,6 +180,7 @@ class NativeDec(nn.Module):
         self.mg, self._mg = (None if notok else mg), {}
         self.cube, self.curves, self.seed = cubes and not notok, list(curves), seed
         self.cubes, self.active, self.preparing = {}, None, False   # {volume index: {mm: (cells, tokens, k, cube)}}
+        self.cube_dir = None   # segrun: <out>.cubes, the training scans' cubes per level (<mm>.pt), reloaded on resume
         self.register_buffer("stage", torch.zeros((), dtype=torch.long))
         lv = (*self.dense, *(MG if self.mg or self.cube else ()))
         c = encoder.dim * (1 + len(encoder.taps))
@@ -339,11 +340,24 @@ class NativeDec(nn.Module):
         t0 = __import__("time").time()
         self.stage.fill_(n)
         for level in range(1 if resume else n, n + 1):
-            for x, c in scans:
-                self.place(x, c, level, lambda x=x, c=c: predict(x, c))
-            cells = sum(len(v[MG[level - 1]][0]) for v in self.cubes.values() if MG[level - 1] in v)
-            print(f"[seg] cubes: {MG[level - 1]:g} mm {'again on resume' if resume else f'from it {it}'} on {len(scans)} "
-                  f"training scans, {cells} cells ({__import__('time').time() - t0:.0f} s)", flush=True)
+            mm = MG[level - 1]
+            f = None if self.cube_dir is None else self.cube_dir / f"{mm:g}.pt"
+            if resume and f is not None and f.exists():   # the cubes placed when the level started, as they were
+                for vid, v in torch.load(f, weights_only=False).items():
+                    self.cubes.setdefault(vid, {})[mm] = v
+                how = "reloaded"
+            else:
+                for x, c in scans:
+                    self.place(x, c, level, lambda x=x, c=c: predict(x, c))
+                if f is not None:
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    ids = {int(c[6]) for _, c in scans}
+                    torch.save({vid: v[mm] for vid, v in self.cubes.items() if vid in ids and mm in v}, f.with_suffix(".tmp"))
+                    f.with_suffix(".tmp").replace(f)
+                how = "placed again on resume" if resume else f"placed from it {it}"
+            cells = sum(len(v[mm][0]) for v in self.cubes.values() if mm in v)
+            print(f"[seg] cubes: {mm:g} mm {how} on {len(scans)} training scans, {cells} cells "
+                  f"({__import__('time').time() - t0:.0f} s)", flush=True)
 
 
 @torch.no_grad()
