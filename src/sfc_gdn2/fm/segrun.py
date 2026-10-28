@@ -567,7 +567,8 @@ def train(job: dict) -> None:
                 net.on_val(0, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
                            lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv), resume=True)
         elif hasattr(net, "fit_selector"):   # fm/dense_dec CubeDec: the selector's probe, then the first cubes
-            net.fit_selector([(xv, yv, cv) for (xv, yv, _), cv in zip(data.vols, data.ctx)])
+            net.fit_selector([(xv, yv, cv) for (xv, yv, _), cv in zip(data.vols, data.ctx)],
+                             [(v["x"], v["y"], v["ctx"]) for v in val_v])
             net.eval()
             net.on_val(0, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
                        lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv))

@@ -516,12 +516,9 @@ class CubeDec(DenseDec):
         t16 = t16[par[0][:, None, None], par[1][None, :, None], par[2][None, None, :]]
         return torch.cat([self.sel_ln(t8), self.sel_ln(t16)], -1), c0, k8
 
-    @torch.no_grad()
-    def fit_selector(self, scans) -> None:
-        """The selector's probe before training (user 29/10): logistic regression of "the 8 mm cell holds foreground" on
-        the training scans (scans: (x, y, ctx)), every positive cell and up to 4x as many negatives per scan, L-BFGS."""
-        dev, X, Y = self.sel_probe.weight.device, [], []
-        g = torch.Generator().manual_seed(self.seed)
+    def _probe_data(self, scans, g, sub: bool = True):
+        """(features, labels) of the 8 mm cells of scans (x, y, ctx); sub: every positive and up to 4x as many negatives."""
+        X, Y = [], []
         for x, y, c in scans:
             i = self.cache.ids[int(c[6])]
             S = list(y.shape[-3:])
@@ -530,27 +527,47 @@ class CubeDec(DenseDec):
             occ = F.max_pool3d(fg, k8, k8, ceil_mode=True)[0, 0][: f.shape[0], : f.shape[1], : f.shape[2]].flatten() > 0
             f = f.reshape(-1, f.shape[-1])[: len(occ)]
             neg = (~occ).nonzero()[:, 0]
-            neg = neg[torch.randperm(len(neg), generator=g)[: max(4 * int(occ.sum()), 64)]]
+            if sub:
+                neg = neg[torch.randperm(len(neg), generator=g)[: max(4 * int(occ.sum()), 64)]]
             X.append(torch.cat([f[occ], f[neg]]).half())
             Y.append(torch.cat([torch.ones(int(occ.sum())), torch.zeros(len(neg))]))
-        X, Y = torch.cat(X).to(dev), torch.cat(Y).to(dev)
-        w = torch.zeros(X.shape[1] + 1, device=dev, requires_grad=True)
-        pw = (Y == 0).sum() / (Y == 1).sum().clamp(min=1)
-        opt = torch.optim.LBFGS([w], max_iter=100, history_size=10, line_search_fn="strong_wolfe")
+        dev = self.sel_probe.weight.device
+        return torch.cat(X).to(dev), torch.cat(Y).to(dev)
 
-        def closure():
-            opt.zero_grad()
-            with torch.enable_grad():
-                z = X.float() @ w[:-1] + w[-1]
-                loss = F.binary_cross_entropy_with_logits(z, Y, pos_weight=pw) + 1e-4 * w[:-1].square().sum()
-                loss.backward()
-            return loss
-        opt.step(closure)
-        self.sel_probe.weight.copy_(w[None, :-1].detach())
-        self.sel_probe.bias.copy_(w[-1:].detach())
-        hit = ((X.float() @ w[:-1] + w[-1]) > 0).float()
-        print(f"[seg] selector probe: {len(Y)} cells ({int(Y.sum())} foreground), train recall "
-              f"{float(hit[Y == 1].mean()):.3f}, false positives {float(hit[Y == 0].mean()):.3f}", flush=True)
+    @torch.no_grad()
+    def fit_selector(self, scans, val) -> None:
+        """The selector's probe before training (user 29/10): logistic regression of "the 8 mm cell holds foreground" on
+        the training scans (scans: (x, y, ctx); every positive cell, up to 4x as many negatives), L-BFGS, the L2 chosen on
+        the val scans' cells (all of them) by the same class-weighted loss."""
+        g = torch.Generator().manual_seed(self.seed)
+        X, Y = self._probe_data(scans, g)
+        Xv, Yv = self._probe_data(val, g, sub=False)
+        pw = (Y == 0).sum() / (Y == 1).sum().clamp(min=1)
+        pv = (Yv == 0).sum() / (Yv == 1).sum().clamp(min=1)
+        best = None
+        for l2 in (1e-2, 1.0, 1e2, 1e4):
+            w = torch.zeros(X.shape[1] + 1, device=X.device, requires_grad=True)
+            opt = torch.optim.LBFGS([w], max_iter=100, history_size=10, line_search_fn="strong_wolfe")
+
+            def closure(opt=opt, w=w, l2=l2):
+                opt.zero_grad()
+                with torch.enable_grad():
+                    z = X.float() @ w[:-1] + w[-1]
+                    loss = F.binary_cross_entropy_with_logits(z, Y, pos_weight=pw) + l2 * w[:-1].square().mean()
+                    loss.backward()
+                return loss
+            opt.step(closure)
+            zv = Xv.float() @ w[:-1] + w[-1]
+            lv = float(F.binary_cross_entropy_with_logits(zv, Yv, pos_weight=pv))
+            hit = (zv > 0).float()
+            print(f"[seg] selector probe l2 {l2:g}: val loss {lv:.4f}, recall {float(hit[Yv == 1].mean()):.3f}, "
+                  f"false positives {float(hit[Yv == 0].mean()):.3f}", flush=True)
+            if best is None or lv < best[0]:
+                best = (lv, l2, w.detach().clone())
+        self.sel_probe.weight.copy_(best[2][None, :-1])
+        self.sel_probe.bias.copy_(best[2][-1:])
+        print(f"[seg] selector probe: l2 {best[1]:g} on {len(Y)} training cells ({int(Y.sum())} foreground), "
+              f"{len(Yv)} val cells", flush=True)
 
     def place(self, x, ctx, level, predict) -> None:
         """NativeDec.place on the selector's map (sel_mode: forward returns it) instead of the segmentation."""
