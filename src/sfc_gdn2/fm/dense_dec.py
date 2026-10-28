@@ -8,7 +8,10 @@ cost ~10x the step; add a 4 mm cache level if the control says the tokens matter
 Variant B (args.dense_mg=<folder>, user 28/10: "the decoder could use the tokens as the probe does"): + the probe's
 multigrain 4 / 2 mm levels (fm/sfc.multigrain: cells under the most varied ones of the level above, label-free, a fixed
 budget), precomputed once per volume (python -m sfc_gdn2.fm.dense_dec <task> <folder> <checkpoint>), each 1/4-grid voxel
-taking its cell's projected token where that cell was read, zero elsewhere, with a read / not-read mask channel."""
+taking its cell's projected token where that cell was read, zero elsewhere, with a read / not-read mask channel.
+Sub-cell decoding (args.dense_sub=true, user 28/10: vs's small tumours under-segmented, trilinear treats a token as a
+point sample at its cell's centre and smears it over the neighbours): each 8 mm token is decoded into its own 4^3 sub-cells
+of 2 mm (a linear map, as a ViT's patch decoder / pixel shuffle), only then interpolated onto the 1/4 voxel grid."""
 from __future__ import annotations
 
 import torch
@@ -19,6 +22,7 @@ from .token_cache import TokenCache, fine_ok
 
 LEVELS = (16.0, 8.0)
 MG = (4.0, 2.0)     # variant B's sparse levels
+SUB = 4             # dense_sub: sub-cells per axis of an 8 mm token (2 mm)
 CH = (16, 32, 64)   # full, 1/2, 1/4 resolution
 TOK = 64            # channels of each token level after its projection
 
@@ -34,7 +38,8 @@ class DenseDec(nn.Module):
 
     tile_corner = True
 
-    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, width: float = 1.0, dense4: bool = False):
+    def __init__(self, encoder, cache: str, n_out: int, mg: str | None = None, width: float = 1.0, dense4: bool = False,
+                 sub: bool = False):
         super().__init__()
         global CH, TOK   # ponytail: module-level widths scaled per run (one decoder per process); args.dense_width
         CH, TOK = tuple(int(c * width) for c in (16, 32, 64)), int(64 * width)
@@ -44,6 +49,7 @@ class DenseDec(nn.Module):
         self.cache.levels = self.levels
         c = encoder.dim * (1 + len(encoder.taps))
         self.tok = nn.ModuleList(nn.Sequential(nn.LayerNorm(c), nn.Linear(c, TOK)) for _ in self.levels)
+        self.unpatch = nn.Linear(TOK, TOK * SUB ** 3) if sub else None   # the 8 mm level's sub-cells
         self.e0, self.e1, self.e2 = block(1, CH[0]), block(CH[0], CH[1], 2), block(CH[1], CH[2], 2)
         self.mg, self._mg = mg, {}
         if mg:
@@ -67,7 +73,11 @@ class DenseDec(nn.Module):
                 c0 = [c // kk for c, kk in zip(corner, k)]
                 n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
                 t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float().reshape(*n, -1)
-                g = self.tok[j](t).permute(3, 0, 1, 2)[None]                       # [1, TOK, *n] on the cell grid
+                g = self.tok[j](t)                                                 # [*n, TOK] on the cell grid
+                if self.unpatch is not None and mm == 8.0:   # [*n, S, S, S, TOK] -> the sub-cell grid [*n * S, TOK]
+                    g = self.unpatch(g).view(*n, SUB, SUB, SUB, TOK).permute(0, 3, 1, 4, 2, 5, 6)
+                    g = g.reshape(*[a * SUB for a in n], TOK)
+                g = g.permute(3, 0, 1, 2)[None]                                    # [1, TOK, *grid]
                 # cell centres -> voxels: the cells' grid spans n*k voxels from c0*k; the tile is a crop of it
                 full = [a * kk for a, kk in zip(n, k)]
                 g = F.interpolate(g, size=[max(1, f // 4) for f in full], mode="trilinear", align_corners=False)
