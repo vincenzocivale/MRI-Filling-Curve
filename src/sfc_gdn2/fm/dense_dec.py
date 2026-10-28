@@ -250,7 +250,7 @@ class NativeDec(nn.Module):
             ok = ((q >= lo) & (q < hi)).all(1)
             g = torch.zeros(*n, w, device=dev)
             if ok.any():
-                f = self.tok[f"g{mm:g}"](h[ok.cpu()].to(dev).float())
+                f = self._proj(mm)(h[ok.cpu()].to(dev).float())
                 qi = q[ok] - lo
                 g[qi[:, 0], qi[:, 1], qi[:, 2]] = torch.cat([f, f.new_ones(len(f), 1)], 1).float()
             out[mm] = gather(g, c0, k, corner, T, s)
@@ -272,13 +272,21 @@ class NativeDec(nn.Module):
 
     tile_max = staticmethod(DenseDec.tile_max)
 
+    def _proj(self, mm: float) -> nn.Module:
+        return self.tok[f"g{mm:g}"]
+
+    @staticmethod
+    def _cell(sp, mm: float) -> list:
+        from ..data.volume import patch_dims
+        return list(patch_dims(sp, mm))
+
     @torch.no_grad()
     def place(self, x: torch.Tensor, ctx: torch.Tensor, level: int, predict) -> None:
         """Level `level` (1: 4 mm, 2: 2 mm) of the scan x [1, *S] (ctx: spacing, shape, volume index): predict() with the
         levels above, cubes greedily on the foreground probability (each cube's cells excluded from the next centres),
         each cube read by the frozen encoder as one view (box-local curve keys, the curves averaged)."""
         from ..curves import grid_coords, keys
-        from ..data.volume import patch_dims, patchify
+        from ..data.volume import patchify
         vid, mm = int(ctx[6]), MG[level - 1]
         self.active, self.preparing = level - 1, True
         try:
@@ -286,7 +294,7 @@ class NativeDec(nn.Module):
         finally:
             self.active, self.preparing = None, False
         dev, sp = p.device, ctx[:3].float()
-        k = patch_dims(sp.tolist(), mm)
+        k = self._cell(sp.tolist(), mm)
         self.cubes.setdefault(vid, {}).pop(mm, None)
         if not fine_ok(k):
             return
@@ -414,3 +422,50 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+class CubeDec(DenseDec):
+    """args.dense_cubes without dense_native (user 28/10: "keep simpleA, 3 stages"): simpleA (16 / 8 mm at the 1/4
+    bottleneck) + NativeDec's cubes, the 2 mm ones at the 1/2 stage (8 channels + mask: into the encoder path and its skip),
+    the 4 mm ones at the bottleneck (16 + mask). A cube's cell is aligned to its stage: per axis the stage's stride times
+    round(grain / (stride x spacing)), at least one stride (fetal 0.6 mm: 2.4 and 4.8 mm cells, 2 stage voxels each)."""
+
+    _cubes_of, sparse, place, prepare, on_val = (NativeDec._cubes_of, NativeDec.sparse, NativeDec.place,
+                                                 NativeDec.prepare, NativeDec.on_val)
+    tile_max = staticmethod(DenseDec.tile_max)
+
+    def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
+        super().__init__(encoder, cache, n_out)
+        c = encoder.dim * (1 + len(encoder.taps))
+        self.ctok = nn.ModuleDict({f"g{mm:g}": nn.Sequential(nn.LayerNorm(c), nn.Linear(c, NTOK[mm])) for mm in MG})
+        w2, w4 = NTOK[2.0] + 1, NTOK[4.0] + 1
+        self.e2 = block(CH[1] + w2, CH[2], 2)
+        self.mid = block(CH[2] + TOK * len(self.levels) + w4, CH[2])
+        self.d1 = block(2 * CH[1] + w2, CH[1])
+        self.cube, self.curves, self.seed, self.mg = True, list(curves), seed, None
+        self.cubes, self.active, self.preparing, self.cube_dir = {}, None, False, None
+        self.register_buffer("stage", torch.zeros((), dtype=torch.long))
+
+    def _proj(self, mm: float) -> nn.Module:
+        return self.ctok[f"g{mm:g}"]
+
+    @staticmethod
+    def _cell(sp, mm: float) -> list:
+        st = 2 ** NSTAGE[mm]
+        return [st * max(1, round(mm / (st * float(z)))) for z in sp]
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        T0 = tuple(x.shape[2:])
+        x = F.pad(x, [p for t in reversed(T0) for p in (0, -t % 4)])
+        T, dev = tuple(x.shape[2:]), x.device
+        fine = {1: [], 2: []}
+        for r in ctx.tolist():
+            for mm, f in self.sparse(self._cubes_of(int(r[6])), [int(v) for v in r[7:10]], T, dev).items():
+                fine[NSTAGE[mm]].append(f)
+        f0 = self.e0(x)
+        f1 = torch.cat([self.e1(f0), torch.cat(fine[1]).to(x.dtype)], 1)
+        f2 = torch.cat([self.e2(f1), self.fields(ctx, T, dev).to(x.dtype), torch.cat(fine[2]).to(x.dtype)], 1)
+        h = self.mid(f2)
+        h = self.d1(torch.cat([self.u1(h), f1], 1))
+        h = self.d0(torch.cat([self.u0(h), f0], 1))
+        return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
