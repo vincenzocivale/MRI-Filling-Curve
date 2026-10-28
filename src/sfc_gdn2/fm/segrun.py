@@ -224,6 +224,20 @@ def focal_heatmap(logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     return -(((1 - p) ** 2 * lp)[pos].sum() + neg.sum()) / pos.sum()
 
 
+def sel_target(net, y) -> None:
+    """fm/dense_dec CubeDec: the labels of the tiles the next forward trains its selector on."""
+    if hasattr(net, "sel_y"):
+        net.sel_y = y
+
+
+def pop_aux(net):
+    """The auxiliary loss the last forward left (CubeDec's selector), 0 otherwise."""
+    a = getattr(net, "aux", 0.0)
+    if hasattr(net, "aux"):
+        net.aux = 0.0
+    return a
+
+
 def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
     """Landmark tasks: channels 1.. of the decoder are heatmaps (sigmoid), y the tiles' target heatmaps; one scan
     at a time, every model's decoder as it is."""
@@ -238,9 +252,10 @@ def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
         return loss.detach()
     tot = 0.0
     for xi, yi, ci in parts:   # the other models: one scan at a time
+        sel_target(net, (yi.amax(1) > 0.1).to(torch.uint8))
         with amp():
             lg = call(net, xi.to(dev).float(), ci)
-        loss = focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) / len(parts)
+        loss = (focal_heatmap(lg[:, 1:].float(), yi.to(dev).float()) + pop_aux(net)) / len(parts)
         loss.backward()
         tot += float(loss)
     return torch.tensor(tot)
@@ -378,10 +393,11 @@ def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
     b = (2 * inter + 1e-5) / den ** 2 / (k - 1)
     a[0] = b[0] = 0
     for xi, yi, ci in parts:
+        sel_target(net, yi)
         with amp():
             logits = call(net, xi.to(dev).float(), ci)
         ce, _, i_, p_, _ = batch_sums(logits, yi.to(dev), k)
-        (ce / n + (a * i_).sum() + (b * p_).sum()).backward()
+        (ce / n + (a * i_).sum() + (b * p_).sum() + pop_aux(net) / len(parts)).backward()
     dice = (2 * inter[1:] + 1e-5) / den[1:]
     return sum(s[0] for s in sums) / n + 1 - dice.mean()
 
@@ -479,6 +495,9 @@ def train(job: dict) -> None:
             ctx = torch.cat([ctx, torch.tensor([float(vid[it["id"]])])])
             if hasattr(tcache, "ensure"):   # LiveCache: its levels read and written now if the folder lacks them
                 tcache.ensure(it["id"], r["x"], r["ctx"])
+        if hasattr(net, "vol_stats"):   # fm/dense_dec CubeDec: z-score per scan on its nonzero voxels (nnU-Net's)
+            nz = r["x"][r["x"] != 0].float()
+            net.vol_stats[vid[it["id"]]] = (float(nz.mean()), float(nz.std()) + 1e-6)
         v = {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx,
              "align": None if tcache is None else [4 * a for a in tcache.meta(it["id"])["k4"]]}
         if DET:
@@ -547,6 +566,11 @@ def train(job: dict) -> None:
                 net.eval()
                 net.on_val(0, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
                            lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv), resume=True)
+        elif hasattr(net, "fit_selector"):   # fm/dense_dec CubeDec: the selector's probe, then the first cubes
+            net.fit_selector([(xv, yv, cv) for (xv, yv, _), cv in zip(data.vols, data.ctx)])
+            net.eval()
+            net.on_val(0, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
+                       lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv))
         t_save = time.time()
 
         def save_last(it: int) -> None:
@@ -620,9 +644,10 @@ def train(job: dict) -> None:
                 loss = micro_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             else:
+                sel_target(net, y)
                 with amp():
                     logits = call(net, x.to(dev, non_blocking=True).float(), c)
-                loss = loss_fn(logits, y.to(dev), k)
+                loss = loss_fn(logits, y.to(dev), k) + pop_aux(net)
                 loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
             if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch

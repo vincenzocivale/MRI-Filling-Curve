@@ -439,8 +439,7 @@ class CubeDec(DenseDec):
     the 4 mm ones at the bottleneck (16 + mask). A cube's cell is aligned to its stage: per axis the stage's stride times
     round(grain / (stride x spacing)), at least one stride (fetal 0.6 mm: 2.4 and 4.8 mm cells, 2 stage voxels each)."""
 
-    _cubes_of, sparse, place, prepare, on_val = (NativeDec._cubes_of, NativeDec.sparse, NativeDec.place,
-                                                 NativeDec.prepare, NativeDec.on_val)
+    _cubes_of, sparse, prepare = NativeDec._cubes_of, NativeDec.sparse, NativeDec.prepare
     tile_max = staticmethod(DenseDec.tile_max)
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
@@ -458,8 +457,19 @@ class CubeDec(DenseDec):
         self.d1 = block(2 * CH[1] + w2, CH[1])
         self.cube, self.curves, self.seed, self.mg = True, list(curves), seed, None
         self.cubes, self.active, self.preparing, self.cube_dir = {}, None, False, None
-        self.register_buffer("stage", torch.zeros((), dtype=torch.long))
+        self.register_buffer("stage", torch.full((), 2, dtype=torch.long))   # both fine levels from the start
         self.cum, self.off = {0: [1, 1, 1], 1: [2, 2, 2], 2: [4, 4, 4]}, set()   # plan(): per task
+        # 29/10 (user): the fine inputs scaled by gains from 0 (the network opens them when they help: the schedule); the
+        # cubes chosen by a selector = a linear probe on the 16 / 8 mm tokens (fit before training) + a correction on the
+        # U-Net's bottleneck (from 0, detached), trained with BCE + Tversky on "the cell holds foreground"; the input
+        # z-scored per scan (vol_stats, segrun.load), as every external model's preprocessing
+        self.gain = nn.Parameter(torch.zeros(2))
+        self.sel_ln = nn.LayerNorm(c, elementwise_affine=False)
+        self.sel_probe = nn.Linear(2 * c, 1)
+        self.sel_corr = nn.Conv3d(CH[2], 1, 1)
+        nn.init.zeros_(self.sel_corr.weight)
+        nn.init.zeros_(self.sel_corr.bias)
+        self.vol_stats, self.sel_y, self.aux, self.sel_mode = {}, None, 0.0, False
 
     def plan(self, ids) -> None:
         """The task's fingerprint (median spacing of the training scans, from the token cache) -> the 3 stages' strides per
@@ -491,17 +501,130 @@ class CubeDec(DenseDec):
     def _cell(self, sp, mm: float) -> list:
         return [a * max(1, round(mm / (a * float(z)))) for a, z in zip(self._stride(mm), sp)]
 
+    def _cells(self, i: str, mm: float, corner, T):
+        """The cached tokens of level mm over the tile (corner, T voxels): [*n, C] from cell c0, cells of k voxels."""
+        k = [a * int(mm // 4) for a in self.cache.meta(i)["k4"]]
+        c0 = [c // kk for c, kk in zip(corner, k)]
+        n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
+        return self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).float().reshape(*n, -1), c0, k
+
+    def _probe_feats(self, i: str, corner, T):
+        """Each 8 mm cell of the tile: its token ++ its 16 mm parent's, layer-normed -> [*n8, 2C], c0, k8."""
+        t8, c0, k8 = self._cells(i, 8.0, corner, T)
+        t16, d0, _ = self._cells(i, 16.0, corner, T)
+        par = [((torch.arange(n) + a) // 2 - b).clamp(0, m - 1) for n, a, b, m in zip(t8.shape[:3], c0, d0, t16.shape[:3])]
+        t16 = t16[par[0][:, None, None], par[1][None, :, None], par[2][None, None, :]]
+        return torch.cat([self.sel_ln(t8), self.sel_ln(t16)], -1), c0, k8
+
+    @torch.no_grad()
+    def fit_selector(self, scans) -> None:
+        """The selector's probe before training (user 29/10): logistic regression of "the 8 mm cell holds foreground" on
+        the training scans (scans: (x, y, ctx)), every positive cell and up to 4x as many negatives per scan, L-BFGS."""
+        dev, X, Y = self.sel_probe.weight.device, [], []
+        g = torch.Generator().manual_seed(self.seed)
+        for x, y, c in scans:
+            i = self.cache.ids[int(c[6])]
+            S = list(y.shape[-3:])
+            f, _, k8 = self._probe_feats(i, [0, 0, 0], S)
+            fg = ((y > 0) & (y < 255)).float().reshape(1, 1, *S)
+            occ = F.max_pool3d(fg, k8, k8, ceil_mode=True)[0, 0][: f.shape[0], : f.shape[1], : f.shape[2]].flatten() > 0
+            f = f.reshape(-1, f.shape[-1])[: len(occ)]
+            neg = (~occ).nonzero()[:, 0]
+            neg = neg[torch.randperm(len(neg), generator=g)[: max(4 * int(occ.sum()), 64)]]
+            X.append(torch.cat([f[occ], f[neg]]).half())
+            Y.append(torch.cat([torch.ones(int(occ.sum())), torch.zeros(len(neg))]))
+        X, Y = torch.cat(X).to(dev), torch.cat(Y).to(dev)
+        w = torch.zeros(X.shape[1] + 1, device=dev, requires_grad=True)
+        pw = (Y == 0).sum() / (Y == 1).sum().clamp(min=1)
+        opt = torch.optim.LBFGS([w], max_iter=100, history_size=10, line_search_fn="strong_wolfe")
+
+        def closure():
+            opt.zero_grad()
+            with torch.enable_grad():
+                z = X.float() @ w[:-1] + w[-1]
+                loss = F.binary_cross_entropy_with_logits(z, Y, pos_weight=pw) + 1e-4 * w[:-1].square().sum()
+                loss.backward()
+            return loss
+        opt.step(closure)
+        self.sel_probe.weight.copy_(w[None, :-1].detach())
+        self.sel_probe.bias.copy_(w[-1:].detach())
+        hit = ((X.float() @ w[:-1] + w[-1]) > 0).float()
+        print(f"[seg] selector probe: {len(Y)} cells ({int(Y.sum())} foreground), train recall "
+              f"{float(hit[Y == 1].mean()):.3f}, false positives {float(hit[Y == 0].mean()):.3f}", flush=True)
+
+    def place(self, x, ctx, level, predict) -> None:
+        """NativeDec.place on the selector's map (sel_mode: forward returns it) instead of the segmentation."""
+        self.sel_mode = True
+        try:
+            NativeDec.place(self, x, ctx, level, predict)
+        finally:
+            self.sel_mode = False
+
+    def on_val(self, it: int, every: int, scans, predict, resume: bool = False) -> None:
+        """segrun: at the start (it 0) and after every validation the cubes of both levels placed again on the training
+        scans with the current selector, saved to cube_dir; a resumed run reloads the last ones."""
+        import time
+        t0 = time.time()
+        for level, mm in ((1, 4.0), (2, 2.0)):
+            f = None if self.cube_dir is None else self.cube_dir / f"{mm:g}.pt"
+            if resume and f is not None and f.exists():
+                for vid, v in torch.load(f, weights_only=False).items():
+                    self.cubes.setdefault(vid, {})[mm] = v
+                continue
+            for x, c in scans:
+                self.place(x, c, level, lambda x=x, c=c: predict(x, c))
+            if f is not None:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                ids = {int(c[6]) for _, c in scans}
+                torch.save({vid: v[mm] for vid, v in self.cubes.items() if vid in ids and mm in v}, f.with_suffix(".tmp"))
+                f.with_suffix(".tmp").replace(f)
+        cells = {mm: sum(len(v[mm][0]) for v in self.cubes.values() if mm in v) for mm in MG}
+        print(f"[seg] cubes {'reloaded' if resume else f'placed at it {it}'} on {len(scans)} training scans: "
+              f"{cells} cells, gains {[round(float(a), 3) for a in self.gain.detach()]} ({time.time() - t0:.0f} s)", flush=True)
+
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        if self.vol_stats:   # z-score per scan (the stats of the scan the tile comes from)
+            ms = torch.tensor([self.vol_stats[int(r[6])] for r in ctx.tolist()], device=x.device, dtype=x.dtype)
+            x = (x - ms[:, 0, None, None, None, None]) / ms[:, 1, None, None, None, None]
         T0 = tuple(x.shape[2:])
         x = F.pad(x, [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)])
         T, dev = tuple(x.shape[2:]), x.device
         fine = {1: [], 2: []}
         for r in ctx.tolist():
-            for mm, f in self.sparse(self._cubes_of(int(r[6])), [int(v) for v in r[7:10]], T, dev).items():
+            src = {} if self.sel_mode else self._cubes_of(int(r[6]))
+            for mm, f in self.sparse(src, [int(v) for v in r[7:10]], T, dev).items():
                 fine[NSTAGE[mm]].append(f)
         f0 = self.e0(x)
-        f1 = torch.cat([self.e1(f0), torch.cat(fine[1]).to(x.dtype)], 1)
-        f2 = torch.cat([self.e2(f1), self.fields(ctx, T, dev).to(x.dtype), torch.cat(fine[2]).to(x.dtype)], 1)
+        f1 = torch.cat([self.e1(f0), self.gain[0] * torch.cat(fine[1]).to(x.dtype)], 1)
+        e2 = self.e2(f1)
+        sel = None
+        if self.sel_mode or (self.training and self.sel_y is not None):
+            b = self.cum[2]
+            pl = []
+            for r in ctx.tolist():
+                fe, c0, k8 = self._probe_feats(self.cache.ids[int(r[6])], [int(v) for v in r[7:10]], T)
+                pl.append(gather(self.sel_probe(fe.to(dev)), c0, k8, [int(v) for v in r[7:10]], T, b))
+            sel = torch.cat(pl) + self.sel_corr(e2.detach().float())   # [B, 1, *T / b]
+        if self.sel_mode:   # the selector's map in the decoder's channels: softmax and sigmoid both give sigma(sel)
+            up = sel.float()
+            for d, a in enumerate(b):
+                up = up.repeat_interleave(a, 2 + d)
+            n = self.out.out_channels
+            out = torch.full((len(x), n, *T), -1e4, device=dev)
+            out[:, 0] = 0
+            out[:, 1] = up[:, 0]
+            return out[:, :, : T0[0], : T0[1], : T0[2]]
+        if sel is not None:   # BCE + Tversky (false negatives x 0.7) on the bottleneck voxels holding foreground
+            y = self.sel_y.to(dev)
+            y = F.pad(((y > 0) & (y < 255)).float(), [p for t, m in zip(reversed(T0), reversed(b)) for p in (0, -t % m)])
+            tgt = F.max_pool3d(y.reshape(len(x), 1, *T), b, b)
+            pr = sel.float().sigmoid()
+            tp, fn, fp = ((pr * tgt).sum((1, 2, 3, 4)), ((1 - pr) * tgt).sum((1, 2, 3, 4)),
+                          (pr * (1 - tgt)).sum((1, 2, 3, 4)))
+            self.aux = F.binary_cross_entropy_with_logits(sel.float(), tgt) + \
+                (1 - (tp + 1) / (tp + 0.7 * fn + 0.3 * fp + 1)).mean()
+            self.sel_y = None
+        f2 = torch.cat([e2, self.fields(ctx, T, dev).to(x.dtype), self.gain[1] * torch.cat(fine[2]).to(x.dtype)], 1)
         h = self.mid(f2)
         h = self.d1(torch.cat([self._up(self.u1, h, [b // a for a, b in zip(self.cum[1], self.cum[2])]), f1], 1))
         h = self.d0(torch.cat([self._up(self.u0, h, self.cum[1]), f0], 1))
