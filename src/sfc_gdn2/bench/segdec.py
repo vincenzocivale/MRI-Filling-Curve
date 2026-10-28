@@ -35,7 +35,7 @@ def task_items(tasks: dict, vols: pd.DataFrame, splits: pd.DataFrame, seed: int,
     for name, cfg in tasks.items():
         rows = task_rows(vols, splits, cfg, seed)
         sel = {s: idx[:sample] for s, idx in select(rows, cfg, np.random.default_rng(seed)).items()}
-        lm = {k: cfg[k] for k in ("classes", "ignore", "save_pred", "select") if cfg.get(k)}   # multi-label maps (21/10)
+        lm = {k: cfg[k] for k in ("classes", "ignore", "save_pred", "select", "points") if cfg.get(k)}   # multi-label maps (21/10)
         out[name] = [{"id": r["id"], "image": r["input"], "seg": r["seg"], "split": s, "subject": r["subject"]} | lm
                      for s, idx in sel.items() for _, r in rows.loc[idx].iterrows()]
     return out
