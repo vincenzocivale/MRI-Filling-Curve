@@ -55,6 +55,7 @@ from .worker import build, fail, prepared
 TILE_CELLS = 10
 AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
+REFRESH = 125   # fm/dense_dec CubeDec: iterations between the training scans' cube refreshes
 SLIDE_BATCH = int(os.environ.get("SFC_SLIDE_BATCH", "4"))   # sliding: tiles per forward (halved on OOM)
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
@@ -629,6 +630,8 @@ def train(job: dict) -> None:
                                                               + "\n\n" + buf.getvalue())
                     print(f"[seg] profile: {head} -> {out_p.with_suffix('.prof.txt')}", flush=True)
                     return
+            if hasattr(net, "refresh") and it % REFRESH == 0:   # fm/dense_dec CubeDec: cubes from the selector's maps
+                net.refresh([(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)], it)
             ta = time.time()
             x, y, c = queue.pop(0).result()
             if it + len(queue) < iters:

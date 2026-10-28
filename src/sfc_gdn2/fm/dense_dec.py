@@ -439,7 +439,7 @@ class CubeDec(DenseDec):
     the 4 mm ones at the bottleneck (16 + mask). A cube's cell is aligned to its stage: per axis the stage's stride times
     round(grain / (stride x spacing)), at least one stride (fetal 0.6 mm: 2.4 and 4.8 mm cells, 2 stage voxels each)."""
 
-    _cubes_of, sparse, prepare = NativeDec._cubes_of, NativeDec.sparse, NativeDec.prepare
+    _cubes_of, sparse = NativeDec._cubes_of, NativeDec.sparse
     tile_max = staticmethod(DenseDec.tile_max)
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
@@ -470,6 +470,7 @@ class CubeDec(DenseDec):
         nn.init.zeros_(self.sel_corr.weight)
         nn.init.zeros_(self.sel_corr.bias)
         self.vol_stats, self.sel_y, self.aux, self.sel_mode = {}, None, 0.0, False
+        self.sel_map, self.boxes = {}, {}   # training scans: the selector's map; (scan, level): the cubes chosen
 
     def plan(self, ids) -> None:
         """The task's fingerprint (median spacing of the training scans, from the token cache) -> the 3 stages' strides per
@@ -569,35 +570,123 @@ class CubeDec(DenseDec):
         print(f"[seg] selector probe: l2 {best[1]:g} on {len(Y)} training cells ({int(Y.sum())} foreground), "
               f"{len(Yv)} val cells", flush=True)
 
-    def place(self, x, ctx, level, predict) -> None:
-        """NativeDec.place on the selector's map (sel_mode: forward returns it) instead of the segmentation."""
-        self.sel_mode = True
-        try:
-            NativeDec.place(self, x, ctx, level, predict)
-        finally:
-            self.sel_mode = False
+    # 29/10 (user: refresh cheaper): cubes on a fixed grid per scan and level (16^3 cells, stride 8), chosen greedily on
+    # the selector's map at the bottleneck's resolution; the training scans' map is the selector's own output on the
+    # training tiles (sel_map, EMA 0.5, initialised by the probe alone), so a refresh (every REFRESH iterations) runs no
+    # network; a cube read once is kept on disk (cube_dir/read) and only cubes newly chosen are read by the encoder
 
-    def on_val(self, it: int, every: int, scans, predict, resume: bool = False) -> None:
-        """segrun: at the start (it 0) and after every validation the cubes of both levels placed again on the training
-        scans with the current selector, saved to cube_dir; a resumed run reloads the last ones."""
+    def _probe_map(self, x, ctx) -> torch.Tensor:
+        """The probe's foreground probability of a whole scan on the bottleneck grid [*S / b] (CPU)."""
+        S = [-(-s // a) * a for s, a in zip(x.shape[-3:], self.cum[2])]
+        fe, c0, k8 = self._probe_feats(self.cache.ids[int(ctx[6])], [0, 0, 0], S)
+        w = self.sel_probe.weight.device
+        return gather(self.sel_probe(fe.to(w)), c0, k8, [0, 0, 0], S, self.cum[2])[0, 0].float().sigmoid().cpu()
+
+    def _choose(self, ms: torch.Tensor, k) -> list:
+        """Greedy cubes on the map ms [*S / b]: the grid cube (16 cells of k voxels, stride 8) with the highest map value,
+        its region cleared, while >= TAU and < CAP -> [(lo, hi)] in cells."""
+        b, ms, boxes = self.cum[2], ms.clone().float(), []
+        K = [CUBE * kk // bb for kk, bb in zip(k, b)]
+        St = [max(1, a // 2) for a in K]
+        g = [-(-n * bb // kk) for n, bb, kk in zip(ms.shape, b, k)]   # cells per axis
+        while len(boxes) < CAP:
+            sc = F.max_pool3d(ms[None, None], K, St, ceil_mode=True)[0, 0]
+            if float(sc.max()) < TAU:
+                break
+            c = [int(a) * st for a, st in zip(torch.unravel_index(sc.argmax(), sc.shape), St)]   # map units
+            ms[c[0]: c[0] + K[0], c[1]: c[1] + K[1], c[2]: c[2] + K[2]] = -1
+            lo = [min(a * bb // kk, max(0, n - CUBE)) for a, bb, kk, n in zip(c, b, k, g)]
+            boxes.append((lo, [min(n, a + CUBE) for a, n in zip(lo, g)]))
+        return boxes
+
+    def _read(self, x, sp, mm: float, k, boxes, vid: int):
+        """The boxes' tokens (cells, tokens, k, cube) of scan x [1, *S]: each box read by the frozen encoder as one view
+        (box-local curve keys, the curves averaged), or loaded if read before (cube_dir/read); cells in several boxes once."""
+        from ..curves import grid_coords, keys
+        from ..data.volume import patchify
+        dev = self.sel_probe.weight.device
+        pt = patchify(x[0].to(dev).float(), k)
+        g = [-(-int(n) // kk) for n, kk in zip(x.shape[-3:], k)]
+        xyz = grid_coords(torch.tensor(g, device=dev)[None], len(pt))[0]
+        seen, qs, hs, cs = torch.zeros(len(pt), dtype=torch.bool), [], [], []
+        pe = self.encoder.patch_embed
+        mm0, pe.patch_mm = pe.patch_mm, mm
+        try:
+            wt = pe.weights(sp.to(dev), k)
+            for j, (lo, hi) in enumerate(boxes):
+                f = None if self.cube_dir is None else self.cube_dir / "read" / f"{vid}_{mm:g}_{'_'.join(map(str, lo))}.pt"
+                if f is not None and f.exists():
+                    q, h = torch.load(f, weights_only=False)
+                else:
+                    lt, ht = torch.tensor(lo, device=dev), torch.tensor(hi, device=dev)
+                    sel = ((xyz >= lt) & (xyz < ht)).all(1).nonzero()[:, 0]
+                    q, h = xyz[sel], 0
+                    cu = torch.tensor([0, len(sel)], dtype=torch.int32, device=dev)
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                        xe = pe(pt[sel], wt)
+                        for c in self.curves:
+                            o = keys(c, q - lt, ht - lt, self.seed).argsort()
+                            h = h + self.encoder.flat(xe[o], cu, pos=q[o]).float()[o.argsort()]
+                    q, h = q.short().cpu(), (h / len(self.curves)).half().cpu()
+                    if f is not None:
+                        f.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save((q, h), f)
+                lin = (q[:, 0].long() * g[1] + q[:, 1].long()) * g[2] + q[:, 2].long()
+                new = ~seen[lin]
+                seen[lin] = True
+                qs.append(q[new])
+                hs.append(h[new])
+                cs.append(torch.full((int(new.sum()),), j))
+        finally:
+            pe.patch_mm = mm0
+        return torch.cat(qs), torch.cat(hs), list(k), torch.cat(cs)
+
+    def _set_cubes(self, x, ctx, ms) -> int:
+        """Both levels' cubes of one scan from its map; returns the boxes read or changed."""
+        vid, sp, n = int(ctx[6]), ctx[:3].float(), 0
+        for mm in MG:
+            k = self._cell(sp.tolist(), mm)
+            boxes = [] if not fine_ok(k) or mm in self.off else self._choose(ms, k)
+            if self.boxes.get((vid, mm)) == boxes:
+                continue
+            self.boxes[(vid, mm)] = boxes
+            n += len(boxes)
+            if boxes:
+                self.cubes.setdefault(vid, {})[mm] = self._read(x, sp, mm, k, boxes, vid)
+            else:
+                self.cubes.get(vid, {}).pop(mm, None)
+        return n
+
+    @torch.no_grad()
+    def refresh(self, scans, it: int) -> None:
+        """segrun, every REFRESH iterations: the training scans' cubes from their selector maps (no network run)."""
         import time
         t0 = time.time()
-        for level, mm in ((1, 4.0), (2, 2.0)):
-            f = None if self.cube_dir is None else self.cube_dir / f"{mm:g}.pt"
-            if resume and f is not None and f.exists():
-                for vid, v in torch.load(f, weights_only=False).items():
-                    self.cubes.setdefault(vid, {})[mm] = v
-                continue
-            for x, c in scans:
-                self.place(x, c, level, lambda x=x, c=c: predict(x, c))
-            if f is not None:
-                f.parent.mkdir(parents=True, exist_ok=True)
-                ids = {int(c[6]) for _, c in scans}
-                torch.save({vid: v[mm] for vid, v in self.cubes.items() if vid in ids and mm in v}, f.with_suffix(".tmp"))
-                f.with_suffix(".tmp").replace(f)
-        cells = {mm: sum(len(v[mm][0]) for v in self.cubes.values() if mm in v) for mm in MG}
-        print(f"[seg] cubes {'reloaded' if resume else f'placed at it {it}'} on {len(scans)} training scans: "
-              f"{cells} cells, gains {[round(float(a), 3) for a in self.gain.detach()]} ({time.time() - t0:.0f} s)", flush=True)
+        n = sum(self._set_cubes(x, c, self.sel_map[int(c[6])]) for x, c in scans)
+        if n or it % 625 == 0:
+            cells = {mm: sum(len(v[mm][0]) for v in self.cubes.values() if mm in v) for mm in MG}
+            print(f"[seg] cubes at it {it}: {n} boxes changed, {cells} cells on {len(scans)} training scans, gains "
+                  f"{[round(float(a), 3) for a in self.gain.detach()]} ({time.time() - t0:.0f} s)", flush=True)
+
+    def on_val(self, it: int, every: int, scans, predict, resume: bool = False) -> None:
+        """segrun: at the start (it 0) and on resume the training scans' maps from the probe and their cubes (a resume
+        loads the cubes read before from disk); after the other validations nothing (refresh does it)."""
+        if it and not resume:
+            return
+        with torch.no_grad():
+            self.sel_map = {int(c[6]): self._probe_map(x, c) for x, c in scans}
+        self.boxes = {}
+        self.refresh(scans, it)
+
+    @torch.no_grad()
+    def prepare(self, x: torch.Tensor, ctx: torch.Tensor, predict) -> None:
+        """Val / test (segrun.sliding, before its pass): the selector's map on the scan (sel_mode pass), then its cubes."""
+        self.sel_mode, self.preparing = True, True
+        try:
+            p = predict()
+        finally:
+            self.sel_mode, self.preparing = False, False
+        self._set_cubes(x, ctx, F.max_pool3d(p[1:2].float()[None], self.cum[2], self.cum[2], ceil_mode=True)[0, 0].cpu())
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
         if self.vol_stats:   # z-score per scan (the stats of the scan the tile comes from)
@@ -641,6 +730,14 @@ class CubeDec(DenseDec):
             self.aux = F.binary_cross_entropy_with_logits(sel.float(), tgt) + \
                 (1 - (tp + 1) / (tp + 0.7 * fn + 0.3 * fp + 1)).mean()
             self.sel_y = None
+            with torch.no_grad():   # the training scans' maps follow the selector (EMA on the tile's region)
+                for r, pj in zip(ctx.tolist(), pr.detach().cpu()):
+                    m = self.sel_map.get(int(r[6]))
+                    if m is not None:
+                        o = [int(c) // a for c, a in zip(r[7:10], b)]
+                        sl = tuple(slice(a, a + n) for a, n in zip(o, pj.shape[1:]))
+                        reg = m[sl]
+                        reg.mul_(0.5).add_(0.5 * pj[0][tuple(slice(0, n) for n in reg.shape)])
         f2 = torch.cat([e2, self.fields(ctx, T, dev).to(x.dtype), self.gain[1] * torch.cat(fine[2]).to(x.dtype)], 1)
         h = self.mid(f2)
         h = self.d1(torch.cat([self._up(self.u1, h, [b // a for a, b in zip(self.cum[1], self.cum[2])]), f1], 1))
