@@ -56,6 +56,7 @@ from .worker import build, fail, prepared
 TILE_CELLS = 10
 AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
+SLIDE_BATCH = int(os.environ.get("SFC_SLIDE_BATCH", "4"))   # sliding: tiles per forward (halved on OOM)
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
 
@@ -157,14 +158,26 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     fits = x.is_cuda and n_out * math.prod(P) * 2 <= torch.cuda.mem_get_info(x.device)[0] / 4
     out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device if fits else "cpu")
     wsum = torch.zeros(P, device=x.device)
-    for a, b, c in product(*starts):   # one tile at a time
-        sl = (slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2]))
-        with amp():
-            cx = ctx if ctx is None or not getattr(net, "tile_corner", False) else \
-                torch.cat([ctx.float(), torch.tensor([a, b, c], dtype=torch.float)])   # fm/dense_dec: tokens by corner
-            lg = call(net, xp[(slice(None), *sl)][None], None if cx is None else cx[None])[0]
-        out[(slice(None), *sl)] += ((lg.float().sigmoid() if lm else lg.float().softmax(0)) * g).to(out)
-        wsum[sl] += g
+    tiles, i, bs = list(product(*starts)), 0, SLIDE_BATCH   # tiles in batches (28/10), halved on OOM
+    corner = ctx is not None and getattr(net, "tile_corner", False)
+    while i < len(tiles):
+        part = tiles[i: i + bs]
+        sls = [(slice(a, a + patch[0]), slice(b, b + patch[1]), slice(c, c + patch[2])) for a, b, c in part]
+        try:
+            with amp():
+                cx = None if ctx is None else torch.stack(
+                    [torch.cat([ctx.float(), torch.tensor(t, dtype=torch.float)]) if corner else ctx for t in part])
+                lg = call(net, torch.stack([xp[(slice(None), *sl)] for sl in sls]), cx)   # fm/dense_dec: tokens by corner
+        except torch.cuda.OutOfMemoryError:
+            if bs == 1:
+                raise
+            bs //= 2
+            torch.cuda.empty_cache()
+            continue
+        for sl, lt in zip(sls, lg):
+            out[(slice(None), *sl)] += ((lt.float().sigmoid() if lm else lt.float().softmax(0)) * g).to(out)
+            wsum[sl] += g
+        i += len(part)
     wsum = wsum.to(out.device)
     for c in range(n_out):  # one class at a time: dividing the whole fp16 accumulator by an fp32 tensor made an fp32
         out[c].div_(wsum)   # copy of it (whole-body nnF grids: 60 GB accumulator, RAM OOM at 240 GB)
