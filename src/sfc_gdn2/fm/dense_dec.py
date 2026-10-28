@@ -444,7 +444,12 @@ class CubeDec(DenseDec):
     tile_max = staticmethod(DenseDec.tile_max)
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
-        super().__init__(encoder, cache, n_out)
+        live = str(cache).startswith("live:")   # a task without a cache yet: written as segrun loads each scan
+        super().__init__(encoder, str(cache).removeprefix("live:"), n_out)
+        if live:
+            from .token_cache import LiveCache
+            self.cache, self.enc_curves = LiveCache(str(cache)[5:], self), list(curves)
+            self.cache.levels = self.levels
         c = encoder.dim * (1 + len(encoder.taps))
         self.ctok = nn.ModuleDict({f"g{mm:g}": nn.Sequential(nn.LayerNorm(c), nn.Linear(c, NTOK[mm])) for mm in MG})
         w2, w4 = NTOK[2.0] + 1, NTOK[4.0] + 1
@@ -461,6 +466,9 @@ class CubeDec(DenseDec):
         axis (nnU-Net's rule: an axis halves only while finer than twice the finest one) and the fine levels kept (off: a
         level whose cell on the median scan holds < 8 voxels, or the voxels of the level above). Isotropic scans: simpleA."""
         import numpy as np
+        ids = [i for i in ids if (self.cache.root / f"{i}.json").exists()]
+        if not ids:   # a live cache before its first scans: planned again once segrun has loaded them
+            return
         sp = np.median([self.cache.meta(i)["spacing"] for i in ids], 0).tolist()
         cur, cum = list(sp), [1, 1, 1]
         for s in (1, 2):

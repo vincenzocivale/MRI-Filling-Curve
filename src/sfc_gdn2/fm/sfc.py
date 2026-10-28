@@ -1161,7 +1161,7 @@ class SFC(Wrapper):
                 net = NativeDec(enc, tc, n_out, a.get("dense_mg"), bool(a.get("dense_notok")), bool(a.get("dense_cubes")),
                                 self.curves, int(self.run_cfg["seed"]))
             elif a.get("dense_cubes"):   # simpleA + the cubes (3 stages, user 28/10)
-                net = CubeDec(enc, tc, n_out, self.curves, int(self.run_cfg["seed"]))
+                net = CubeDec(enc, str(a["token_cache"]), n_out, self.curves, int(self.run_cfg["seed"]))
             else:
                 net = DenseDec(enc, tc, n_out, a.get("dense_mg"), float(a.get("dense_width") or 1), bool(a.get("dense_4mm")),
                                bool(a.get("dense_sub")), bool(a.get("dense_notok")))

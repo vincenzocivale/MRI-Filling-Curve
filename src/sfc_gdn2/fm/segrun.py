@@ -524,6 +524,8 @@ def train(job: dict) -> None:
         print(f"[seg] best state from {ckpt} (iter {best['iter']}), training skipped", flush=True)
     else:
         train_v = [load(it) for it in split["train"]]
+        if hasattr(net, "plan"):   # a live token cache is written by load(): the fingerprint again, now complete
+            net.plan([it["id"] for it in split["train"]])
         val_v = [load(it) for it in split["val"]]
         data = Patches(train_v, patch, k, rng)
         del train_v
