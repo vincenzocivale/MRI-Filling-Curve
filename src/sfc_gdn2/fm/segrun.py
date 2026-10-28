@@ -493,6 +493,8 @@ def train(job: dict) -> None:
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
+    if hasattr(net, "plan"):   # fm/dense_dec CubeDec: the task's fingerprint (training scans) -> strides and fine levels
+        net.plan([it["id"] for it in split["train"]])
     # on disk as the run goes, so a killed job resumes: the training state every 10 min (.last.pt), the best state
     # until the test is written (.best.pt), the test volumes done (.test.json)
     out_p = Path(job["out"])

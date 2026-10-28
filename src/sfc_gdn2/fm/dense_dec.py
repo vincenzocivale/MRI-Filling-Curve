@@ -15,6 +15,8 @@ of 2 mm (a linear map, as a ViT's patch decoder / pixel shuffle), only then inte
 No tokens (args.dense_notok=true, user 28/10: how much of the dense decoder is the U-Net alone?): the image path only."""
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -46,6 +48,7 @@ class DenseDec(nn.Module):
         CH, TOK = tuple(int(c * width) for c in (16, 32, 64)), int(64 * width)
         self.encoder = encoder
         self.cache = TokenCache(cache)
+        self.bott = [4, 4, 4]   # voxels per bottleneck voxel and axis (CubeDec.plan: anisotropic)
         self.levels = () if notok else (*LEVELS, 4.0) if dense4 else LEVELS   # simpleC: + 4 mm dense (--dense4)
         self.cache.levels = self.levels
         c = encoder.dim * (1 + len(encoder.taps))
@@ -62,14 +65,15 @@ class DenseDec(nn.Module):
 
     def fields(self, ctx: torch.Tensor, T, dev) -> torch.Tensor:
         """Each level's projected tokens over each tile, trilinear on the tile's 1/4 grid -> [B, TOK x levels, *T/4]."""
-        out = []
+        out, b = [], self.bott
+        T4 = [t // a for t, a in zip(T, b)]
         for r in ctx.tolist():
             i, corner = self.cache.ids[int(r[6])], [int(v) for v in r[7:10]]
             k4, lv = self.cache.meta(i)["k4"], []
             for j, mm in enumerate(self.levels):
                 k = [a * int(mm // 4) for a in k4]
                 if mm < 8 and not fine_ok(k):   # a scan too coarse for 4 mm cells (no file): an empty level
-                    lv.append(torch.zeros(1, TOK, *[t // 4 for t in T], device=dev))
+                    lv.append(torch.zeros(1, TOK, *T4, device=dev))
                     continue
                 c0 = [c // kk for c, kk in zip(corner, k)]
                 n = [-(-(c + t) // kk) - a for c, t, kk, a in zip(corner, T, k, c0)]
@@ -81,10 +85,10 @@ class DenseDec(nn.Module):
                 g = g.permute(3, 0, 1, 2)[None]                                    # [1, TOK, *grid]
                 # cell centres -> voxels: the cells' grid spans n*k voxels from c0*k; the tile is a crop of it
                 full = [a * kk for a, kk in zip(n, k)]
-                g = F.interpolate(g, size=[max(1, f // 4) for f in full], mode="trilinear", align_corners=False)
-                o = [(c - a * kk) // 4 for c, a, kk in zip(corner, c0, k)]
-                g = g[:, :, o[0]: o[0] + T[0] // 4, o[1]: o[1] + T[1] // 4, o[2]: o[2] + T[2] // 4]
-                g = F.pad(g, [p for d, s in zip(reversed(g.shape[2:]), reversed([t // 4 for t in T])) for p in (0, s - d)])
+                g = F.interpolate(g, size=[max(1, f // a) for f, a in zip(full, b)], mode="trilinear", align_corners=False)
+                o = [(c - a * kk) // bb for c, a, kk, bb in zip(corner, c0, k, b)]
+                g = g[:, :, o[0]: o[0] + T4[0], o[1]: o[1] + T4[1], o[2]: o[2] + T4[2]]
+                g = F.pad(g, [p for d, s in zip(reversed(g.shape[2:]), reversed(T4)) for p in (0, s - d)])
                 lv.append(g)
             if self.mg:
                 lv += self.sparse(i, corner, T, dev)
@@ -149,12 +153,13 @@ NSTAGE = {16.0: 4, 8.0: 3, 4.0: 2, 2.0: 1}
 CUBE, CAP, TAU, DROP = 16, 8, 0.1, 0.3   # cells per axis, cubes per volume and level, min foreground prob, cubes dropped in training
 
 
-def gather(g: torch.Tensor, c0, k, corner, T, s: int) -> torch.Tensor:
-    """g [*n, C] on the cell grid from cell c0 (cells of k voxels) -> [1, C, *T / 2^s]: each voxel of stage s takes the cell
-    its centre lies in (nearest, no interpolation: a token is a cell, not a point sample)."""
-    st, dev = 2 ** s, g.device
+def gather(g: torch.Tensor, c0, k, corner, T, s) -> torch.Tensor:
+    """g [*n, C] on the cell grid from cell c0 (cells of k voxels) -> [1, C, *T / stride]: each voxel of stage s (an int:
+    stride 2^s on every axis; a list: the stride per axis) takes the cell its centre lies in (nearest, no interpolation:
+    a token is a cell, not a point sample)."""
+    sts, dev = [2 ** s] * 3 if isinstance(s, int) else list(s), g.device
     idx = [((torch.arange(t // st, device=dev) * st + st // 2 + c) // kk - a).clamp(0, n - 1)
-           for t, c, kk, a, n in zip(T, corner, k, c0, g.shape[:3])]
+           for t, c, kk, a, n, st in zip(T, corner, k, c0, g.shape[:3], sts)]
     return g[idx[0][:, None, None], idx[1][None, :, None], idx[2][None, None, :]].permute(3, 0, 1, 2)[None]
 
 
@@ -238,9 +243,9 @@ class NativeDec(nn.Module):
         elsewhere, + the mask."""
         out = {}
         for mm in MG:
-            s, w = NSTAGE[mm], NTOK[mm] + 1
+            s, w = self._stride(mm), NTOK[mm] + 1
             if mm not in src:
-                out[mm] = torch.zeros(1, w, *[t // 2 ** s for t in T], device=dev)
+                out[mm] = torch.zeros(1, w, *[t // a for t, a in zip(T, s)], device=dev)
                 continue
             q, h, k = src[mm]
             q = q.to(dev).long()
@@ -276,6 +281,10 @@ class NativeDec(nn.Module):
         return self.tok[f"g{mm:g}"]
 
     @staticmethod
+    def _stride(mm: float) -> list:
+        return [2 ** NSTAGE[mm]] * 3
+
+    @staticmethod
     def _cell(sp, mm: float) -> list:
         from ..data.volume import patch_dims
         return list(patch_dims(sp, mm))
@@ -296,7 +305,7 @@ class NativeDec(nn.Module):
         dev, sp = p.device, ctx[:3].float()
         k = self._cell(sp.tolist(), mm)
         self.cubes.setdefault(vid, {}).pop(mm, None)
-        if not fine_ok(k):
+        if not fine_ok(k) or mm in getattr(self, "off", ()):
             return
         sc = F.max_pool3d(p[1:].float().amax(0)[None, None], k, k, ceil_mode=True)[0, 0]   # per cell: max foreground
         g, boxes = sc.shape, []
@@ -445,18 +454,38 @@ class CubeDec(DenseDec):
         self.cube, self.curves, self.seed, self.mg = True, list(curves), seed, None
         self.cubes, self.active, self.preparing, self.cube_dir = {}, None, False, None
         self.register_buffer("stage", torch.zeros((), dtype=torch.long))
+        self.cum, self.off = {0: [1, 1, 1], 1: [2, 2, 2], 2: [4, 4, 4]}, set()   # plan(): per task
+
+    def plan(self, ids) -> None:
+        """The task's fingerprint (median spacing of the training scans, from the token cache) -> the 3 stages' strides per
+        axis (nnU-Net's rule: an axis halves only while finer than twice the finest one) and the fine levels kept (off: a
+        level whose cell on the median scan holds < 8 voxels, or the voxels of the level above). Isotropic scans: simpleA."""
+        import numpy as np
+        sp = np.median([self.cache.meta(i)["spacing"] for i in ids], 0).tolist()
+        cur, cum = list(sp), [1, 1, 1]
+        for s in (1, 2):
+            st = [2 if c < 2 * min(cur) else 1 for c in cur]
+            cur, cum = [c * a for c, a in zip(cur, st)], [c * a for c, a in zip(cum, st)]
+            self.cum[s] = cum
+        self.e1[0].stride, self.e2[0].stride = tuple(self.cum[1]), tuple(b // a for a, b in zip(self.cum[1], self.cum[2]))
+        self.bott = self.cum[2]
+        cells = {mm: self._cell(sp, mm) for mm in MG}
+        self.off = {mm for mm in MG if math.prod(cells[mm]) < 8} | ({2.0} if cells[2.0] == cells[4.0] else set())
+        print(f"[seg] plan: median spacing {[round(z, 2) for z in sp]} mm, strides {self.cum[1]} / {self.cum[2]}, "
+              f"cells {cells} voxels, levels off {sorted(self.off)}", flush=True)
 
     def _proj(self, mm: float) -> nn.Module:
         return self.ctok[f"g{mm:g}"]
 
-    @staticmethod
-    def _cell(sp, mm: float) -> list:
-        st = 2 ** NSTAGE[mm]
-        return [st * max(1, round(mm / (st * float(z)))) for z in sp]
+    def _stride(self, mm: float) -> list:
+        return self.cum[NSTAGE[mm]]
+
+    def _cell(self, sp, mm: float) -> list:
+        return [a * max(1, round(mm / (a * float(z)))) for a, z in zip(self._stride(mm), sp)]
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
         T0 = tuple(x.shape[2:])
-        x = F.pad(x, [p for t in reversed(T0) for p in (0, -t % 4)])
+        x = F.pad(x, [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)])
         T, dev = tuple(x.shape[2:]), x.device
         fine = {1: [], 2: []}
         for r in ctx.tolist():
@@ -466,6 +495,11 @@ class CubeDec(DenseDec):
         f1 = torch.cat([self.e1(f0), torch.cat(fine[1]).to(x.dtype)], 1)
         f2 = torch.cat([self.e2(f1), self.fields(ctx, T, dev).to(x.dtype), torch.cat(fine[2]).to(x.dtype)], 1)
         h = self.mid(f2)
-        h = self.d1(torch.cat([self.u1(h), f1], 1))
-        h = self.d0(torch.cat([self.u0(h), f0], 1))
+        h = self.d1(torch.cat([self._up(self.u1, h, [b // a for a, b in zip(self.cum[1], self.cum[2])]), f1], 1))
+        h = self.d0(torch.cat([self._up(self.u0, h, self.cum[1]), f0], 1))
         return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
+
+    @staticmethod
+    def _up(u: nn.ConvTranspose3d, h: torch.Tensor, st) -> torch.Tensor:
+        """The transposed conv with this plan's stride per axis (kernel = stride: an axis not halved keeps one tap)."""
+        return F.conv_transpose3d(h, u.weight[:, :, : st[0], : st[1], : st[2]], u.bias, stride=tuple(st))
