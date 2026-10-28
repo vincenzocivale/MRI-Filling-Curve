@@ -56,6 +56,11 @@ prostate_lesion: {type: seg, label: seg, query: "dataset == 'Prostate158' and mo
 wmh_seg:       {type: seg, label: seg, query: "dataset == 'WMH2017'", classes: [1], ignore: [2]}   # 2 = other pathology
 cmb_seg:       {type: seg, label: seg, query: "dataset == 'VALDO' and session == 'task2' and modality == 'T2star'", save_pred: true, select: f1,
                 extra_metric_note: "lesion-wise F1 (Dice is unstable on 2-10 mm dots)"}
+# 28/10 (user): the two tasks replacing cmb_seg (VALDO alone: 4 val / 22 test CMBs). Manifests: datasets-meta/scripts/
+# build_cmbpts.py, build_bmsr.py (bench_new/*_cmbpts.csv, *_bmsr.csv, merged into bench_v2)
+cmbpts:        {type: seg, label: seg, query: "dataset == 'CMBpts'", save_pred: true, select: det,     # VALDO T2* + Dou + CSIRO SWI: 2 mm spheres, detection F1 within 5 mm
+                points: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench_new/points_cmbpts.csv}
+bmsr_seg:      {type: seg, label: seg, query: "dataset == 'UCSF-BMSR' and modality == 'T1c'", save_pred: true, select: f1}  # brain metastases, lesion-wise F1 (+ Dice)
 # lacune_seg removed (21/10, user): Dice 0 for all 13 models, 28 train volumes and 4 test volumes with lacunes
 heart_seg:     {type: seg, label: seg, query: "dataset == 'HVSMR' and official_split == 'no'", classes: [1, 2, 3, 4, 5, 6, 7, 8]}  # without the 20 HVSMR 2016 cases
 ms_seg:        {type: seg, label: seg, query: "dataset == 'MSLesSeg' and modality == 'FLAIR'"}
