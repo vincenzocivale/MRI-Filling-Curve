@@ -323,8 +323,8 @@ class Pretrainer:
     def _restore_partial(self, c: dict) -> None:
         """train.resume_partial (28/10): the model of another objective config. Its rec heads grown to
         objective.rec_head_cells (LeJEPA.expand_rec_heads: the same pooled prediction), new modules keep their init;
-        Adam's moments carried over by parameter name for every parameter of the same shape (the new heads and a grown
-        head start with none)."""
+        the optimizer's state (MuonAdamW: m / v / t) carried over by parameter name for every parameter of the same shape
+        (the new heads and a grown head start with none)."""
         from .lejepa import LeJEPA
         sd = LeJEPA.expand_rec_heads(dict(c["model"]), self.net.rec_head_cells)
         r = self.net.load_state_dict(sd, strict=False)
@@ -336,7 +336,7 @@ class Pretrainer:
             mine = [p for p in g["params"] if names[id(p)] in c["model"]]
             for p, oi in zip(mine, old["param_groups"][gi]["params"]):
                 st = old["state"].get(oi)
-                if st is not None and st["exp_avg"].shape == p.shape:
+                if st is not None and all(v.shape == p.shape for v in st.values() if torch.is_tensor(v) and v.ndim):
                     new["state"][new["param_groups"][gi]["params"][g["params"].index(p)]] = st
         self.opt.load_state_dict(new)
 
