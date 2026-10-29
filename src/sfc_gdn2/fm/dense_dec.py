@@ -617,13 +617,16 @@ class CubeDec(DenseDec):
             self.ram.move_to_end(key)
             return self.ram[key]
         f = None if self.cube_dir is None else self.cube_dir / "read" / f"{vid}_{mm:g}_{'_'.join(map(str, lo))}.pt"
-        if f is not None and f.exists():
-            q, h = torch.load(f, weights_only=False)
-        else:
+        try:   # a file cut by a job's time limit (before the atomic write): read again
+            q, h = torch.load(f, weights_only=False) if f is not None and f.exists() else (None, None)
+        except RuntimeError:
+            q = h = None
+        if q is None:
             q, h = self._read_box(vid, mm, lo, hi)
             if f is not None:
                 f.parent.mkdir(parents=True, exist_ok=True)
-                torch.save((q, h), f)
+                torch.save((q, h), f.with_suffix(".tmp"))
+                f.with_suffix(".tmp").replace(f)
         self.ram[key] = (q, h)
         self.ram_bytes += h.numel() * 2
         while self.ram_bytes > CUBE_RAM_GB * 2 ** 30 and len(self.ram) > 1:
