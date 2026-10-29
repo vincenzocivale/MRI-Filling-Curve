@@ -429,6 +429,10 @@ class LeJEPA(nn.Module):
         if self.tok_self:   # groups whose B is A unmasked: A's box
             pg = torch.tensor([self.tok_self_p[0]] * self.gg + [self.tok_self_p[1]] * self.gl, device=grid.device)
             same = torch.rand(same.shape, device=grid.device, generator=gen) < pg
+            # >= 1 tied group per part on every rank: the token head's SyncBatchNorm and gathers are collectives, a
+            # rank without one deadlocked the others (NCCL timeout, p30 29/10)
+            for s in (0, self.gg)[: 1 + bool(self.gl)]:
+                same[0, s] |= ~same[:, s: s + (self.gg if s == 0 else self.gl)].any()
             corner, edge = (torch.where(same[..., None, None], t[:, :, :1], t) for t in (corner, edge))
         zg, lens, tops, spred, stgt, smask, svol = [], [], [], [], [], [], []
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
