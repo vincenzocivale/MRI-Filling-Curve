@@ -590,7 +590,7 @@ class CubeDec(DenseDec):
         region's max >= TAU / 2 (hysteresis: few changes), then greedily the highest ones >= TAU, < CAP in all, each
         region cleared -> [(lo, hi)] in cells."""
         b, ms, boxes = self.cum[2], ms.clone().float(), []
-        K = [CUBE * kk // bb for kk, bb in zip(k, b)]
+        K = [min(CUBE * kk // bb, n) for kk, bb, n in zip(k, b, ms.shape)]   # a scan thinner than a cube: the whole axis
         St = [max(1, a // 2) for a in K]
         g = [-(-n * bb // kk) for n, bb, kk in zip(ms.shape, b, k)]   # cells per axis
         reg = lambda lo: tuple(slice(a * kk // bb, a * kk // bb + kd) for a, kk, bb, kd in zip(lo, k, b, K))
