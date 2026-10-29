@@ -1154,6 +1154,12 @@ class SFC(Wrapper):
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
         a = self.args
+        if a.get("hier_dec"):   # fm/hier_dec (29/10): Dmix gerarchico + kernel continuo
+            from .hier_dec import HierDec
+            net = HierDec(enc, str(a["token_cache"]), n_out, self.curves, int(self.run_cfg["seed"]))
+            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
+                             "curves": list(self.curves), "blocks": None}
+            return net, ["encoder"], SEG_PATCH
         if a.get("dense_dec"):   # fm/dense_dec (28/10): the dense control decoder on the cached 16 / 8 mm tokens
             from .dense_dec import CubeDec, DenseDec, NativeDec
             tc = str(a["token_cache"]).removeprefix("live:")
