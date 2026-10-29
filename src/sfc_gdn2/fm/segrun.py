@@ -741,6 +741,24 @@ def train(job: dict) -> None:
               f"({' '.join(f'x{t}:{m:.2f}' for t, m in sorted(by.items()))})", flush=True)
         del val_v
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
+    if hasattr(net, "read_taus") and not LM and "read_tau" not in best:
+        # fm/hier_dec (user 30/10): the read threshold for the test chosen on the val Dice of the best state, one pass
+        # (every cell read, each threshold a mask: the decoder returns their log-probabilities side by side).
+        # ponytail: Dice for every task (cmbpts' selection is its F1; add it if hier_dec runs there)
+        load_trained(best["state"])
+        net.eval()
+        net.read_taus, by = list(net.TAUS), []
+        for it in split["val"]:
+            v = load(it)
+            p = sliding(net, v["x"].to(dev).float(), patch, k * len(net.read_taus), amp, v["ctx"])
+            by.append([dice_on(p[a * k:(a + 1) * k].argmax(0).to(dev), v["y"].to(dev), k) for a in range(len(net.read_taus))])
+            del v, p
+        by = np.nanmean(np.array(by, dtype=float), 0)
+        best |= {"read_tau": float(net.read_taus[int(np.argmax(by))]), "val_by_tau": {str(t): float(d) for t, d in zip(net.read_taus, by)}}
+        print(f"[seg] read threshold {best['read_tau']:g} (val Dice per threshold {best['val_by_tau']})", flush=True)
+        torch.save({"key": key, "best": best, "curve": curve}, ckpt)
+    if "read_tau" in best:
+        net.read_taus = [best["read_tau"]]
     if job.get("val_only"):  # pretraining tuning: the best val Dice, no test volume read
         if job.get("save_pred"):   # the best state's val predictions kept anyway (user, 24/10: lesion counts on val)
             load_trained(best["state"])
