@@ -72,8 +72,9 @@ objective:
   sigreg_samples: 768         # every SIGReg rescaled to this many samples (it grows with its sample count): same weight
                               # for every term whatever batch, tokens_per_volume, groups or GPUs; 768 = what lam was tuned on
   w_top: 0.63                 # (G3, p3 12/10) weight of the view, volume and session terms (cells: 1), in both means
-  tok_self: 0.0               # (29/10) LeJEPA + iBOT++ token term (A masked vs A unmasked, symmetric, own SIGReg): its
+  tok_self: 0.0               # (29/10) LeJEPA + iBOT++ token term (A masked vs B = A unmasked, symmetric, own SIGReg): its
                               # weight in both means; 0 = off (the cross-view token term was removed: off since 23/10)
+  tok_self_p: [0.5, 0.5]      # per group (global, local): probability that B is A unmasked (the token term's pairs)
   top_levels: [volume, session]   # the levels above the view ([] for the A/B check)
   rec_weight: 0.2             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
   rec_visible: 0.2            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens

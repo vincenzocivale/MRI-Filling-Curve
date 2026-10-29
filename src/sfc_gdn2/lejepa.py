@@ -20,12 +20,13 @@ bounds the tokens per step whatever the field of view.
 
 - top (`global`): the mean bi token over the view's foreground patches -> `glob` head; invariance between
   A and B + SIGReg (per view, over the batch).
-- token (`tok_self`, LeJEPA + iBOT++ as TIPSv2; 0 = off): view A read again unmasked (same draws); every foreground
-  `bi` token (forward ++ backward output at that patch, as in the segmentation probe) of masked A, masked and
-  visible, and the same token of the unmasked reading -> `tok` head in one call (same BatchNorm statistics), pulled
+- token (`tok_self`, LeJEPA + iBOT++ as TIPSv2; 0 = off): in a fraction `tok_self_p` (global, local) of the groups
+  view B is view A unmasked (same draws); there every foreground `bi` token (forward ++ backward output at that
+  patch, as in the segmentation probe) of masked A, masked and visible, and the same token of B -> `tok` head in one
+  call (same BatchNorm statistics), pulled
   together (symmetric, no stop-grad, no teacher, as LeJEPA's invariance). Foreground only (as Vol-JEPA's head mask):
   background patches stay in the sequence (with no position embedding their count is spatial signal) but are never
-  masked, paired or sampled for SIGReg. SIGReg on the unmasked foreground tokens, `tokens_per_volume` per volume (only
+  masked, paired or sampled for SIGReg. SIGReg on B's foreground tokens, `tokens_per_volume` per volume (only
   the estimate's sample count: the weight is fixed by `sigreg_samples`).
 - cells (`levels`, e.g. 2, 4, 8 patches = 32, 64, 128 mm per edge, aligned on the patch grid, so A and B
   share them whatever their boxes): mean foreground bi token per cell; every cell whose foreground is
@@ -120,7 +121,7 @@ class LeJEPA(nn.Module):
                  w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0,
                  rec_head_cells: int = 0, rec_extra: bool = False, rec_contrast: float = 0.0, rec_edge: float = 0.0,
-                 tok_self: float = 0.0):
+                 tok_self: float = 0.0, tok_self_p: tuple = (0.5, 0.5)):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -132,12 +133,14 @@ class LeJEPA(nn.Module):
         self.global_frac, self.local_edge, self.jitter, self.mask_ratio = global_frac, local_edge, jitter, mask_ratio
         self.gamma, self.scale, self.shift, self.noise, self.fg_threshold = gamma, scale, shift, noise, fg_threshold
         self.levels = [int(c) for c in levels]
-        # tok_self w (29/10, user: LeJEPA + iBOT++, TIPSv2): view A read a second time unmasked (same box, augmentation,
-        # curve: the generator replayed) and every foreground token of masked A, masked and visible, pulled to its
-        # unmasked reading, both with gradient (symmetric, no teacher, no stop-grad, as LeJEPA's invariance); SIGReg on the
-        # unmasked tokens, tokens_per_volume per volume. The only token term (the cross-view one, A masked -> B, removed
-        # 29/10: off since 23/10, no_tok better). Weight w in both means; logged as inv_token(_m, _v) / sigreg_token
-        self.tok_self = float(tok_self)
+        # tok_self w (29/10, user: LeJEPA + iBOT++, TIPSv2): per group, with probability tok_self_p (global, local), view B
+        # is view A unmasked (same box, curve, symmetry and augmentation; only its noise sample differs) instead of
+        # another view; on those groups every foreground token of masked A, masked and visible, is pulled to the same
+        # token of B, both with gradient (symmetric, no teacher, no stop-grad, as LeJEPA's invariance), SIGReg on B's
+        # tokens, tokens_per_volume per volume. The other terms use every group as before. No extra reading. The only
+        # token term (the cross-view one, A masked -> another B, removed 29/10: off since 23/10, no_tok better).
+        # Weight w in both means; logged as inv_token(_m, _v) / sigreg_token
+        self.tok_self, self.tok_self_p = float(tok_self), tuple(tok_self_p)
         self.register_buffer("mask_cells", torch.tensor(mask_cells), persistent=False)
         self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim) if tok_self else None
@@ -208,14 +211,14 @@ class LeJEPA(nn.Module):
         c = corner[:, :, None] + (self._u(shape, -self.jitter, self.jitter, gen) * edge[:, :, None]).round().long()
         return c.clamp(min=0).minimum(g - e), e
 
-    def serialize(self, grid, corner, edge, n, tot, gen):
+    def serialize(self, grid, corner, edge, n, tot, gen, src):
         """Boxes (corner, edge) [V,3] in patch grids [V,3], n [V] patches per box (tot in all, host) -> every view's
         patches in the order of a random curve of `view_curves` under a random cube symmetry, traced within the box,
         packed view after view (no padding): view [T], patch index in its scan's raster [T], coordinates [T,3] in the
         scan and in the box after the symmetry (the view position)."""
         dev, nv = corner.device, len(corner)
-        sym = torch.randint(len(self.perms), (nv,), device=dev, generator=gen)
-        curve = torch.randint(len(self.curves), (nv,), device=dev, generator=gen)
+        sym = torch.randint(len(self.perms), (nv,), device=dev, generator=gen)[src]
+        curve = torch.randint(len(self.curves), (nv,), device=dev, generator=gen)[src]
         tv = torch.repeat_interleave(torch.arange(nv, device=dev), n, output_size=tot)
         j, e = torch.arange(tot, device=dev) - (n.cumsum(0) - n)[tv], edge[tv]
         box = torch.stack([j // (e[:, 1] * e[:, 2]), j // e[:, 2] % e[:, 1], j % e[:, 2]], -1)   # raster of the box
@@ -260,24 +263,27 @@ class LeJEPA(nn.Module):
             v[s:e] = self.thick(v[s:e], k, a, f)
         return self.encoder.patch_embed(v, w)
 
-    def read(self, vols, ws, fg, n_patch, vol, corner, edge, masked, gen):
+    def read(self, vols, ws, fg, n_patch, vol, corner, edge, masked, gen, src=None):
         """Views [V] (scan `vol`, box) -> their tokens packed view after view, each along its curve (no padding):
         view [T], patch index in its scan [T], patch coords [T,3], foreground [T], mask [T], bi tokens [T,2d]; tokens
         per view [V] and per-view offsets [V] (device) and the tokens per view (host). Masking applies only to
         foreground patches of views with `masked`; the backward pass reads each view in reverse. Tokens are embedded
-        per scan (its own voxels per patch and kernel weights `ws`). Host syncs: a handful per call."""
+        per scan (its own voxels per patch and kernel weights `ws`). Host syncs: a handful per call. src [V]: the view whose
+        draws (symmetry, curve, augmentation, thick slices) each view takes (itself by default; tok_self: a B view tied
+        to its A)."""
         nv, dev = len(corner), corner.device
+        src = torch.arange(nv, device=dev) if src is None else src
         n = edge.prod(-1)
         vol_h, lens = torch.stack([vol, n]).tolist()
         tot = sum(lens)
-        tv, idx, pxyz, vpos = self.serialize(vols["grid"][vol], corner, edge, n, tot, gen)
+        tv, idx, pxyz, vpos = self.serialize(vols["grid"][vol], corner, edge, n, tot, gen, src)
         fgv = fg[vol[tv], idx]
-        u = lambda lo, hi: self._u((nv, 1, 1), lo, hi, gen)
+        u = lambda lo, hi: self._u((nv, 1, 1), lo, hi, gen)[src]
         gamma, scale, shift, noise = u(-self.gamma, self.gamma).exp(), u(1 - self.scale, 1 + self.scale), \
             u(-self.shift, self.shift), u(0, self.noise)
-        on = torch.rand(nv, device=dev, generator=gen) < self.thick_prob
-        axis = torch.randint(3, (nv,), device=dev, generator=gen)
-        mm = torch.randint(len(self.thick_mm), (nv,), device=dev, generator=gen)
+        on = (torch.rand(nv, device=dev, generator=gen) < self.thick_prob)[src]
+        axis = torch.randint(3, (nv,), device=dev, generator=gen)[src]
+        mm = torch.randint(len(self.thick_mm), (nv,), device=dev, generator=gen)[src]
         # masked in aligned cubes of one of mask_cells per view (<= half its shortest edge): big cubes are the
         # coarse levels' prediction targets
         cells = self.mask_cells[None]
@@ -398,6 +404,11 @@ class LeJEPA(nn.Module):
             gc, ge = self.jittered(*self.boxes(coarse[3], coarse[1], gen), coarse[1], gen)
             corner, edge = (torch.cat([g[:, : self.gg], f[:, self.gg:]], 1) for g, f in ((gc, corner), (ge, edge)))
         vol = torch.arange(b, device=grid.device)[:, None, None].expand(-1, corner.shape[1], 2)
+        same = torch.zeros(corner.shape[:2], dtype=torch.bool, device=grid.device)                    # [B,G]
+        if self.tok_self:   # groups whose B is A unmasked: A's box
+            pg = torch.tensor([self.tok_self_p[0]] * self.gg + [self.tok_self_p[1]] * self.gl, device=grid.device)
+            same = torch.rand(same.shape, device=grid.device, generator=gen) < pg
+            corner, edge = (torch.where(same[..., None, None], t[:, :, :1], t) for t in (corner, edge))
         zg, lens, tops, spred, stgt, smask, svol = [], [], [], [], [], [], []
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
@@ -405,12 +416,9 @@ class LeJEPA(nn.Module):
             c, e, v = (t[:, part].reshape(-1, *t.shape[3:]) for t in (corner, edge, vol))  # views A,B interleaved
             nv, dev = len(c), c.device
             masked = torch.arange(nv, device=dev) % 2 == 0
-            if self.tok_self:   # the same draws again for the unmasked reading
-                gen_self = torch.Generator(gen.device)
-                gen_self.set_state(gen.get_state())
-            tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(pv, pws, pfg, pn, v, c, e, masked, gen)
-            if self.tok_self:   # A unmasked, with gradient (no teacher: SIGReg holds it)
-                bi_u = self.read(pv, pws, pfg, pn, v, c, e, torch.zeros_like(masked), gen_self)[5]
+            sg = same[:, part].reshape(-1)                                                 # per group
+            src = torch.arange(nv, device=dev) - (sg.repeat_interleave(2) & ~masked).long()   # tied B -> its A
+            tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(pv, pws, pfg, pn, v, c, e, masked, gen, src)
             has = torch.zeros(nv, device=dev).index_add_(0, tv, fgv.float()) > 0
             w = (fgv | ~has[tv]).float()                                                   # foreground (all if none)
             top = torch.zeros(nv, bi.shape[-1], device=dev).index_add_(0, tv, bi.float() * w[:, None]) \
@@ -423,17 +431,18 @@ class LeJEPA(nn.Module):
                 ctgt[i].append(q)
                 cz[i].append(zb)
                 cvol[i].append(v[1::2][vb])
-            if self.tok_self:   # every foreground token of A, masked and visible, against its unmasked reading
-                fa = _ranges(off[0::2], n[0::2], sum(n_h[0::2]))
-                fa = fa[fgv[fa]]
-                # one head call: both readings under the same BatchNorm statistics; recomputed in backward for
-                # big scans (~10^5 tokens x 1024 hidden)
-                x = torch.cat([bi.index_select(0, fa), bi_u.index_select(0, fa)])
+            if self.tok_self and bool(sg.any()):   # tied groups: every foreground token of A against the same in B
+                ra, rb = (_ranges(off[k::2], n[k::2], sum(n_h[k::2])) for k in (0, 1))
+                # the same patches in A and B (same box), in their own curve orders: aligned by (group, patch)
+                ra, rb = (r[sg[tv[r] // 2] & fgv[r]] for r in (ra, rb))
+                ra, rb = (r[(tv[r] // 2 * pn + idx[r]).argsort()] for r in (ra, rb))
+                # one head call: both under the same BatchNorm statistics; recomputed in backward for big scans
+                x = torch.cat([bi.index_select(0, ra), bi.index_select(0, rb)])
                 z = (checkpoint(self.tok, x, use_reentrant=False) if len(x) > self.checkpoint_tokens else self.tok(x)).float()
-                spred.append(z[: len(fa)])
-                stgt.append(z[len(fa):])
-                smask.append(mask[fa])
-                svol.append(v[tv[fa]])
+                spred.append(z[: len(ra)])
+                stgt.append(z[len(ra):])
+                smask.append(mask[ra])
+                svol.append(v[tv[ra]])
             lens.append(e.prod(-1).float().mean())
             # masked tokens (A's foreground) -> their patch's sub-patch layout (MAE-style); rec_visible: B's foreground
             for w, r, acc in ((self.rec_weight, mask, rec), (self.rec_visible, fgv & (tv % 2 == 1), recv)):
@@ -474,7 +483,7 @@ class LeJEPA(nn.Module):
         inv = [inv_g, *(out[f"inv_cell{c}"] for c in self.levels), *(out[f"inv_{n}"] for n in self.top)]
         sigs = [sig_g, *(out[f"sigreg_cell{c}"] for c in self.levels), *(out[f"sigreg_{n}"] for n in self.top)]
         w = [self.w_top, *(1.0 for _ in self.levels), *(self.w_top for _ in self.top)]
-        if self.tok_self:   # symmetric pull (= mean ||z - mean||^2) + SIGReg on the unmasked tokens, per volume
+        if spred:   # symmetric pull (= mean ||z - mean||^2) + SIGReg on B's (unmasked) tokens, per volume
             d = (torch.cat(spred) - torch.cat(stgt)).square().mean(1) / 4
             m, z, vs = torch.cat(smask), torch.cat(stgt), torch.cat(svol)
             out["inv_token"] = d.mean()
