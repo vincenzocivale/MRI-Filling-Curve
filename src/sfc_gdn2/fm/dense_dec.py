@@ -445,7 +445,7 @@ class CubeDec(DenseDec):
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
         live = str(cache).startswith("live:")   # a task without a cache yet: written as segrun loads each scan
-        super().__init__(encoder, str(cache).removeprefix("live:"), n_out)
+        super().__init__(encoder, str(cache).removeprefix("live:"), n_out, width=2.0)   # 32 / 64 / 128 channels (29/10)
         if live:
             from .token_cache import LiveCache
             self.cache, self.enc_curves = LiveCache(str(cache)[5:], self), list(curves)
@@ -468,6 +468,7 @@ class CubeDec(DenseDec):
         self.sel_ln = nn.LayerNorm(c, elementwise_affine=False)
         self.sel_probe = nn.Linear(2 * c, 1)
         self.sel_corr = nn.Conv3d(CH[2], 1, 1)
+        self.ds = nn.ModuleList([nn.Conv3d(CH[1], n_out, 1), nn.Conv3d(CH[2], n_out, 1)])   # deep supervision, 1/2 and 1/4
         nn.init.zeros_(self.sel_corr.weight)
         nn.init.zeros_(self.sel_corr.bias)
         self.vol_stats, self.sel_y, self.aux, self.sel_mode = {}, None, 0.0, False
@@ -716,6 +717,7 @@ class CubeDec(DenseDec):
                         F.max_pool3d(p[1:2].float()[None], self.cum[2], self.cum[2], ceil_mode=True)[0, 0].cpu())
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        yl = self.sel_y   # the training tiles' labels (segrun.sel_target): the selector's and the deep supervision's target
         if self.vol_stats:   # z-score per scan (the stats of the scan the tile comes from)
             ms = torch.tensor([self.vol_stats[int(r[6])] for r in ctx.tolist()], device=x.device, dtype=x.dtype)
             x = (x - ms[:, 0, None, None, None, None]) / ms[:, 1, None, None, None, None]
@@ -728,7 +730,8 @@ class CubeDec(DenseDec):
             for mm, f in self.sparse(src, [int(v) for v in r[7:10]], T, dev).items():
                 fine[NSTAGE[mm]].append(f)
         f0 = self.e0(x)
-        f1 = torch.cat([self.e1(f0), self.gain[0] * torch.cat(fine[1]).to(x.dtype)], 1)
+        drop = lambda t: F.dropout(t, 0.1, self.training)   # the token inputs: 4096 dims, small datasets
+        f1 = torch.cat([self.e1(f0), self.gain[0] * drop(torch.cat(fine[1]).to(x.dtype))], 1)
         e2 = self.e2(f1)
         sel = None
         if self.sel_mode or (self.training and self.sel_y is not None):
@@ -765,9 +768,15 @@ class CubeDec(DenseDec):
                         sl = tuple(slice(a, a + n) for a, n in zip(o, pj.shape[1:]))
                         reg = m[sl]
                         reg.mul_(0.5).add_(0.5 * pj[0][tuple(slice(0, n) for n in reg.shape)])
-        f2 = torch.cat([e2, self.fields(ctx, T, dev).to(x.dtype), self.gain[1] * torch.cat(fine[2]).to(x.dtype)], 1)
-        h = self.mid(f2)
-        h = self.d1(torch.cat([self._up(self.u1, h, [b // a for a, b in zip(self.cum[1], self.cum[2])]), f1], 1))
+        f2 = torch.cat([e2, drop(self.fields(ctx, T, dev).to(x.dtype)), self.gain[1] * drop(torch.cat(fine[2]).to(x.dtype))], 1)
+        h = hm = self.mid(f2)
+        h = h1 = self.d1(torch.cat([self._up(self.u1, h, [b // a for a, b in zip(self.cum[1], self.cum[2])]), f1], 1))
+        if self.training and yl is not None and not getattr(self, "landmark", False):   # nnU-Net's weights 0.5, 0.25
+            from .segrun import loss_fn
+            y = F.pad(yl.to(dev).long(), [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)],
+                      value=255)
+            for w, hd, head, st in ((0.5, h1, self.ds[0], self.cum[1]), (0.25, hm, self.ds[1], self.cum[2])):
+                self.aux = self.aux + w * loss_fn(head(hd).float(), y[:, :: st[0], :: st[1], :: st[2]], self.out.out_channels)
         h = self.d0(torch.cat([self._up(self.u0, h, self.cum[1]), f0], 1))
         return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
 
