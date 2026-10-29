@@ -151,6 +151,7 @@ NSTAGE = {16.0: 4, 8.0: 3, 4.0: 2, 2.0: 1}
 # args.dense_cubes: the fine levels read in cubes of the pretraining view (16^3 cells: 6.4 cm at 4 mm, 3.2 cm at 2 mm) where
 # the decoder itself sees foreground; one rule for every task (user 28/10: nothing per dataset)
 CUBE, CAP, TAU, DROP = 16, 8, 0.1, 0.3
+CUBE_LIVE = __import__("os").environ.get("SFC_CUBE_LIVE") == "1"   # cubes read by the encoder on the GPU, no disk (29/10)
 CUBE_RAM_GB = float(__import__("os").environ.get("SFC_CUBE_RAM_GB", "60"))   # the cube cache in RAM (a workstation: ~4)   # cells per axis, cubes per volume and level, min foreground prob, cubes dropped in training
 
 
@@ -256,7 +257,7 @@ class NativeDec(nn.Module):
             ok = ((q >= lo) & (q < hi)).all(1)
             g = torch.zeros(*n, w, device=dev)
             if ok.any():
-                f = self._proj(mm)(h[ok.cpu()].to(dev).float())
+                f = self._proj(mm)(h[ok.to(h.device)].to(dev).float())
                 qi = q[ok] - lo
                 g[qi[:, 0], qi[:, 1], qi[:, 2]] = torch.cat([f, f.new_ones(len(f), 1)], 1).float()
             out[mm] = gather(g, c0, k, corner, T, s)
@@ -616,7 +617,7 @@ class CubeDec(DenseDec):
         if key in self.ram:
             self.ram.move_to_end(key)
             return self.ram[key]
-        f = None if self.cube_dir is None else self.cube_dir / "read" / f"{vid}_{mm:g}_{'_'.join(map(str, lo))}.pt"
+        f = None if self.cube_dir is None or CUBE_LIVE else self.cube_dir / "read" / f"{vid}_{mm:g}_{'_'.join(map(str, lo))}.pt"
         try:   # a file cut by a job's time limit (before the atomic write): read again
             q, h = torch.load(f, weights_only=False) if f is not None and f.exists() else (None, None)
         except RuntimeError:
@@ -655,6 +656,8 @@ class CubeDec(DenseDec):
                     h = h + self.encoder.flat(xe[o], cu, pos=q[o]).float()[o.argsort()]
         finally:
             pe.patch_mm = mm0
+        if CUBE_LIVE:   # kept on the GPU (the LRU then caches GPU tensors)
+            return q.short(), (h / len(self.curves)).half()
         return q.short().cpu(), (h / len(self.curves)).half().cpu()
 
     def _src(self, vid: int, corner, T) -> dict:
