@@ -535,7 +535,7 @@ class CubeDec(DenseDec):
                 neg = neg[torch.randperm(len(neg), generator=g)[: max(4 * int(occ.sum()), 64)]]
             X.append(torch.cat([f[occ], f[neg]]).half())
             Y.append(torch.cat([torch.ones(int(occ.sum())), torch.zeros(len(neg))]))
-        dev = self.sel_probe.weight.device
+        dev = self.sel_probe.weight.device if sub else "cpu"   # the val cells (all of them) stay on the CPU
         return torch.cat(X).to(dev), torch.cat(Y).to(dev)
 
     @torch.no_grad()
@@ -561,7 +561,7 @@ class CubeDec(DenseDec):
                     loss.backward()
                 return loss
             opt.step(closure)
-            zv = Xv.float() @ w[:-1] + w[-1]
+            zv = torch.cat([(c.to(w.device).float() @ w[:-1] + w[-1]).cpu() for c in Xv.split(1 << 16)])
             lv = float(F.binary_cross_entropy_with_logits(zv, Yv, pos_weight=pv))
             hit = (zv > 0).float()
             print(f"[seg] selector probe l2 {l2:g}: val loss {lv:.4f}, recall {float(hit[Yv == 1].mean()):.3f}, "
