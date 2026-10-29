@@ -49,6 +49,9 @@ every term weighs as one of sigreg_samples samples (768: the token term lam was 
 """
 from __future__ import annotations
 
+import copy
+import math
+
 import torch
 import torch.distributed.nn
 from torch import nn
@@ -108,6 +111,13 @@ class Projector(nn.Sequential):
                          nn.Linear(hidden, hidden), bn(), nn.GELU(), nn.Linear(hidden, d_out))
 
 
+class Protos(nn.Linear):
+    """iBOT/DINO's last layer: cosine of the l2-normalised embedding with K l2-normalised prototypes -> [.., K]."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.normalize(x.float(), dim=-1) @ nn.functional.normalize(self.weight.float(), dim=-1).T
+
+
 class LeJEPA(nn.Module):
     def __init__(self, encoder: Encoder, view_curves: list[str], seed: int = 17, groups_global: int = 2,
                  groups_local: int = 6, global_frac: tuple = (0.3, 1.0), local_edge: tuple = (3, 8),
@@ -121,7 +131,8 @@ class LeJEPA(nn.Module):
                  w_top: float = 1.0, top_levels: tuple = ("volume", "session"), rec_weight: float = 0.0,
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0,
                  rec_head_cells: int = 0, rec_extra: bool = False, rec_contrast: float = 0.0, rec_edge: float = 0.0,
-                 tok_self: float = 0.0, tok_self_p: tuple = (0.5, 0.5)):
+                 tok_self: float = 0.0, tok_self_p: tuple = (0.5, 0.5),
+                 tok_self_ema: float = 0.0, tok_protos: int = 4096):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -139,11 +150,21 @@ class LeJEPA(nn.Module):
         # token of B, both with gradient (symmetric, no teacher, no stop-grad, as LeJEPA's invariance), SIGReg on B's
         # tokens, tokens_per_volume per volume. The other terms use every group as before. No extra reading. The only
         # token term (the cross-view one, A masked -> another B, removed 29/10: off since 23/10, no_tok better).
-        # Weight w in both means; logged as inv_token(_m, _v) / sigreg_token
+        # Weight w in both means; logged as inv_token(_m, _v) / sigreg_token.
+        # tok_self_ema m > 0 (29/10, user: the EMA branch on the same pairs, TIPSv2's head-only EMA): no SIGReg on the term;
+        # head + tok_protos prototypes (Protos), B's token through an EMA copy of both (momentum m -> 1 on a cosine,
+        # ema_update after each optimizer step) without gradient, centred (EMA 0.9 of its mean logits) and sharpened
+        # (temperature 0.04) as DINO/iBOT against A's at 0.1, cross-entropy; weight w added to the loss outside the means
+        # (inv_token = the CE; tok_entropy: the target's entropy, ~0 = collapse onto a prototype)
         self.tok_self, self.tok_self_p = float(tok_self), tuple(tok_self_p)
         self.register_buffer("mask_cells", torch.tensor(mask_cells), persistent=False)
         self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim) if tok_self else None
+        self.tok_self_ema, self.tok_t = tok_self_ema, None
+        if tok_self and tok_self_ema:
+            self.tok = nn.Sequential(self.tok, Protos(proj_dim, tok_protos, bias=False))
+            self.tok_t = copy.deepcopy(self.tok).requires_grad_(False)
+            self.register_buffer("tok_center", torch.zeros(tok_protos))
         self.cell = nn.ModuleList(Projector(2 * encoder.dim, proj_hidden, proj_dim) for _ in self.levels)
         self.top = nn.ModuleDict({n: Projector(2 * encoder.dim, proj_hidden, proj_dim) for n in top_levels})
         self.rec_weight, self.rec_cells, self.rec_eps, self.rec_visible = rec_weight, rec_cells, rec_eps, rec_visible
@@ -437,10 +458,17 @@ class LeJEPA(nn.Module):
                 ra, rb = (r[sg[tv[r] // 2] & fgv[r]] for r in (ra, rb))
                 ra, rb = (r[(tv[r] // 2 * pn + idx[r]).argsort()] for r in (ra, rb))
                 # one head call: both under the same BatchNorm statistics; recomputed in backward for big scans
-                x = torch.cat([bi.index_select(0, ra), bi.index_select(0, rb)])
-                z = (checkpoint(self.tok, x, use_reentrant=False) if len(x) > self.checkpoint_tokens else self.tok(x)).float()
-                spred.append(z[: len(ra)])
-                stgt.append(z[len(ra):])
+                if self.tok_t is not None:   # EMA: A through the head, B through its EMA copy, no gradient
+                    x = bi.index_select(0, ra)
+                    spred.append((checkpoint(self.tok, x, use_reentrant=False) if len(x) > self.checkpoint_tokens
+                                  else self.tok(x)).float())
+                    with torch.no_grad():
+                        stgt.append(self.tok_t(bi.index_select(0, rb)).float())
+                else:
+                    x = torch.cat([bi.index_select(0, ra), bi.index_select(0, rb)])
+                    z = (checkpoint(self.tok, x, use_reentrant=False) if len(x) > self.checkpoint_tokens else self.tok(x)).float()
+                    spred.append(z[: len(ra)])
+                    stgt.append(z[len(ra):])
                 smask.append(mask[ra])
                 svol.append(v[tv[ra]])
             lens.append(e.prod(-1).float().mean())
@@ -483,19 +511,35 @@ class LeJEPA(nn.Module):
         inv = [inv_g, *(out[f"inv_cell{c}"] for c in self.levels), *(out[f"inv_{n}"] for n in self.top)]
         sigs = [sig_g, *(out[f"sigreg_cell{c}"] for c in self.levels), *(out[f"sigreg_{n}"] for n in self.top)]
         w = [self.w_top, *(1.0 for _ in self.levels), *(self.w_top for _ in self.top)]
-        if spred:   # symmetric pull (= mean ||z - mean||^2) + SIGReg on B's (unmasked) tokens, per volume
-            d = (torch.cat(spred) - torch.cat(stgt)).square().mean(1) / 4
-            m, z, vs = torch.cat(smask), torch.cat(stgt), torch.cat(svol)
+        tok_loss = 0
+        if spred:
+            zs, zt, m = torch.cat(spred), torch.cat(stgt), torch.cat(smask)
+            if self.tok_t is None:   # symmetric pull (= mean ||z - mean||^2) + SIGReg on B's tokens, per volume
+                d = (zs - zt).square().mean(1) / 4
+                vs = torch.cat(svol)
+                out["sigreg_token"] = sig(zt[self._sample(vs, torch.ones_like(vs, dtype=torch.bool), b, gen)][None])
+            else:                    # centred, sharpened EMA target; cross-entropy
+                q = ((zt - self.tok_center) / 0.04).softmax(-1)
+                d = -(q * (zs / 0.1).log_softmax(-1)).sum(-1)
+                out["tok_entropy"] = -(q * q.clamp_min(1e-12).log()).sum(-1).mean()
+                if self.training:
+                    c = zt.mean(0)
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(c)
+                        c /= torch.distributed.get_world_size()
+                    self.tok_center.mul_(0.9).add_(0.1 * c)
             out["inv_token"] = d.mean()
             out["inv_token_m"] = d[m].mean() if m.any() else d.sum() * 0
             out["inv_token_v"] = d[~m].mean() if (~m).any() else d.sum() * 0
-            out["sigreg_token"] = sig(z[self._sample(vs, torch.ones_like(vs, dtype=torch.bool), b, gen)][None])
-            inv.append(out["inv_token"]), sigs.append(out["sigreg_token"]), w.append(self.tok_self)
+            if self.tok_t is None:
+                inv.append(out["inv_token"]), sigs.append(out["sigreg_token"]), w.append(self.tok_self)
+            else:
+                tok_loss = self.tok_self * out["inv_token"]
         wmean = lambda xs: sum(a * x for a, x in zip(w, xs)) / sum(w)
         for k, r in (("rec", rec), ("rec_visible", recv), ("rec_contrast", con), ("rec_edge", edg)):
             if r:
                 out[k] = (r := torch.cat(r)).sum() / max(len(r), 1)
-        return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs) + self.rec_weight * out.get("rec", 0)
+        return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs) + tok_loss + self.rec_weight * out.get("rec", 0)
                 + self.rec_visible * out.get("rec_visible", 0) + self.rec_contrast * out.get("rec_contrast", 0)
                 + self.rec_edge * out.get("rec_edge", 0),
                 "inv_global": inv_g, "sigreg_global": sig_g, **out, "len_global": lens[0], "len_local": lens[1]}
@@ -517,6 +561,15 @@ class LeJEPA(nn.Module):
                 parent = ((i[:, None, None] // f) * c + i[None, :, None] // f) * c + i[None, None, :] // f
                 sd[key] = sd[key][parent.flatten().to(sd[key].device)]
         return sd
+
+    @torch.no_grad()
+    def ema_update(self, progress: float = 0.0):
+        """tok_self_ema: the target head follows the trained one after each optimizer step, momentum tok_self_ema -> 1
+        on a cosine over training (progress in [0, 1]), as DINO/iBOT."""
+        if self.tok_t is not None:
+            m = 1 - (1 - self.tok_self_ema) * (1 + math.cos(math.pi * progress)) / 2
+            for t, p in zip(self.tok_t.parameters(), self.tok.parameters()):
+                t.lerp_(p, 1 - m)
 
     def _sample(self, vol: torch.Tensor, fg: torch.Tensor, b: int, gen) -> torch.Tensor:
         """`tokens_per_volume` row indices per volume, drawn among its foreground rows (with replacement: a fixed

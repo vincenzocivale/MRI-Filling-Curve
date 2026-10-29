@@ -417,6 +417,7 @@ class Pretrainer:
             gnorm = nn.utils.clip_grad_norm_(self.model.parameters(), clip)
             if torch.isfinite(gnorm):  # a non-finite step would poison the weights and Adam's moments
                 self.opt.step()
+                self.net.ema_update(step / t["steps"])
             else:
                 self.skipped += 1
             event = None
