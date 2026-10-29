@@ -54,8 +54,6 @@ objective:
                               # (m5: OOM at 144 scans/GPU); brains are ~2.3k patches, the cap shrinks ~0.3% of views
   thick_prob: 0.3             # per view: native slices averaged into slabs along a random axis ...
   thick_mm: [4, 8]            # ... ~4 or 8 mm thick (skipped where the scan's slices already are): thick-slice acquisitions
-  coarse_max: 1               # > 1: in coarse_prob of the views each axis averaged in blocks of 1..coarse_max native
-  coarse_prob: 0.3            # voxels (a coarser acquisition: 0.69 -> 1.4 mm, 1 -> 4 mm, 3 -> 6 mm slices); 1 = off
   mask_ratio: [0.2, 0.5]      # fraction of view A's cubes whose foreground patches get the mask token
   mask_cells: [1]             # (G3, p3 12/10) per view A: cube edge (patches) of its mask, <= half the view's shortest edge
   levels: [2, 4]              # cube levels above the patch (32, 64 mm): mean token of fully masked A cubes -> B's (v8 smoke: 128 mm cubes got 0-4 pairs per step: masks that big fit only whole-body views)
@@ -66,26 +64,19 @@ objective:
   fg_threshold: 0.05          # foreground patch = mean above this (group centres are foreground)
   proj_hidden: 1024
   proj_dim: 64                # every head (view mean, patch, each cube level); LeJEPA Tab. 1d: small is better
-  proj_norm: batch           # BatchNorm projectors (LayerNorm, the 23/10 small-batch trial with it, lost ~10 points of IDH:
-                              # back to batch, user 23/10); "layer" stays an option; runs before
-                              # 23/10 used batch (their saved config.yaml has no key: the code default "batch")
-  tokens_per_volume: 32       # B foreground tokens (and cells) per volume fed to their SIGReg: the estimate's sample
-                              # count only (4 GPUs x 36 vols x 32 = 4608), not its weight (sigreg_samples); <32 also
-                              # biases vol_share up (within-volume variance from too few tokens: floor 0.2 at 5)
+  tokens_per_volume: 32       # foreground tokens (and B's cells) per volume fed to their SIGReg: the estimate's sample
+                              # count only (4 GPUs x 36 vols x 32 = 4608), not its weight (sigreg_samples)
   lam: 0.076                  # (G3, p3 12/10) loss = (1-lam)*invariance + lam*SIGReg
   sigreg_slices: 256
   sigreg_knots: 17
   sigreg_samples: 768         # every SIGReg rescaled to this many samples (it grows with its sample count): same weight
                               # for every term whatever batch, tokens_per_volume, groups or GPUs; 768 = what lam was tuned on
-  w_top: 0.63                 # (G3, p3 12/10) weight of the view, volume and session terms (token and cells: 1), in both means
+  w_top: 0.63                 # (G3, p3 12/10) weight of the view, volume and session terms (cells: 1), in both means
+  tok_self: 0.0               # (29/10) LeJEPA + iBOT++ token term (A masked vs A unmasked, symmetric, own SIGReg): its
+                              # weight in both means; 0 = off (the cross-view token term was removed: off since 23/10)
   top_levels: [volume, session]   # the levels above the view ([] for the A/B check)
   rec_weight: 0.2             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
   rec_visible: 0.2            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens
-  volume_locals: true        # (16/10) false: the volume level pulls only the global views together (locals out)
-  tok_joint_bn: false        # (16/10) token head on A's predictions and B's tokens in one call (shared BatchNorm
-                              # statistics); false = two calls, as every run before
-  cov_dim: 0                  # > 0: second-order view level (token covariance projected to this, its square root;
-                              # invariance + SIGReg like the view mean; notes/loss_stato.md); 0 = off
   max_packed_tokens: 65536    # tokens per encoder call (GDN-2's backward peak follows it; 262144: -12% s/step at d=512)
 
 train:
