@@ -754,6 +754,8 @@ def train(job: dict) -> None:
                 t_save = time.time()
         del val_v, data
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
+        # the last iteration's state kept too (user 30/10: never delete checkpoints; diagnosis of the val's choice)
+        torch.save({"key": key, "it": it, "state": trained()}, out_p.with_suffix(".final.pt"))
         last.unlink(missing_ok=True)
     if LM and getattr(net, "ctopk_eval", None) and "lm_topk" not in best:
         # landmark cascade (user, 24/10): the cells per landmark scaled on the val MRE of the best state, once (x1 is the
