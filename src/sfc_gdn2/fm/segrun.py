@@ -147,7 +147,8 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
         with amp():
             return net.landmark_predict(x, ctx.to(x.device), n_out) if lm else net.cascade_predict(x, ctx.to(x.device), n_out)
     S = tuple(x.shape[1:])
-    patch = S if patch is None else tuple(patch)
+    patch = S if patch is None else tuple(min(p, s) for p, s in zip(patch, S)) if getattr(net, "any_tile", False) \
+        else tuple(patch)
     xp, _ = pad_to(x, None, patch)
     P = tuple(xp.shape[1:])
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
@@ -322,11 +323,14 @@ def dice_full_res(probs: torch.Tensor, grid_from_gt: np.ndarray, lab: np.ndarray
 class Patches:
     """Random training patches from volumes held in RAM; 1/3 centred on a voxel of a random present class."""
 
-    def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator):
+    def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator, fit: bool = False):
+        self.fit = fit
         self.vols, self.ctx, self.patch, self.rng, self.align, self.lm = [], [], [], rng, [], []
         for v in vols:
             self.lm.append(v.get("lm"))
             pv = tile_of(patch, v.get("align"), k)
+            if pv and getattr(self, "fit", False) and v.get("align"):   # any_tile: never larger than the volume (its grid)
+                pv = [min(p, -(-s // a) * a) for p, s, a in zip(pv, v["x"].shape[1:], v["align"])]
             x, y = pad_to(v["x"], v["y"], pv) if pv else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
             self.align.append(v.get("align"))
@@ -360,12 +364,6 @@ class Patches:
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
             ys.append(y[sl] if self.lm[j] is None else heat_spec(self.lm[j], start))
-        if len({t.shape for t in xs}) > 1 and getattr(self, "pad_batch", False) and self.lm[0] is None:
-            # a decoder reading any tile shape (fm/hier_dec, user 30/10): one batch, each tile padded at its end to the
-            # largest (image 0, label 255: ignored by the loss), not one scan at a time
-            M = [max(t.shape[a] for t in ys) for a in range(3)]
-            xs = [F.pad(t, [p for d, m in zip(reversed(t.shape[1:]), reversed(M)) for p in (0, m - d)]) for t in xs]
-            ys = [F.pad(t, [p for d, m in zip(reversed(t.shape), reversed(M)) for p in (0, m - d)], value=255) for t in ys]
         if len({t.shape for t in xs}) > 1:
             return [t[None] for t in xs], [t[None] for t in ys], None if cs[0] is None else [t[None] for t in cs]
         return torch.stack(xs), torch.stack(ys), None if cs[0] is None else torch.stack(cs)
@@ -407,6 +405,25 @@ def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
         (ce / n + (a * i_).sum() + (b * p_).sum() + pop_aux(net) / len(parts)).backward()
     dice = (2 * inter[1:] + 1e-5) / den[1:]
     return sum(s[0] for s in sums) / n + 1 - dice.mean()
+
+
+def group_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
+    """A decoder reading any tile shape (any_tile, fm/hier_dec): the batch's tiles of one shape in one call, one call per
+    shape, loss_fn's value on the whole batch from the calls' summed sums (the soft Dice over the batch), one backward."""
+    by = {}
+    for i, t in enumerate(x):
+        by.setdefault(tuple(t.shape), []).append(i)
+    sums, aux = [], 0.0
+    for idx in by.values():
+        yi = torch.cat([y[i] for i in idx])
+        sel_target(net, yi)
+        with amp():
+            lg = call(net, torch.cat([x[i] for i in idx]).to(dev).float(), None if c is None else torch.cat([c[i] for i in idx]))
+        sums.append(batch_sums(lg, yi.to(dev), k))
+        aux = aux + pop_aux(net) * len(idx) / len(x)
+    loss = sums_loss([sum(s_[j] for s_ in sums) for j in range(5)]) + aux
+    loss.backward()
+    return loss.detach()
 
 
 def sums_loss(t: list) -> torch.Tensor:
@@ -552,8 +569,7 @@ def train(job: dict) -> None:
         if hasattr(net, "plan"):   # a live token cache is written by load(): the fingerprint again, now complete
             net.plan([it["id"] for it in split["train"]])
         val_v = [load(it) for it in split["val"]]
-        data = Patches(train_v, patch, k, rng)
-        data.pad_batch = getattr(net, "pad_batch", False)
+        data = Patches(train_v, patch, k, rng, fit=getattr(net, "any_tile", False))
         del train_v
         params = [p for p in net.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=job["lr"], weight_decay=1e-4)
@@ -650,6 +666,9 @@ def train(job: dict) -> None:
                 logits = torch.zeros(1, device=dev)
             elif getattr(net, "cascade", False):
                 loss = cascade_step(net, x, y, c, k, amp, dev)
+                logits = torch.zeros(1, device=dev)
+            elif isinstance(x, list) and getattr(net, "any_tile", False):   # tiles of several shapes, grouped by shape
+                loss = group_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
             elif isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
                 loss = micro_step(net, x, y, c, k, amp, dev)
