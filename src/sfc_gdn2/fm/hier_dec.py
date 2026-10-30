@@ -95,6 +95,9 @@ class HierDec(nn.Module):
         self.fproj = nn.Linear(W, C, bias=False)
         # two CK-conv layers on the voxels (user 30/10: Willis' small arteries, errors inside the cells read)
         self.stem, self.head, self.head2 = CKConv(1, C), CKConv(C, C), CKConv(C, C)
+        # image branch and field normalised before their sum (30/10: even with the LayerNorm the field was ~120x the
+        # image branch, whose CK-convs never left their init)
+        self.na, self.nf = nn.GroupNorm(1, C), nn.GroupNorm(1, C)
         self.out = nn.Conv3d(C, n_out, 1)
         self.tau, self.read_taus, self.TAUS = TAU, [TAU], TAUS
         self.full = False   # eval reads every cell (thresholds as masks): segrun sets it for the threshold's choice and the test
@@ -123,8 +126,8 @@ class HierDec(nn.Module):
             # the group's tiles by slices: advanced indexing of the [B, C, 160^3] field (~1e9 values) failed on the GPU
             # (CUDA "invalid configuration argument", 29/10)
             pick = (lambda t: t) if len(idx) == len(x) else (lambda t, idx=idx: torch.cat([t[b:b + 1] for b in idx]))
-            a, fl = self.head(F.gelu(self.stem(pick(x), sp)), sp), pick(field)
-            o = [self.out(F.gelu(self.head2(F.gelu(a + fl[:, m].to(a.dtype)), sp))) for m in range(fl.shape[1])]
+            a, fl = self.na(self.head(F.gelu(self.stem(pick(x), sp)), sp)), pick(field)
+            o = [self.out(F.gelu(self.head2(F.gelu(a + self.nf(fl[:, m]).to(a.dtype)), sp))) for m in range(fl.shape[1])]
             # several thresholds: each one's log-probabilities (sliding's softmax over all of them then gives each
             # threshold's probabilities / their count: the same argmax per threshold)
             out.append(o[0] if len(o) == 1 else torch.cat([q.float().log_softmax(1) for q in o], 1))
