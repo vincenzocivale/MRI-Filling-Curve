@@ -19,7 +19,7 @@ from torch.nn import functional as F
 
 from .token_cache import TokenCache, fine_ok
 
-LV = (16.0, 8.0, 4.0, 2.0)
+LV = (16.0, 8.0, 4.0, 2.0, 1.0)   # 1 mm (30/10): Willis' field at 2 mm is capped at Dice .54 (GT on 2 mm cells), .89 at 1 mm
 W, C = 256, 32           # token width, stem width
 TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cells with P(mixed) > TAU; the test's
                                         # threshold chosen on val among TAUS (segrun, one pass: every cell read, masks)
@@ -84,9 +84,9 @@ class HierDec(nn.Module):
         self.enc = nn.Sequential(nn.LayerNorm(c), nn.Linear(c, W))
         self.mlp = nn.ModuleList(nn.Sequential(nn.Linear(3 * W, W), nn.GELU(), nn.Linear(W, W)) for _ in LV[1:])
         self.vox = KernelEmbed(W, rank=8, basis="bspline")   # one for 8 / 4 / 2 mm: B-splines in the cell's own coordinate
-        # P(mixed) of the 8 / 4 mm cells (what decides the 4 / 2 mm reads): one logit, class-balanced BCE on detached
+        # P(mixed) of the 8 / 4 / 2 mm cells (what decides the 4 / 2 / 1 mm reads): one logit, class-balanced BCE on detached
         # tokens (only where to read; the tokens learn from the voxels' loss alone); bias -2: little read at the start
-        self.lhead = nn.ModuleList(nn.Linear(W, 1) for _ in LV[1:3])
+        self.lhead = nn.ModuleList(nn.Linear(W, 1) for _ in LV[1:4])
         for h in self.lhead:
             nn.init.constant_(h.bias, -2.0)
         # the field enters the head through a 1x1 (user 29/10: smooth over >= 2 mm already, a 2 mm kernel on it added
@@ -95,10 +95,6 @@ class HierDec(nn.Module):
         self.fproj = nn.Linear(W, C, bias=False)
         # two CK-conv layers on the voxels (user 30/10: Willis' small arteries, errors inside the cells read)
         self.stem, self.head, self.head2 = CKConv(1, C), CKConv(C, C), CKConv(C, C)
-        # each cell's field normalised (no bias: a cell not read stays 0), on the cells, before the interpolation (30/10:
-        # even with the tokens' LayerNorm the field was ~120x the image branch, whose CK-convs never left their init; a
-        # norm at voxel resolution cost an fp32 pass over [C, 160^3] per tile)
-        self.fnorm = nn.LayerNorm(C, bias=False)
         self.out = nn.Conv3d(C, n_out, 1)
         self.tau, self.read_taus, self.TAUS = TAU, [TAU], TAUS
         self.full = False   # eval reads every cell (thresholds as masks): segrun sets it for the threshold's choice and the test
@@ -149,7 +145,7 @@ class HierDec(nn.Module):
         B, T, dev = len(xs), tuple(xs.shape[1:]), xs.device
         taus = torch.tensor(self.read_taus if self.full and not self.training else [self.tau], device=dev)
         nt = len(taus)
-        ks = [[[4 * a for a in k4], [2 * a for a in k4], list(k4), list(patch_dims(sp, 2.0))]
+        ks = [[[4 * a for a in k4], [2 * a for a in k4], list(k4), list(patch_dims(sp, 2.0)), list(patch_dims(sp, 1.0))]
               for k4, sp in ((self.cache.meta(i)["k4"], sp) for i, sp in zip(ids, sps))]
         spt = [torch.tensor(sp, device=dev, dtype=torch.float32) for sp in sps]
         field, loss, prev, live = [0.0] * B, 0.0, [None] * B, list(range(B))
@@ -209,7 +205,7 @@ class HierDec(nn.Module):
                 t = p_ + d
             cnt = [len(g_[5]) for g_ in geo]
             pm = torch.zeros(len(t), device=dev)
-            if j in (1, 2):   # P(mixed) of the 8 / 4 mm cells: what the next level reads
+            if j in (1, 2, 3):   # P(mixed) of the 8 / 4 / 2 mm cells: what the next level reads
                 lg = self.lhead[j - 1](t.detach()).float()[:, 0]
                 pm = lg.sigmoid().detach()
                 if ys is not None:
@@ -219,7 +215,7 @@ class HierDec(nn.Module):
                         pos = (tg[v] == 1).float()
                         w = (len(pos) - pos.sum()) / pos.sum().clamp(min=1)   # class-balanced: miste vs pure
                         loss = loss + F.binary_cross_entropy_with_logits(lg[v], pos, pos_weight=w)
-            f = self.fnorm(self.fproj(d))
+            f = self.fproj(d)
             for b, (k, c0, n, front, N, keep, inc), tb, pb, fb in zip(live, geo, t.split(cnt), pm.split(cnt), f.split(cnt)):
                 row = torch.zeros(N, dtype=torch.bool, device=dev)
                 row[keep] = True
