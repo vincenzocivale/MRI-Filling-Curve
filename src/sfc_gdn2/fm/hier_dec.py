@@ -27,10 +27,10 @@ TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cel
 DROP = 0.1               # dropout on the encoder's 4096-d tokens (as CubeDec: small datasets)
 LIVE_MAX = 1 << 17   # tokens per live encoder call (30/10: 2^19 ran out of memory on tumor_ucsf, a batch's earlier shape
                      # groups' graphs held until the one backward)
-SNAKE_GAP = 8        # v10 (user 30/10, "il serpente"): live cells read as stretches of the curve; a gap of <= this many unread
+SNAKE_GAP = 16       # v10 (user 30/10, "il serpente"): live cells read as stretches of the curve; a gap of <= this many unread
                      # cells between open ones read too (context only), a longer one starts a new sequence
 OPEN_MAX = 1 << 14   # v10: open cells per tile and live level at most (the highest parent P(mixed)): tumor_ucsf ran out of memory
-SEQ_MAX = 1 << 10    # v10: sequences per live call at most (tumor_ucsf: thousands of short stretches, a Triton grid limit)
+SEQ_MAX = 4095       # v10: sequences per live call at most (GDN-2 kernels: a grid axis of sequences x 16 heads <= 65535)
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
 PDROP = 0.0              # HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9 off
