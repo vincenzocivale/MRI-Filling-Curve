@@ -788,13 +788,16 @@ def train(job: dict) -> None:
                                              for q, v in zip(pa, vs)], True) for c in range(1, k)])) for pa in preds]
         else:
             by = [float(np.nanmean([dice_on(q, v["y"], k) for q, v in zip(pa, vs)])) for pa in preds]
-        best |= {"read_tau": float(net.read_taus[int(np.nanargmax(by))]),
-                 "val_by_tau": {str(t): d for t, d in zip(net.read_taus, by)}}
-        print(f"[seg] read threshold {best['read_tau']:g} (val {job.get('select') or 'dice'} per threshold "
+        # 30/10: reading every cell is not the training read (the encoder reads the chosen cells as one sequence, so
+        # their tokens change): the training read (None) is a candidate too, its val score the selection's own
+        by_t = {str(t): d for t, d in zip(net.read_taus, by)} | {"train": float(best.get("score", best["val"]))}
+        b_ = max(by_t, key=lambda t: by_t[t])
+        best |= {"read_tau": None if b_ == "train" else float(b_), "val_by_tau": by_t}
+        print(f"[seg] read threshold {best['read_tau']} (val {job.get('select') or 'dice'} per threshold "
               f"{best['val_by_tau']})", flush=True)
         del preds, vs
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
-    if "read_tau" in best:   # the test reads every cell, its threshold a mask (as chosen)
+    if best.get("read_tau") is not None:   # the test reads every cell, its threshold a mask (as chosen)
         net.full, net.read_taus = True, [best["read_tau"]]
     if job.get("val_only"):  # pretraining tuning: the best val Dice, no test volume read
         if job.get("save_pred"):   # the best state's val predictions kept anyway (user, 24/10: lesion counts on val)
@@ -864,7 +867,8 @@ def train(job: dict) -> None:
         rule = choose_postproc(vals, k, sizes, f1)
         del vals
     tkey = key | {"best_iter": best["iter"], "postproc": {str(c): r for c, r in rule.items()}} | \
-        ({"lm_topk": best["lm_topk"]} if "lm_topk" in best else {})   # (only when chosen: other runs' partial tests resume)
+        ({"lm_topk": best["lm_topk"]} if "lm_topk" in best else {}) | \
+        ({"read_tau": best["read_tau"]} if "read_tau" in best else {})   # (only when chosen: other runs' partial tests resume)
     done = json.loads(part.read_text()) if part.exists() else {}
     res = done["res"] if done.get("key") == tkey else {"per_volume": [], "per_class": [], "test_ids": []}
     if res["test_ids"]:
