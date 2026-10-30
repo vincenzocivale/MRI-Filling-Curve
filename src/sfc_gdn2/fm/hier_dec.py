@@ -79,7 +79,9 @@ class HierDec(nn.Module):
         c = encoder.dim * (1 + len(encoder.taps))
         # one projection for every level (user 30/10: the encoder reads every grain in one space; four of them were 80 %
         # of the parameters and where HIE overfit, train Dice .585 vs val .176)
-        self.enc = nn.Linear(c, W)
+        # LayerNorm first (as CubeDec's ctok; 30/10: without it the field was ~250x the image branch, whose CK-convs never
+        # left their init)
+        self.enc = nn.Sequential(nn.LayerNorm(c), nn.Linear(c, W))
         self.mlp = nn.ModuleList(nn.Sequential(nn.Linear(3 * W, W), nn.GELU(), nn.Linear(W, W)) for _ in LV[1:])
         self.vox = KernelEmbed(W, rank=8, basis="bspline")   # one for 8 / 4 / 2 mm: B-splines in the cell's own coordinate
         # P(mixed) of the 8 / 4 mm cells (what decides the 4 / 2 mm reads): one logit, class-balanced BCE on detached
