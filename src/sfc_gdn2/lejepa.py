@@ -132,7 +132,8 @@ class LeJEPA(nn.Module):
                  rec_cells: int = 4, rec_eps: float = 0.01, rec_visible: float = 0.0,
                  rec_head_cells: int = 0, rec_extra: bool = False, rec_contrast: float = 0.0, rec_edge: float = 0.0,
                  tok_self: float = 0.0, tok_self_p: tuple = (0.5, 0.5),
-                 tok_self_ema: float = 0.0, tok_protos: int = 4096):
+                 tok_self_ema: float = 0.0, tok_protos: int = 4096,
+                 meta: float = 0.0, meta_ridge: float = 0.1, meta_min_mm: float = 8.0):
         super().__init__()
         self.encoder, self.gg, self.gl, self.k, self.lam = encoder, groups_global, groups_local, 2, lam
         self.curves, self.seed = list(view_curves), seed
@@ -157,6 +158,14 @@ class LeJEPA(nn.Module):
         # (temperature 0.04) as DINO/iBOT against A's at 0.1, cross-entropy; weight w added to the loss outside the means
         # (inv_token = the CE; tok_entropy: the target's entropy, ~0 = collapse onto a prototype)
         self.tok_self, self.tok_self_p = float(tok_self), tuple(tok_self_p)
+        # meta w (30/10, user: post-training "understand the tasks", no labels): every unmasked B view of a scan at
+        # >= meta_min_mm is an episode. Label-free targets per foreground token on a 2^3 sub-grid of its patch: the
+        # scan's z-scored intensity of its session mate on the same grid in another contrast (cross; manifest
+        # p31 pairs: session = session#grid), FLAIR hyperintensity (z > 2.5), 3 intensity classes (1D k-means). The
+        # view's tokens split by a random plane: a ridge (closed form, strength meta_ridge x mean |x|^2) fitted on one
+        # side, 1 - R^2 on the other, back-propagated through the solution into the encoder (MetaOptNet). Per rank, no
+        # collective; weight w added to the loss; logged as meta and meta_r2_<family>.
+        self.meta, self.meta_ridge, self.meta_min_mm = float(meta), float(meta_ridge), float(meta_min_mm)
         self.register_buffer("mask_cells", torch.tensor(mask_cells), persistent=False)
         self.glob = Projector(2 * encoder.dim, proj_hidden, proj_dim)
         self.tok = Projector(2 * encoder.dim, proj_hidden, proj_dim) if tok_self else None
@@ -363,6 +372,82 @@ class LeJEPA(nn.Module):
         bi = torch.cat([fwd, bwd.index_select(0, rev) if late else bwd], -1)   # index_select: backward index_add
         return tv, idx, pxyz, fgv, mask, bi, n, off, lens
 
+    def _episodes(self, pv, v, idx, pxyz, fgv, bi, n_h, gen, acc: dict) -> None:
+        """objective.meta: one episode per unmasked (B) view of the read; 1 - R^2 per family appended to acc."""
+        dev = bi.device
+        mms = pv.get("patch_mm") or [self.encoder.patch_embed.patch_mm] * len(pv["patches"])
+        ses, mod, flair = pv["session"].tolist(), pv["modality"].tolist(), pv["flair"].tolist()
+        stats = {}
+
+        def scan(b):   # z-scored voxels and 3 intensity-class centres of scan b (its foreground), once
+            if b not in stats:
+                x = pv["patches"][b].float()
+                f = x[x > self.fg_threshold]
+                mu, sd = f.mean(), f.std().clamp_min(1e-6)
+                z = ((f[torch.randint(len(f), (min(len(f), 1 << 17),), device=dev, generator=gen)] - mu) / sd)
+                c = torch.quantile(z, torch.tensor([0.2, 0.5, 0.8], device=dev))
+                for _ in range(15):
+                    a = (z[:, None] - c).abs().argmin(1)
+                    c = torch.stack([z[a == j].mean() if (a == j).any() else c[j] for j in range(3)])
+                stats[b] = (mu, sd, c)
+            return stats[b]
+
+        def target(b, pid):   # z-scored voxels of scan b's patches pid -> [R, 1, *k] and its foreground
+            mu, sd, _ = scan(b)
+            x = pv["patches"][b][pid].float()
+            return ((x - mu) / sd).view(-1, 1, *pv["k_list"][b]), (x > self.fg_threshold).view(-1, 1, *pv["k_list"][b])
+
+        pool = lambda t: nn.functional.adaptive_avg_pool3d(t.float(), 2).flatten(1)
+        offs = [0]
+        for ln in n_h:
+            offs.append(offs[-1] + ln)
+        with torch.autocast(dev.type, enabled=False):
+            for j in range(1, len(n_h), 2):   # B views
+                b = int(v[j])
+                if mms[b] < self.meta_min_mm:
+                    continue
+                r = torch.arange(offs[j], offs[j + 1], device=dev)
+                r = r[fgv[r]]
+                if len(r) < 64:
+                    continue
+                pid = idx[r]
+                with torch.no_grad():
+                    z, fgm = target(b, pid)
+                    fam = {"tissue": torch.cat([pool(((z - scan(b)[2].view(1, 3, 1, 1, 1)).abs().argmin(1, keepdim=True)
+                                                       == j_) & fgm) for j_ in range(3)], 1)}
+                    if flair[b]:
+                        fam["hyper"] = pool((z > 2.5) & fgm)
+                    mate = [m for m in range(len(ses)) if m != b and ses[m] == ses[b] and mod[m] != mod[b]
+                            and pv["k_list"][m] == pv["k_list"][b] and pv["patches"][m].shape == pv["patches"][b].shape]
+                    if mate:
+                        zm, fm = target(mate[0], pid)
+                        fam["cross"] = pool(zm * fm)
+                    u = torch.randn(3, device=dev, generator=gen)
+                    side = (pxyz[r].float() - pxyz[r].float().mean(0)) @ u
+                    s = side < side.median()
+                if s.sum() < 32 or (~s).sum() < 32:
+                    continue
+                x = bi[r].float()
+                xs, xq = x[s], x[~s]
+                m0 = xs.mean(0)
+                xs, xq = xs - m0, xq - m0
+                y = torch.cat(list(fam.values()), 1)
+                ys, yq = y[s], y[~s]
+                y0 = ys.mean(0)
+                lam = self.meta_ridge * xs.square().sum(1).mean()
+                if len(xs) <= xs.shape[1]:   # kernel form (fewer support tokens than dimensions)
+                    a = torch.linalg.solve(xs @ xs.T + lam * torch.eye(len(xs), device=dev), ys - y0)
+                    pred = xq @ (xs.T @ a) + y0
+                else:
+                    pred = xq @ torch.linalg.solve(xs.T @ xs + lam * torch.eye(xs.shape[1], device=dev), xs.T @ (ys - y0)) + y0
+                c0 = 0
+                for f, t in fam.items():
+                    sl = slice(c0, c0 + t.shape[1])
+                    c0 += t.shape[1]
+                    sst = (yq[:, sl] - yq[:, sl].mean(0)).square().sum()
+                    if sst > 1e-3 * len(yq):   # a target with no variance on the query side: no episode
+                        acc.setdefault(f, []).append(((pred[:, sl] - yq[:, sl]).square().sum() / sst).clamp(max=4))
+
     def _grid_ctx(self, vols: dict) -> tuple:
         """One cut of the batch's scans -> (vols with host lists, grid [B,3], n_patch, foreground [B,N], kernel
         weights per scan)."""
@@ -435,6 +520,7 @@ class LeJEPA(nn.Module):
                 same[0, s] |= ~same[:, s: s + (self.gg if s == 0 else self.gl)].any()
             corner, edge = (torch.where(same[..., None, None], t[:, :, :1], t) for t in (corner, edge))
         zg, lens, tops, spred, stgt, smask, svol = [], [], [], [], [], [], []
+        meta = {}   # family -> [1 - R^2 per episode]
         cpred, ctgt, cz, cvol = ([[] for _ in self.levels] for _ in range(4))
         for part in (slice(0, self.gg), slice(self.gg, None)):                             # globals / locals
             pv, pgrid, pn, pfg, pws = coarse if part.start == 0 else fine
@@ -444,6 +530,8 @@ class LeJEPA(nn.Module):
             sg = same[:, part].reshape(-1)                                                 # per group
             src = torch.arange(nv, device=dev) - (sg.repeat_interleave(2) & ~masked).long()   # tied B -> its A
             tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(pv, pws, pfg, pn, v, c, e, masked, gen, src)
+            if self.meta:
+                self._episodes(pv, v, idx, pxyz, fgv, bi, n_h, gen, meta)
             has = torch.zeros(nv, device=dev).index_add_(0, tv, fgv.float()) > 0
             w = (fgv | ~has[tv]).float()                                                   # foreground (all if none)
             top = torch.zeros(nv, bi.shape[-1], device=dev).index_add_(0, tv, bi.float() * w[:, None]) \
@@ -540,12 +628,15 @@ class LeJEPA(nn.Module):
             else:
                 tok_loss = self.tok_self * out["inv_token"]
         wmean = lambda xs: sum(a * x for a, x in zip(w, xs)) / sum(w)
+        if meta:
+            out["meta"] = torch.cat([torch.stack(x) for x in meta.values()]).mean()
+            out |= {f"meta_r2_{f}": 1 - torch.stack(x).detach().mean() for f, x in meta.items()}
         for k, r in (("rec", rec), ("rec_visible", recv), ("rec_contrast", con), ("rec_edge", edg)):
             if r:
                 out[k] = (r := torch.cat(r)).sum() / max(len(r), 1)
         return {"loss": (1 - self.lam) * wmean(inv) + self.lam * wmean(sigs) + tok_loss + self.rec_weight * out.get("rec", 0)
                 + self.rec_visible * out.get("rec_visible", 0) + self.rec_contrast * out.get("rec_contrast", 0)
-                + self.rec_edge * out.get("rec_edge", 0),
+                + self.rec_edge * out.get("rec_edge", 0) + self.meta * out.get("meta", 0),
                 "inv_global": inv_g, "sigreg_global": sig_g, **out, "len_global": lens[0], "len_local": lens[1]}
 
     def rec_cells_of(self, p: torch.Tensor) -> torch.Tensor:

@@ -252,6 +252,9 @@ class Pretrainer:
                 if isinstance(m, nn.SyncBatchNorm):   # counts to have type BFloat16 but got Float", 21/10)
                     m.forward = fp32_forward(m.forward)
         self.session = torch.tensor(ses)
+        mods = rows["modality"].astype(str)   # objective.meta: the session mate in another contrast; FLAIR hyperintensity
+        self.modality = torch.tensor(pd.factorize(mods)[0])
+        self.flair = torch.tensor(mods.str.upper().str.contains("FLAIR").to_numpy())
         self.model = DistributedDataParallel(self.net, device_ids=[self.device.index]) if world > 1 else self.net
         muon = t.get("optimizer", "adamw") == "muon"
         groups = param_groups(self.net, t["weight_decay"], muon)
@@ -408,9 +411,11 @@ class Pretrainer:
             patches += int(batch["grid"].prod(1).sum())
             gen.manual_seed((self.seed * 1_000_003 + step) * 4096 + self.rank)  # resumable on any number of GPUs
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                vols = to_device(batch, self.device) | {"session": self.session[batch["index"]].to(self.device)}
+                ids = {n: t[batch["index"]].to(self.device) for n, t in
+                       (("session", self.session), ("modality", self.modality), ("flair", self.flair))}
+                vols = to_device(batch, self.device) | ids
                 if "global" in batch:
-                    vols["global"] = to_device(batch["global"], self.device)
+                    vols["global"] = to_device(batch["global"], self.device) | ids
                 out = self.model(vols, gen)
             self.opt.zero_grad(set_to_none=True)
             out["loss"].backward()
