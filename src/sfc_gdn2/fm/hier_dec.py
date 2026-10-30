@@ -11,6 +11,7 @@ threshold a mask; the test's chosen on val (segrun, one pass over TAUS). Generic
 [B, K, *T], tile_corner, sel_y / aux as CubeDec's selector)."""
 from __future__ import annotations
 
+import itertools
 import math
 
 import torch
@@ -26,6 +27,9 @@ TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cel
 DROP = 0.1               # dropout on the encoder's 4096-d tokens (as CubeDec: small datasets)
 LIVE_MAX = 1 << 17   # tokens per live encoder call (30/10: 2^19 ran out of memory on tumor_ucsf, a batch's earlier shape
                      # groups' graphs held until the one backward)
+SNAKE_GAP = 8        # v10 (user 30/10, "il serpente"): live cells read as stretches of the curve; a gap of <= this many unread
+                     # cells between open ones read too (context only), a longer one starts a new sequence
+OPEN_MAX = 1 << 14   # v10: open cells per tile and live level at most (the highest parent P(mixed)): tumor_ucsf ran out of memory
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
 PDROP = 0.0              # HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9 off
@@ -162,7 +166,7 @@ class HierDec(nn.Module):
         loss, prev, live = 0.0, [None] * B, list(range(B))
         for j, mm in enumerate(LV):
             dense = mm in self.cache.levels   # cached: every cell; live: the children of the cells passing the threshold
-            members, geo, par, pats, qs = [], [], [], [], []
+            members, geo, par, pats, qs, alls = [], [], [], [], [], []
             for b in live:
                 k, corner = ks[b][j], corners[b]
                 if j and (not fine_ok(k) or k == ks[b][j - 1]):   # a scan too coarse for this level (and the finer ones)
@@ -185,6 +189,8 @@ class HierDec(nn.Module):
                     if not dense and not (self.full and not self.training):   # reads what passes; full: all, masks
                         ok = ok & (pm[prr[pidx]] > self.tau)
                     keep = ok.nonzero()[:, 0]
+                    if not dense and len(keep) > OPEN_MAX:   # the cap: the open cells under the likeliest mixed parents
+                        keep = keep[pm[prr[pidx[keep]]].topk(OPEN_MAX).indices].sort().values
                     if not len(keep):
                         continue
                     r = prr[pidx[keep]]
@@ -194,8 +200,10 @@ class HierDec(nn.Module):
                     # zero-padded; tiles from the scan instead of xs if the tile borders show
                     xp = F.pad(xs[b].float(), [p for f, a, kk, t_ in zip(reversed(front), reversed(n), reversed(k), reversed(T))
                                                for p in (f, a * kk - f - t_)])
-                    pats.append(patchify(xp, k)[keep])
+                    allp = patchify(xp, k)
+                    pats.append(allp[keep])
                     qs.append(g[keep])
+                    alls.append((allp, g, keep))
                 members.append(b)
                 geo.append((k, c0, n, front, N, keep, inc))
             live = members
@@ -204,7 +212,7 @@ class HierDec(nn.Module):
             if dense:   # the cached levels' tokens, else the frozen encoder now on the cells chosen
                 enc = torch.cat([self._cached(ids[b], mm, g_[1], g_[2], g_[0], dev)[g_[5]] for b, g_ in zip(live, geo)])
             else:
-                enc = self._read_many(pats, qs, [g_[2] for g_ in geo], [spt[b] for b in live], mm, [g_[0] for g_ in geo])
+                enc = self._read_snake(alls, [g_[2] for g_ in geo], [spt[b] for b in live], mm, [g_[0] for g_ in geo])
             e = self.enc(F.dropout(enc, DROP, self.training))
             if j == 0:
                 t = d = e
@@ -274,6 +282,58 @@ class HierDec(nn.Module):
         finally:
             pe.patch_mm = mm0
         return torch.cat(out)
+
+    @torch.no_grad()
+    def _read_snake(self, alls, ns, sps, mm, ks) -> torch.Tensor:
+        """The frozen encoder at level mm on several tiles' open cells, as stretches of the curve LIVE (v10): per tile
+        (all its cells' patches, their grid coordinates, the open ones) the open cells and the unread ones in gaps of <=
+        SNAKE_GAP between them, one sequence per stretch, stretches packed in calls of <= LIVE_MAX tokens -> the open
+        cells' tokens [sum open, last ++ taps], tiles in order, each tile's in its `keep` order."""
+        from ..curves import keys
+        pe, dev = self.encoder.patch_embed, alls[0][0].device
+        mm0, pe.patch_mm = pe.patch_mm, mm
+        segs, xs_, ps_, sel = [], [], [], []
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                for a, (allp, g, keep) in enumerate(alls):
+                    N = len(g)
+                    order = keys(LIVE, g, torch.tensor(ns[a], device=dev), self.seed).argsort()   # the cells along the curve
+                    rank = torch.empty_like(order)
+                    rank[order] = torch.arange(N, device=dev)
+                    r = rank[keep].sort().values
+                    br = (r[1:] - r[:-1] <= SNAKE_GAP + 1).nonzero()[:, 0]   # bridged gaps: every place inside read
+                    cov = torch.zeros(N + 1, dtype=torch.long, device=dev)
+                    cov.index_add_(0, r[br], torch.ones_like(br)).index_add_(0, r[br + 1], -torch.ones_like(br))
+                    m = cov[:N].cumsum(0) > 0
+                    m[r] = True
+                    R = m.nonzero()[:, 0]                              # places read, along the curve
+                    cut = (R[1:] - R[:-1] > 1).nonzero()[:, 0] + 1   # a new stretch after a long gap
+                    b0 = torch.cat([cut.new_zeros(1), cut, cut.new_tensor([len(R)])])
+                    pos = torch.full((N,), -1, dtype=torch.long, device=dev)
+                    pos[R] = torch.arange(len(R), device=dev)
+                    sel.append(pos[rank[keep]])
+                    cells = order[R]
+                    xs_.append(pe(allp[cells], pe.weights(sps[a], ks[a])))
+                    ps_.append(g[cells])
+                    segs += [(a, s0, s1 - s0) for s0, s1 in itertools.pairwise(b0.tolist())]
+                hs, grp, tot = [[] for _ in alls], [], 0
+                for i in range(len(segs) + 1):
+                    if grp and (i == len(segs) or tot + segs[i][2] > LIVE_MAX):
+                        rng = {}   # a group's stretches of one tile are consecutive: one slice per tile
+                        for a, o, n in grp:
+                            rng[a] = (rng.get(a, (o, o))[0], o + n)
+                        xe = torch.cat([xs_[a][o0: o1] for a, (o0, o1) in rng.items()])
+                        cu = torch.tensor([0] + [n for _, _, n in grp], device=dev).cumsum(0).to(torch.int32)
+                        h = self.encoder.flat(xe, cu, pos=torch.cat([ps_[a][o0: o1] for a, (o0, o1) in rng.items()])).float()
+                        for (a, (o0, o1)), hh in zip(rng.items(), h.split([o1 - o0 for o0, o1 in rng.values()])):
+                            hs[a].append(hh)
+                        grp, tot = [], 0
+                    if i < len(segs):
+                        grp.append(segs[i])
+                        tot += segs[i][2]
+        finally:
+            pe.patch_mm = mm0
+        return torch.cat([torch.cat(h)[s] for h, s in zip(hs, sel)])
 
     @staticmethod
     def _mixed(y, front, n, k, keep) -> torch.Tensor:
