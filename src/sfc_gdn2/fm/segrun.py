@@ -196,6 +196,7 @@ def dice_on(pred: torch.Tensor, y: torch.Tensor, k: int) -> float:
 MISS_MM = 50.0   # a landmark not predicted at all counts as this radial error in the val selection
 
 
+TRAIN_EVAL = 6   # training scans scored at each validation (user 30/10)
 LANDMARK_SIGMA_MM = 3.0   # landmark heatmaps (user, 23/10: landmarks are a regression, not a segmentation)
 
 
@@ -626,6 +627,7 @@ def train(job: dict) -> None:
         drawer = ThreadPoolExecutor(1)
         queue = [drawer.submit(draw) for _ in range(min(AHEAD, iters - start + 1))]
         tm = {"data": 0.0, "step": 0.0, "val": 0.0}   # seconds per part since the last val line (24/10: where the time goes)
+        lsum = [0.0, 0]   # the training loss summed since the last val line (user 30/10: log the mean, not the last batch)
         # SFC_SEG_PROFILE="w,n" (27/10, where the step's time goes): after w iterations, n under cProfile + torch.profiler,
         # the tables to <out>.prof.txt, then the run stops (no val, no test)
         pw, pn = (int(v) for v in os.environ.get("SFC_SEG_PROFILE", "0,0").split(","))
@@ -680,6 +682,7 @@ def train(job: dict) -> None:
                 loss = loss_fn(logits, y.to(dev), k) + pop_aux(net)
                 loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
+            lsum = [lsum[0] + float(loss), lsum[1] + 1]
             if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
                 raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "
                                          f"{bool(torch.isfinite(logits).all())}, input finite "
@@ -706,8 +709,12 @@ def train(job: dict) -> None:
                         preds = [p.argmax(0) for p in preds]
                 ds = [dice_on(p.argmax(0) if p.dim() == 4 else p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
                 val = float(np.nanmean(ds))
-                rec = {"iter": it, "loss": float(loss), "val_dice": val, "min": (time.time() - t0) / 60}
+                rec = {"iter": it, "loss": lsum[0] / max(lsum[1], 1), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
+                if not LM and not getattr(net, "cascade", False):   # user 30/10: the Dice on a few training scans too (overfit)
+                    rec["train_dice"] = float(np.nanmean([dice_on(sliding(net, xv.to(dev).float(), patch, k, amp, cv).to(dev).argmax(0),
+                                                                  yv.to(dev), k) for (xv, yv, _), cv in zip(data.vols[:TRAIN_EVAL], data.ctx[:TRAIN_EVAL])]))
+                    msg = f"train dice {rec['train_dice']:.4f} " + msg
                 if getattr(net, "crank", False) and getattr(net, "cascade", False) and not LM:
                     rec |= {"val_dice_vol": [float(d) for d in ds], "rank_dice_vol": [float(d) for d in rds],
                             "rank_dice": float(np.nanmean(rds))}
@@ -725,9 +732,9 @@ def train(job: dict) -> None:
                 del preds
                 curve.append(rec)
                 tm["val"] = time.time() - tc
-                print(f"[seg] it {it} loss {float(loss):.3f} {msg} ({(time.time() - t0) / 60:.1f} min; s: data {tm['data']:.0f}"
+                print(f"[seg] it {it} loss {rec['loss']:.3f} {msg} ({(time.time() - t0) / 60:.1f} min; s: data {tm['data']:.0f}"
                       f" step {tm['step']:.0f} val {tm['val']:.0f})", flush=True)
-                tm = dict.fromkeys(tm, 0.0)
+                tm, lsum = dict.fromkeys(tm, 0.0), [0.0, 0]
                 if "state" not in best or score > best.get("score", best["val"]):
                     best = {"val": val, "iter": it, "score": score, "state": trained()} | \
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \

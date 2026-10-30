@@ -1154,9 +1154,10 @@ class SFC(Wrapper):
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
         a = self.args
-        if a.get("hier_dec"):   # fm/hier_dec (29/10): Dmix gerarchico + kernel continuo
-            from .hier_dec import HierDec
-            net = HierDec(enc, str(a["token_cache"]), n_out, self.curves, int(self.run_cfg["seed"]))
+        if a.get("hier_dec") or a.get("hier_unet"):   # fm/hier_dec (29/10): Dmix gerarchico + kernel continuo; hier_unet (30/10)
+            from .hier_dec import HierDec, HierUNet
+            net = (HierUNet if a.get("hier_unet") else HierDec)(enc, str(a["token_cache"]), n_out, self.curves,
+                                                                 int(self.run_cfg["seed"]))
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}
             return net, ["encoder"], SEG_PATCH

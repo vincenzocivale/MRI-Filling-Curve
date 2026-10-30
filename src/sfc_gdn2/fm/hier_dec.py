@@ -19,7 +19,7 @@ from torch.nn import functional as F
 
 from .token_cache import TokenCache, fine_ok
 
-LV = (16.0, 8.0, 4.0, 2.0, 1.0)   # 1 mm (30/10): Willis' field at 2 mm is capped at Dice .54 (GT on 2 mm cells), .89 at 1 mm
+LV = (16.0, 8.0, 4.0, 2.0)   # (30/10: a 1 mm level, hier5, cost +20-30 % per step; dropped by the user)
 W, C = 256, 32           # token width, stem width
 TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cells with P(mixed) > TAU; the test's
                                         # threshold chosen on val among TAUS (segrun, one pass: every cell read, masks)
@@ -84,9 +84,9 @@ class HierDec(nn.Module):
         self.enc = nn.Sequential(nn.LayerNorm(c), nn.Linear(c, W))
         self.mlp = nn.ModuleList(nn.Sequential(nn.Linear(3 * W, W), nn.GELU(), nn.Linear(W, W)) for _ in LV[1:])
         self.vox = KernelEmbed(W, rank=8, basis="bspline")   # one for 8 / 4 / 2 mm: B-splines in the cell's own coordinate
-        # P(mixed) of the 8 / 4 / 2 mm cells (what decides the 4 / 2 / 1 mm reads): one logit, class-balanced BCE on detached
+        # P(mixed) of the 8 / 4 mm cells (what decides the 4 / 2 mm reads): one logit, class-balanced BCE on detached
         # tokens (only where to read; the tokens learn from the voxels' loss alone); bias -2: little read at the start
-        self.lhead = nn.ModuleList(nn.Linear(W, 1) for _ in LV[1:4])
+        self.lhead = nn.ModuleList(nn.Linear(W, 1) for _ in LV[1:3])
         for h in self.lhead:
             nn.init.constant_(h.bias, -2.0)
         # the field enters the head through a 1x1 (user 29/10: smooth over >= 2 mm already, a 2 mm kernel on it added
@@ -96,6 +96,8 @@ class HierDec(nn.Module):
         # two CK-conv layers on the voxels (user 30/10: Willis' small arteries, errors inside the cells read)
         self.stem, self.head, self.head2 = CKConv(1, C), CKConv(C, C), CKConv(C, C)
         self.out = nn.Conv3d(C, n_out, 1)
+        self.fnorm = None   # HierUNet: each cell's field layer-normed
+        self.grid = None    # HierUNet: per level (output, stride per axis); None: one field at the voxels
         self.tau, self.read_taus, self.TAUS = TAU, [TAU], TAUS
         self.full = False   # eval reads every cell (thresholds as masks): segrun sets it for the threshold's choice and the test
         self.sel_y, self.aux, self._n = None, 0.0, 0
@@ -145,10 +147,13 @@ class HierDec(nn.Module):
         B, T, dev = len(xs), tuple(xs.shape[1:]), xs.device
         taus = torch.tensor(self.read_taus if self.full and not self.training else [self.tau], device=dev)
         nt = len(taus)
-        ks = [[[4 * a for a in k4], [2 * a for a in k4], list(k4), list(patch_dims(sp, 2.0)), list(patch_dims(sp, 1.0))]
+        ks = [[[4 * a for a in k4], [2 * a for a in k4], list(k4), list(patch_dims(sp, 2.0))]
               for k4, sp in ((self.cache.meta(i)["k4"], sp) for i, sp in zip(ids, sps))]
         spt = [torch.tensor(sp, device=dev, dtype=torch.float32) for sp in sps]
-        field, loss, prev, live = [0.0] * B, 0.0, [None] * B, list(range(B))
+        grid_ = self.grid or [(0, (1, 1, 1))] * len(LV)
+        sz = {o: [t // a for t, a in zip(T, st)] for o, st in grid_}
+        field = {o: [xs.new_zeros(nt, C, *z, dtype=torch.float32) for _ in range(B)] for o, z in sz.items()}
+        loss, prev, live = 0.0, [None] * B, list(range(B))
         for j, mm in enumerate(LV):
             dense = mm in self.cache.levels   # cached: every cell; live: the children of the cells passing the threshold
             members, geo, par, pats, qs = [], [], [], [], []
@@ -205,7 +210,7 @@ class HierDec(nn.Module):
                 t = p_ + d
             cnt = [len(g_[5]) for g_ in geo]
             pm = torch.zeros(len(t), device=dev)
-            if j in (1, 2, 3):   # P(mixed) of the 8 / 4 / 2 mm cells: what the next level reads
+            if j in (1, 2):   # P(mixed) of the 8 / 4 mm cells: what the next level reads
                 lg = self.lhead[j - 1](t.detach()).float()[:, 0]
                 pm = lg.sigmoid().detach()
                 if ys is not None:
@@ -215,7 +220,7 @@ class HierDec(nn.Module):
                         pos = (tg[v] == 1).float()
                         w = (len(pos) - pos.sum()) / pos.sum().clamp(min=1)   # class-balanced: miste vs pure
                         loss = loss + F.binary_cross_entropy_with_logits(lg[v], pos, pos_weight=w)
-            f = self.fproj(d)
+            f = self.fproj(d) if self.fnorm is None else self.fnorm(self.fproj(d))
             for b, (k, c0, n, front, N, keep, inc), tb, pb, fb in zip(live, geo, t.split(cnt), pm.split(cnt), f.split(cnt)):
                 row = torch.zeros(N, dtype=torch.bool, device=dev)
                 row[keep] = True
@@ -226,10 +231,14 @@ class HierDec(nn.Module):
                 # per threshold the cells it keeps (a cell not kept: detail 0), all thresholds in one interpolation
                 grid = fb.new_zeros(nt, N, C)
                 grid[:, keep] = fb[None] * inc.T[:, :, None].to(fb.dtype)
-                up = F.interpolate(grid.transpose(1, 2).reshape(nt, C, *n), size=[a * kk for a, kk in zip(n, k)],
+                o, st = grid_[j]   # the cells' span on the output's grid (stride st), the tile cropped from it
+                up = F.interpolate(grid.transpose(1, 2).reshape(nt, C, *n), size=[max(1, a * kk // s) for a, kk, s in zip(n, k, st)],
                                    mode="trilinear", align_corners=False)
-                field[b] = field[b] + up[:, :, front[0]: front[0] + T[0], front[1]: front[1] + T[1], front[2]: front[2] + T[2]]
-        return torch.stack(field), loss
+                lo, z = [f_ // s for f_, s in zip(front, st)], sz[o]
+                up = up[:, :, lo[0]: lo[0] + z[0], lo[1]: lo[1] + z[1], lo[2]: lo[2] + z[2]]
+                field[o][b][:, :, : up.shape[2], : up.shape[3], : up.shape[4]] += up.float()
+        out = [torch.stack(field[o]) for o in sorted(field)]
+        return (out[0] if self.grid is None else out), loss
 
     def _cached(self, i, mm, c0, n, k, dev) -> torch.Tensor:
         return self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float()
@@ -270,3 +279,71 @@ class HierDec(nn.Module):
         ok = v != 255
         lo, hi = torch.where(ok, v, 1e9).amin(1), torch.where(ok, v, -1.0).amax(1)
         return torch.where(ok.any(1), (lo != hi).long(), -1)
+
+
+class HierUNet(HierDec):
+    """args.hier_unet (user 30/10, "CubeDec ha fatto 76"): CubeDec's U-Net on the voxels (32 / 64 / 128 channels, nnU-Net
+    strides per task, z-score per scan, deep supervision at 1/2 and 1/4) with HierDec's cascade as its token input in place
+    of CubeDec's cubes / selector / gains: the 16 / 8 mm levels' field at the bottleneck, the 4 / 2 mm levels' (read under
+    the mixed cells) at the 1/2 stage; each cell's field layer-normed. Eval reads by the training threshold (no full read)."""
+
+    def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
+        super().__init__(encoder, cache, n_out, curves, seed)
+        from .dense_dec import block
+        del self.stem, self.head, self.head2, self.out, self.read_taus   # no CK-convs; segrun: no threshold choice
+        self.fnorm = nn.LayerNorm(C, bias=False)
+        ch = (32, 64, 128)
+        self.e0, self.e1, self.e2 = block(1, ch[0]), block(ch[0], ch[1], 2), block(ch[1], ch[2], 2)
+        self.mid = block(ch[2] + C, ch[2])
+        self.u1, self.d1 = nn.ConvTranspose3d(ch[2], ch[1], 2, 2), block(2 * ch[1] + C, ch[1])
+        self.u0, self.d0 = nn.ConvTranspose3d(ch[1], ch[0], 2, 2), block(2 * ch[0], ch[0])
+        self.out = nn.Conv3d(ch[0], n_out, 1)
+        self.ds = nn.ModuleList([nn.Conv3d(ch[1], n_out, 1), nn.Conv3d(ch[2], n_out, 1)])
+        self.cum = {1: [2, 2, 2], 2: [4, 4, 4]}
+        self.vol_stats = {}   # segrun: z-score per scan
+
+    def plan(self, ids) -> None:
+        """nnU-Net's strides (CubeDec.plan): an axis halves only while finer than twice the finest one, on the training
+        scans' median spacing; the levels' field: 16 / 8 mm at the bottleneck, 4 / 2 mm at the 1/2 stage."""
+        import numpy as np
+        ids = [i for i in ids if (self.cache.root / f"{i}.json").exists()]
+        if not ids:
+            return
+        cur, cum = np.median([self.cache.meta(i)["spacing"] for i in ids], 0).tolist(), [1, 1, 1]
+        for s in (1, 2):
+            st = [2 if c < 2 * min(cur) else 1 for c in cur]
+            cur, cum = [c * a for c, a in zip(cur, st)], [c * a for c, a in zip(cum, st)]
+            self.cum[s] = cum
+        self.e1[0].stride, self.e2[0].stride = tuple(self.cum[1]), tuple(b // a for a, b in zip(self.cum[1], self.cum[2]))
+        self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, tuple(self.cum[1]))] * 2
+        print(f"[seg] hier_unet plan: strides {self.cum[1]} / {self.cum[2]}", flush=True)
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        from .dense_dec import CubeDec
+        from .segrun import loss_fn
+        if self.grid is None:   # no plan (no training scan in the cache yet): CubeDec's default strides
+            self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, tuple(self.cum[1]))] * 2
+        rows = ctx.tolist()
+        if self.vol_stats:
+            ms = torch.tensor([self.vol_stats[int(r[6])] for r in rows], device=x.device, dtype=x.dtype)
+            x = (x - ms[:, 0, None, None, None, None]) / ms[:, 1, None, None, None, None]
+        T0 = tuple(x.shape[2:])
+        x = F.pad(x, [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)])
+        ys = None
+        if self.sel_y is not None and self.training:
+            ys = F.pad(self.sel_y.to(x.device).reshape(len(x), *T0).long(),
+                       [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)], value=255)
+        (fc, ff), aux = self.fields(x[:, 0], [tuple(r[:3]) for r in rows], [self.cache.ids[int(r[6])] for r in rows],
+                                    [[int(v) for v in r[7:10]] for r in rows], ys)
+        f0 = self.e0(x)
+        f1 = self.e1(f0)
+        hm = self.mid(torch.cat([self.e2(f1), fc[:, 0].to(f1.dtype)], 1))
+        st = [b // a for a, b in zip(self.cum[1], self.cum[2])]
+        h1 = self.d1(torch.cat([CubeDec._up(self.u1, hm, st), f1, ff[:, 0].to(f1.dtype)], 1))
+        if ys is not None:
+            if not getattr(self, "landmark", False):   # deep supervision, nnU-Net's weights 0.5, 0.25
+                for w, hd, head, s in ((0.5, h1, self.ds[0], self.cum[1]), (0.25, hm, self.ds[1], self.cum[2])):
+                    aux = aux + w * loss_fn(head(hd).float(), ys[:, :: s[0], :: s[1], :: s[2]], self.out.out_channels)
+            self.aux, self.sel_y = aux, None
+        h = self.d0(torch.cat([CubeDec._up(self.u0, h1, self.cum[1]), f0], 1))
+        return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
