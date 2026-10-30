@@ -154,7 +154,9 @@ class HierDec(nn.Module):
         spt = [torch.tensor(sp, device=dev, dtype=torch.float32) for sp in sps]
         grid_ = self.grid or [(0, (1, 1, 1))] * len(LV)
         sz = {o: [t // a for t, a in zip(T, st)] for o, st in grid_}
-        field = {o: [xs.new_zeros(nt, C, *z, dtype=torch.float32) for _ in range(B)] for o, z in sz.items()}
+        # the field in the autocast dtype (30/10: tumor_ucsf's 160^3 tiles, B 8, ran out of memory with fp32 fields)
+        fdt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else torch.float32
+        field = {o: [xs.new_zeros(nt, C, *z, dtype=fdt) for _ in range(B)] for o, z in sz.items()}
         loss, prev, live = 0.0, [None] * B, list(range(B))
         for j, mm in enumerate(LV):
             dense = mm in self.cache.levels   # cached: every cell; live: the children of the cells passing the threshold
@@ -238,7 +240,7 @@ class HierDec(nn.Module):
                                    mode="trilinear", align_corners=False)
                 lo, z = [f_ // s for f_, s in zip(front, st)], sz[o]
                 up = up[:, :, lo[0]: lo[0] + z[0], lo[1]: lo[1] + z[1], lo[2]: lo[2] + z[2]]
-                field[o][b][:, :, : up.shape[2], : up.shape[3], : up.shape[4]] += up.float()
+                field[o][b][:, :, : up.shape[2], : up.shape[3], : up.shape[4]] += up.to(fdt)
         out = [torch.stack(field[o]) for o in sorted(field)]
         return (out[0] if self.grid is None else out), loss
 
