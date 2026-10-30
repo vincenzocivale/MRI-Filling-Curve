@@ -26,6 +26,7 @@ TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cel
 DROP = 0.1               # dropout on the encoder's 4096-d tokens (as CubeDec: small datasets)
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
+PDROP = 0.25             # HierUNet: path dropout per training tile (image off, else field off)
 
 
 def axis_taps(s: float, rank: int, dev, r: float = R_MM) -> torch.Tensor:
@@ -285,7 +286,9 @@ class HierUNet(HierDec):
     """args.hier_unet (user 30/10, "CubeDec ha fatto 76"): CubeDec's U-Net on the voxels (32 / 64 / 128 channels, nnU-Net
     strides per task, z-score per scan, deep supervision at 1/2 and 1/4) with HierDec's cascade as its token input in place
     of CubeDec's cubes / selector / gains: the 16 / 8 mm levels' field at the bottleneck, the 4 / 2 mm levels' (read under
-    the mixed cells) at the 1/2 stage. Eval reads by the training threshold (no full read)."""
+    the mixed cells) at the 1/2 stage and at the voxels (30/10, v8: HierDec's field reached the voxels, best on HIE). Path
+    dropout (v8): per training tile the image (e0's output) off with probability PDROP, else the field off with PDROP, so
+    each path segments alone and the convs learn to use either. Eval reads by the training threshold (no full read)."""
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
         super().__init__(encoder, cache, n_out, curves, seed)
@@ -297,7 +300,7 @@ class HierUNet(HierDec):
         self.e0, self.e1, self.e2 = block(1, ch[0]), block(ch[0], ch[1], 2), block(ch[1], ch[2], 2)
         self.mid = block(ch[2] + C, ch[2])
         self.u1, self.d1 = nn.ConvTranspose3d(ch[2], ch[1], 2, 2), block(2 * ch[1] + C, ch[1])
-        self.u0, self.d0 = nn.ConvTranspose3d(ch[1], ch[0], 2, 2), block(2 * ch[0], ch[0])
+        self.u0, self.d0 = nn.ConvTranspose3d(ch[1], ch[0], 2, 2), block(2 * ch[0] + C, ch[0])
         self.out = nn.Conv3d(ch[0], n_out, 1)
         self.ds = nn.ModuleList([nn.Conv3d(ch[1], n_out, 1), nn.Conv3d(ch[2], n_out, 1)])
         self.cum = {1: [2, 2, 2], 2: [4, 4, 4]}
@@ -316,14 +319,14 @@ class HierUNet(HierDec):
             cur, cum = [c * a for c, a in zip(cur, st)], [c * a for c, a in zip(cum, st)]
             self.cum[s] = cum
         self.e1[0].stride, self.e2[0].stride = tuple(self.cum[1]), tuple(b // a for a, b in zip(self.cum[1], self.cum[2]))
-        self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, tuple(self.cum[1]))] * 2
+        self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, (1, 1, 1))] * 2
         print(f"[seg] hier_unet plan: strides {self.cum[1]} / {self.cum[2]}", flush=True)
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
         from .dense_dec import CubeDec
         from .segrun import loss_fn
         if self.grid is None:   # no plan (no training scan in the cache yet): CubeDec's default strides
-            self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, tuple(self.cum[1]))] * 2
+            self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, (1, 1, 1))] * 2
         rows = ctx.tolist()
         if self.vol_stats:
             ms = torch.tensor([self.vol_stats[int(r[6])] for r in rows], device=x.device, dtype=x.dtype)
@@ -337,14 +340,20 @@ class HierUNet(HierDec):
         (fc, ff), aux = self.fields(x[:, 0], [tuple(r[:3]) for r in rows], [self.cache.ids[int(r[6])] for r in rows],
                                     [[int(v) for v in r[7:10]] for r in rows], ys)
         f0 = self.e0(x)
+        fc, ff = fc[:, 0].to(f0.dtype), ff[:, 0].to(f0.dtype)
+        if self.training:   # path dropout: u < PDROP image off, PDROP <= u < 2 PDROP field off
+            u = torch.rand(len(x), device=x.device)[:, None, None, None, None]
+            f0 = f0 * (u >= PDROP).to(f0.dtype)
+            on = ((u < PDROP) | (u >= 2 * PDROP)).to(f0.dtype)
+            fc, ff = fc * on, ff * on
         f1 = self.e1(f0)
-        hm = self.mid(torch.cat([self.e2(f1), fc[:, 0].to(f1.dtype)], 1))
+        hm = self.mid(torch.cat([self.e2(f1), fc], 1))
         st = [b // a for a, b in zip(self.cum[1], self.cum[2])]
-        h1 = self.d1(torch.cat([CubeDec._up(self.u1, hm, st), f1, ff[:, 0].to(f1.dtype)], 1))
+        h1 = self.d1(torch.cat([CubeDec._up(self.u1, hm, st), f1, F.avg_pool3d(ff, self.cum[1], self.cum[1])], 1))
         if ys is not None:
             if not getattr(self, "landmark", False):   # deep supervision, nnU-Net's weights 0.5, 0.25
                 for w, hd, head, s in ((0.5, h1, self.ds[0], self.cum[1]), (0.25, hm, self.ds[1], self.cum[2])):
                     aux = aux + w * loss_fn(head(hd).float(), ys[:, :: s[0], :: s[1], :: s[2]], self.out.out_channels)
             self.aux, self.sel_y = aux, None
-        h = self.d0(torch.cat([CubeDec._up(self.u0, h1, self.cum[1]), f0], 1))
+        h = self.d0(torch.cat([CubeDec._up(self.u0, h1, self.cum[1]), f0, ff], 1))
         return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
