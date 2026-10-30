@@ -799,6 +799,8 @@ def train(job: dict) -> None:
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     if best.get("read_tau") is not None:   # the test reads every cell, its threshold a mask (as chosen)
         net.full, net.read_taus = True, [best["read_tau"]]
+    elif hasattr(net, "read_taus"):   # the training read
+        net.full, net.read_taus = False, [net.tau]
     if job.get("val_only"):  # pretraining tuning: the best val Dice, no test volume read
         if job.get("save_pred"):   # the best state's val predictions kept anyway (user, 24/10: lesion counts on val)
             load_trained(best["state"])
