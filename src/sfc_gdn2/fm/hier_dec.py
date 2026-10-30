@@ -285,13 +285,14 @@ class HierUNet(HierDec):
     """args.hier_unet (user 30/10, "CubeDec ha fatto 76"): CubeDec's U-Net on the voxels (32 / 64 / 128 channels, nnU-Net
     strides per task, z-score per scan, deep supervision at 1/2 and 1/4) with HierDec's cascade as its token input in place
     of CubeDec's cubes / selector / gains: the 16 / 8 mm levels' field at the bottleneck, the 4 / 2 mm levels' (read under
-    the mixed cells) at the 1/2 stage; each cell's field layer-normed. Eval reads by the training threshold (no full read)."""
+    the mixed cells) at the 1/2 stage. Eval reads by the training threshold (no full read)."""
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
         super().__init__(encoder, cache, n_out, curves, seed)
         from .dense_dec import block
         del self.stem, self.head, self.head2, self.out, self.read_taus   # no CK-convs; segrun: no threshold choice
-        self.fnorm = nn.LayerNorm(C, bias=False)
+        # no per-cell LayerNorm on the field (30/10: every read cell at the same norm, small details amplified, slow start;
+        # the blocks' InstanceNorm already sets the field's scale per tile)
         ch = (32, 64, 128)
         self.e0, self.e1, self.e2 = block(1, ch[0]), block(ch[0], ch[1], 2), block(ch[1], ch[2], 2)
         self.mid = block(ch[2] + C, ch[2])
