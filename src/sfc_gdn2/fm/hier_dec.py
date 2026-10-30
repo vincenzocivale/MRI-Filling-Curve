@@ -233,8 +233,12 @@ class HierDec(nn.Module):
                     v = tg >= 0
                     if v.any():
                         pos = (tg[v] == 1).float()
-                        w = (len(pos) - pos.sum()) / pos.sum().clamp(min=1)   # class-balanced: miste vs pure
-                        loss = loss + F.binary_cross_entropy_with_logits(lg[v], pos, pos_weight=w)
+                        # class-balanced as the mean of the two classes' mean BCE (31/10: the weight pure / mixed was
+                        # ~1e3-1e4 on microbleeds and landmarks; through the global gradient clipping it starved the
+                        # segmentation: cmbpts collapsed to the background, fetal's first loss ~2.5e4)
+                        bce = F.binary_cross_entropy_with_logits(lg[v], pos, reduction="none")
+                        loss = loss + 0.5 * ((bce * pos).sum() / pos.sum().clamp(min=1)
+                                             + (bce * (1 - pos)).sum() / (1 - pos).sum().clamp(min=1))
             f = self.fproj(d) if self.fnorm is None else self.fnorm(self.fproj(d))
             for b, (k, c0, n, front, N, keep, inc), tb, pb, fb in zip(live, geo, t.split(cnt), pm.split(cnt), f.split(cnt)):
                 row = torch.zeros(N, dtype=torch.bool, device=dev)
