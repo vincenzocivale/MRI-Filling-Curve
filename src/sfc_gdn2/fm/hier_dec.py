@@ -352,11 +352,11 @@ class HierUNet(HierDec):
             self.full = full
         T = tuple(x.shape[2:])
         lm = getattr(self, "landmark", False)
-        tok = None if lm else self.tok_out(F.gelu(F.interpolate(fc[:, 0], size=T, mode="trilinear", align_corners=False)
-                                                  + ff[:, 0])).float()
         f0 = self.e0(x)
         fc, ff = fc[:, 0].to(f0.dtype), ff[:, 0].to(f0.dtype)
-        if self.training:   # path dropout: u < PDROP image off, PDROP <= u < 2 PDROP field off
+        # the token head in the autocast dtype (30/10: in fp32 at the voxels, B 8 x 160^3, out of memory)
+        tok = None if lm else self.tok_out(F.gelu(F.interpolate(fc, size=T, mode="trilinear", align_corners=False) + ff))
+        if self.training and PDROP:   # path dropout: u < PDROP image off, PDROP <= u < 2 PDROP field off
             u = torch.rand(len(x), device=x.device)[:, None, None, None, None]
             f0 = f0 * (u >= PDROP).to(f0.dtype)
             on = ((u < PDROP) | (u >= 2 * PDROP)).to(f0.dtype)
@@ -375,7 +375,7 @@ class HierUNet(HierDec):
         o = self.out(h)
         if lm or self.training:   # training: segrun's loss on the U-Net head (the token head's is in aux)
             return o[:, :, : T0[0], : T0[1], : T0[2]]
-        pu, pt = o.float().softmax(1), tok.softmax(1)
+        pu, pt = o.float().softmax(1), tok.float().softmax(1)
         al = self.read_taus if self.full else [0.5]
         out = [(a * pu + (1 - a) * pt).clamp(min=1e-8).log() for a in al]   # log-probabilities per alpha, side by side
         return torch.cat(out, 1)[:, :, : T0[0], : T0[1], : T0[2]]
