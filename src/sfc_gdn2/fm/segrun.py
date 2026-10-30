@@ -768,20 +768,31 @@ def train(job: dict) -> None:
         del val_v
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     if hasattr(net, "read_taus") and not LM and "read_tau" not in best:
-        # fm/hier_dec (user 30/10): the read threshold for the test chosen on the val Dice of the best state, one pass
-        # (every cell read, each threshold a mask: the decoder returns their log-probabilities side by side).
-        # ponytail: Dice for every task (cmbpts' selection is its F1; add it if hier_dec runs there)
+        # fm/hier_dec (user 30/10): the read threshold for the test chosen on val with the best state, one pass (every
+        # cell read, each threshold a mask: the decoder returns their log-probabilities side by side), by the task's own
+        # selection score (Dice, or the lesion / detection F1). ponytail: landmarks keep the training threshold
         load_trained(best["state"])
         net.eval()
-        net.full, net.read_taus, by = True, list(net.TAUS), []
+        net.full, net.read_taus = True, list(net.TAUS)
+        nt, preds, vs = len(net.read_taus), [[] for _ in net.TAUS], []
         for it in split["val"]:
             v = load(it)
-            p = sliding(net, v["x"].to(dev).float(), patch, k * len(net.read_taus), amp, v["ctx"])
-            by.append([dice_on(p[a * k:(a + 1) * k].argmax(0).to(dev), v["y"].to(dev), k) for a in range(len(net.read_taus))])
+            p = sliding(net, v["x"].to(dev).float(), patch, k * nt, amp, v["ctx"])
+            for a in range(nt):
+                preds[a].append(p[a * k:(a + 1) * k].argmax(0).to(torch.uint8).cpu())
+            vs.append({n: v[n] for n in ("y", "sp", "pts") if n in v})
             del v, p
-        by = np.nanmean(np.array(by, dtype=float), 0)
-        best |= {"read_tau": float(net.read_taus[int(np.argmax(by))]), "val_by_tau": {str(t): float(d) for t, d in zip(net.read_taus, by)}}
-        print(f"[seg] read threshold {best['read_tau']:g} (val Dice per threshold {best['val_by_tau']})", flush=True)
+        if job.get("select") in ("f1", "det"):
+            md = "det" if job["select"] == "det" else True
+            by = [float(np.nanmean([_metric([_score((q == c).numpy(), (v["y"] == c).numpy(), md, sp=v.get("sp"), pts=v.get("pts"))
+                                             for q, v in zip(pa, vs)], True) for c in range(1, k)])) for pa in preds]
+        else:
+            by = [float(np.nanmean([dice_on(q, v["y"], k) for q, v in zip(pa, vs)])) for pa in preds]
+        best |= {"read_tau": float(net.read_taus[int(np.nanargmax(by))]),
+                 "val_by_tau": {str(t): d for t, d in zip(net.read_taus, by)}}
+        print(f"[seg] read threshold {best['read_tau']:g} (val {job.get('select') or 'dice'} per threshold "
+              f"{best['val_by_tau']})", flush=True)
+        del preds, vs
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     if "read_tau" in best:   # the test reads every cell, its threshold a mask (as chosen)
         net.full, net.read_taus = True, [best["read_tau"]]
