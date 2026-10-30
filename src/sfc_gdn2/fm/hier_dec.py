@@ -26,7 +26,8 @@ TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cel
 DROP = 0.1               # dropout on the encoder's 4096-d tokens (as CubeDec: small datasets)
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
-PDROP = 0.25             # HierUNet: path dropout per training tile (image off, else field off)
+PDROP = 0.0              # HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9 off
+ALPHAS = (1.0, 0.5, 0.0)   # HierUNet v9: the U-Net head's weight in the mix with the token head, chosen on val
 
 
 def axis_taps(s: float, rank: int, dev, r: float = R_MM) -> torch.Tensor:
@@ -288,12 +289,17 @@ class HierUNet(HierDec):
     of CubeDec's cubes / selector / gains: the 16 / 8 mm levels' field at the bottleneck, the 4 / 2 mm levels' (read under
     the mixed cells) at the 1/2 stage and at the voxels (30/10, v8: HierDec's field reached the voxels, best on HIE). Path
     dropout (v8): per training tile the image (e0's output) off with probability PDROP, else the field off with PDROP, so
-    each path segments alone and the convs learn to use either. Eval reads by the training threshold (no full read)."""
+    each path segments alone and the convs learn to use either. Token head (v9, user 30/10: "l'ensamble è la cosa più
+    intelligente", HIE: every U-Net 0.13-0.29 on test, every token-only decoder 0.30-0.34): the field at the voxels (coarse
+    levels upsampled + fine) -> GELU -> 1x1, its own loss; the prediction mixes the two heads' probabilities, the U-Net's
+    weight alpha chosen on val among ALPHAS (segrun's threshold pass: TAUS / read_taus / full carry the alphas here; 0.5
+    during training; landmarks: the U-Net head alone). The cascade reads by the training threshold (no full read)."""
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
         super().__init__(encoder, cache, n_out, curves, seed)
         from .dense_dec import block
-        del self.stem, self.head, self.head2, self.out, self.read_taus   # no CK-convs; segrun: no threshold choice
+        del self.stem, self.head, self.head2, self.out   # no CK-convs
+        self.TAUS, self.read_taus = ALPHAS, [0.5]   # segrun's threshold pass chooses the heads' mix (alpha) here
         # no per-cell LayerNorm on the field (30/10: every read cell at the same norm, small details amplified, slow start;
         # the blocks' InstanceNorm already sets the field's scale per tile)
         ch = (32, 64, 128)
@@ -303,6 +309,7 @@ class HierUNet(HierDec):
         self.u0, self.d0 = nn.ConvTranspose3d(ch[1], ch[0], 2, 2), block(2 * ch[0] + C, ch[0])
         self.out = nn.Conv3d(ch[0], n_out, 1)
         self.ds = nn.ModuleList([nn.Conv3d(ch[1], n_out, 1), nn.Conv3d(ch[2], n_out, 1)])
+        self.tok_out = nn.Conv3d(C, n_out, 1)   # the token head
         self.cum = {1: [2, 2, 2], 2: [4, 4, 4]}
         self.vol_stats = {}   # segrun: z-score per scan
 
@@ -337,8 +344,16 @@ class HierUNet(HierDec):
         if self.sel_y is not None and self.training:
             ys = F.pad(self.sel_y.to(x.device).reshape(len(x), *T0).long(),
                        [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)], value=255)
-        (fc, ff), aux = self.fields(x[:, 0], [tuple(r[:3]) for r in rows], [self.cache.ids[int(r[6])] for r in rows],
-                                    [[int(v) for v in r[7:10]] for r in rows], ys)
+        full, self.full = self.full, False   # (full: the alphas' pass; the cascade reads by the training threshold)
+        try:
+            (fc, ff), aux = self.fields(x[:, 0], [tuple(r[:3]) for r in rows], [self.cache.ids[int(r[6])] for r in rows],
+                                        [[int(v) for v in r[7:10]] for r in rows], ys)
+        finally:
+            self.full = full
+        T = tuple(x.shape[2:])
+        lm = getattr(self, "landmark", False)
+        tok = None if lm else self.tok_out(F.gelu(F.interpolate(fc[:, 0], size=T, mode="trilinear", align_corners=False)
+                                                  + ff[:, 0])).float()
         f0 = self.e0(x)
         fc, ff = fc[:, 0].to(f0.dtype), ff[:, 0].to(f0.dtype)
         if self.training:   # path dropout: u < PDROP image off, PDROP <= u < 2 PDROP field off
@@ -351,9 +366,16 @@ class HierUNet(HierDec):
         st = [b // a for a, b in zip(self.cum[1], self.cum[2])]
         h1 = self.d1(torch.cat([CubeDec._up(self.u1, hm, st), f1, F.avg_pool3d(ff, self.cum[1], self.cum[1])], 1))
         if ys is not None:
-            if not getattr(self, "landmark", False):   # deep supervision, nnU-Net's weights 0.5, 0.25
+            if not lm:   # deep supervision, nnU-Net's weights 0.5, 0.25; the token head's own loss
                 for w, hd, head, s in ((0.5, h1, self.ds[0], self.cum[1]), (0.25, hm, self.ds[1], self.cum[2])):
                     aux = aux + w * loss_fn(head(hd).float(), ys[:, :: s[0], :: s[1], :: s[2]], self.out.out_channels)
+                aux = aux + loss_fn(tok, ys, self.out.out_channels)
             self.aux, self.sel_y = aux, None
         h = self.d0(torch.cat([CubeDec._up(self.u0, h1, self.cum[1]), f0, ff], 1))
-        return self.out(h)[:, :, : T0[0], : T0[1], : T0[2]]
+        o = self.out(h)
+        if lm or self.training:   # training: segrun's loss on the U-Net head (the token head's is in aux)
+            return o[:, :, : T0[0], : T0[1], : T0[2]]
+        pu, pt = o.float().softmax(1), tok.softmax(1)
+        al = self.read_taus if self.full else [0.5]
+        out = [(a * pu + (1 - a) * pt).clamp(min=1e-8).log() for a in al]   # log-probabilities per alpha, side by side
+        return torch.cat(out, 1)[:, :, : T0[0], : T0[1], : T0[2]]
