@@ -30,6 +30,7 @@ LIVE_MAX = 1 << 17   # tokens per live encoder call (30/10: 2^19 ran out of memo
 SNAKE_GAP = 8        # v10 (user 30/10, "il serpente"): live cells read as stretches of the curve; a gap of <= this many unread
                      # cells between open ones read too (context only), a longer one starts a new sequence
 OPEN_MAX = 1 << 14   # v10: open cells per tile and live level at most (the highest parent P(mixed)): tumor_ucsf ran out of memory
+SEQ_MAX = 1 << 10    # v10: sequences per live call at most (tumor_ucsf: thousands of short stretches, a Triton grid limit)
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
 PDROP = 0.0              # HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9 off
@@ -318,7 +319,7 @@ class HierDec(nn.Module):
                     segs += [(a, s0, s1 - s0) for s0, s1 in itertools.pairwise(b0.tolist())]
                 hs, grp, tot = [[] for _ in alls], [], 0
                 for i in range(len(segs) + 1):
-                    if grp and (i == len(segs) or tot + segs[i][2] > LIVE_MAX):
+                    if grp and (i == len(segs) or tot + segs[i][2] > LIVE_MAX or len(grp) >= SEQ_MAX):
                         rng = {}   # a group's stretches of one tile are consecutive: one slice per tile
                         for a, o, n in grp:
                             rng[a] = (rng.get(a, (o, o))[0], o + n)
