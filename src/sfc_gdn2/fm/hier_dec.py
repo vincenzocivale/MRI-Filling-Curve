@@ -24,6 +24,8 @@ W, C = 256, 32           # token width, stem width
 TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cells with P(mixed) > TAU; the test's
                                         # threshold chosen on val among TAUS (segrun, one pass: every cell read, masks)
 DROP = 0.1               # dropout on the encoder's 4096-d tokens (as CubeDec: small datasets)
+LIVE_MAX = 1 << 17   # tokens per live encoder call (30/10: 2^19 ran out of memory on tumor_ucsf, a batch's earlier shape
+                     # groups' graphs held until the one backward)
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
 PDROP = 0.0              # HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9 off
@@ -258,7 +260,7 @@ class HierDec(nn.Module):
         out, grp, tot = [], [], 0
         try:
             for i in range(len(qs) + 1):
-                if grp and (i == len(qs) or tot + len(qs[i]) > 1 << 19):
+                if grp and (i == len(qs) or tot + len(qs[i]) > LIVE_MAX):
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         os_ = [keys(LIVE, qs[a], torch.tensor(ns[a], device=dev), self.seed).argsort() for a in grp]
                         xe = torch.cat([pe(pats[a], pe.weights(sps[a], ks[a]))[o] for a, o in zip(grp, os_)])
