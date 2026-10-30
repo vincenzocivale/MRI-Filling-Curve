@@ -747,7 +747,7 @@ def train(job: dict) -> None:
         # ponytail: Dice for every task (cmbpts' selection is its F1; add it if hier_dec runs there)
         load_trained(best["state"])
         net.eval()
-        net.read_taus, by = list(net.TAUS), []
+        net.full, net.read_taus, by = True, list(net.TAUS), []
         for it in split["val"]:
             v = load(it)
             p = sliding(net, v["x"].to(dev).float(), patch, k * len(net.read_taus), amp, v["ctx"])
@@ -757,8 +757,8 @@ def train(job: dict) -> None:
         best |= {"read_tau": float(net.read_taus[int(np.argmax(by))]), "val_by_tau": {str(t): float(d) for t, d in zip(net.read_taus, by)}}
         print(f"[seg] read threshold {best['read_tau']:g} (val Dice per threshold {best['val_by_tau']})", flush=True)
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
-    if "read_tau" in best:
-        net.read_taus = [best["read_tau"]]
+    if "read_tau" in best:   # the test reads every cell, its threshold a mask (as chosen)
+        net.full, net.read_taus = True, [best["read_tau"]]
     if job.get("val_only"):  # pretraining tuning: the best val Dice, no test volume read
         if job.get("save_pred"):   # the best state's val predictions kept anyway (user, 24/10: lesion counts on val)
             load_trained(best["state"])

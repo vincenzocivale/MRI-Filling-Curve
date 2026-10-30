@@ -59,8 +59,9 @@ class CKConv(nn.Module):
 
 class HierDec(nn.Module):
     """`encoder` frozen: its cached 16 / 8 mm tokens (`cache`, every cell), and read live (no grad) at 4 / 2 mm under the
-    cells of the level above with P(mixed) > tau. Eval: every cell read; each threshold of `read_taus` a mask (a cell counts if
-    its ancestors at the live levels pass it), several -> their log-probabilities concatenated (segrun's val choice)."""
+    cells of the level above with P(mixed) > tau (the validations during training too). `full` (segrun: the threshold's
+    choice and the test): every cell read, each threshold of `read_taus` a mask (a cell counts if its ancestors at the live
+    levels pass it), several -> their log-probabilities concatenated."""
 
     tile_corner = True
 
@@ -93,6 +94,7 @@ class HierDec(nn.Module):
         self.stem, self.head, self.head2 = CKConv(1, C), CKConv(C, C), CKConv(C, C)
         self.out = nn.Conv3d(C, n_out, 1)
         self.tau, self.read_taus, self.TAUS = TAU, [TAU], TAUS
+        self.full = False   # eval reads every cell (thresholds as masks): segrun sets it for the threshold's choice and the test
         self.sel_y, self.aux, self._n = None, 0.0, 0
         self.off = set()    # levels left out of the field (diagnosis: what each one adds)
         self.trace = None   # a list: each tile's cells read per level are appended (diagnosis, bench_p28/tools/diag_hier.py)
@@ -138,7 +140,7 @@ class HierDec(nn.Module):
         reading per level."""
         from ..data.volume import patch_dims, patchify
         B, T, dev = len(xs), tuple(xs.shape[1:]), xs.device
-        taus = torch.tensor([self.tau] if self.training else self.read_taus, device=dev)
+        taus = torch.tensor(self.read_taus if self.full and not self.training else [self.tau], device=dev)
         nt = len(taus)
         ks = [[[4 * a for a in k4], [2 * a for a in k4], list(k4), list(patch_dims(sp, 2.0))]
               for k4, sp in ((self.cache.meta(i)["k4"], sp) for i, sp in zip(ids, sps))]
@@ -166,7 +168,7 @@ class HierDec(nn.Module):
                     pidx = (pq[:, 0] * pn[1] + pq[:, 1]) * pn[2] + pq[:, 2]        # each cell's parent on its grid
                     prr = (prow.cumsum(0) - 1).clamp(min=0)                        # parent cell -> its row (read ones)
                     ok = prow[pidx]
-                    if not dense and self.training:   # training reads what passes; eval reads all, thresholds as masks
+                    if not dense and not (self.full and not self.training):   # reads what passes; full: all, masks
                         ok = ok & (pm[prr[pidx]] > self.tau)
                     keep = ok.nonzero()[:, 0]
                     if not len(keep):
