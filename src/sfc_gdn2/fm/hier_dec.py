@@ -64,6 +64,7 @@ class HierDec(nn.Module):
     levels pass it), several -> their log-probabilities concatenated."""
 
     tile_corner = True
+    pad_batch = True   # segrun: training tiles of different shapes padded into one batch (any tile shape reads)
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
         super().__init__()

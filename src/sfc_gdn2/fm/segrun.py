@@ -360,6 +360,12 @@ class Patches:
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
             ys.append(y[sl] if self.lm[j] is None else heat_spec(self.lm[j], start))
+        if len({t.shape for t in xs}) > 1 and getattr(self, "pad_batch", False) and self.lm[0] is None:
+            # a decoder reading any tile shape (fm/hier_dec, user 30/10): one batch, each tile padded at its end to the
+            # largest (image 0, label 255: ignored by the loss), not one scan at a time
+            M = [max(t.shape[a] for t in ys) for a in range(3)]
+            xs = [F.pad(t, [p for d, m in zip(reversed(t.shape[1:]), reversed(M)) for p in (0, m - d)]) for t in xs]
+            ys = [F.pad(t, [p for d, m in zip(reversed(t.shape), reversed(M)) for p in (0, m - d)], value=255) for t in ys]
         if len({t.shape for t in xs}) > 1:
             return [t[None] for t in xs], [t[None] for t in ys], None if cs[0] is None else [t[None] for t in cs]
         return torch.stack(xs), torch.stack(ys), None if cs[0] is None else torch.stack(cs)
@@ -547,6 +553,7 @@ def train(job: dict) -> None:
             net.plan([it["id"] for it in split["train"]])
         val_v = [load(it) for it in split["val"]]
         data = Patches(train_v, patch, k, rng)
+        data.pad_batch = getattr(net, "pad_batch", False)
         del train_v
         params = [p for p in net.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=job["lr"], weight_decay=1e-4)
