@@ -125,7 +125,7 @@ def call(net, x: torch.Tensor, ctx):
     return net(x) if ctx is None else net(x, ctx.to(x.device))
 
 
-def tile_rule(job: dict, vols: list, lm: bool) -> None:
+def tile_rule(job: dict, vols: list, lm: bool, k: int = 2) -> None:
     """The tile and the batch from the task's fingerprint (user 31/10: "la dimensione della patch conta molto", a rule):
     on up to 40 training scans the foreground's components (26-connected), their largest extent in mm (p95, E); the
     tile 2 E per axis in 16 mm cells (TILE_CELLS), at least 48 voxels on the finest axis, at most TILE_CELLS; the batch
@@ -146,7 +146,9 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
         tv.append(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])))
     # the batch from the largest tile, not the median (31/10: HIE, cmbpts, bladder out of memory when a batch drew the
     # scans whose tiles are largest); 4 x 160^3 voxels (8 x: ms_seg out of memory)
-    b = 8 if lm else int(min(64, max(8, 4 * 160 ** 3 // min(max(tv), 160 ** 3))))
+    # classes scale the logits' memory (31/10: TotalSeg, ~50 classes, out of memory at 8 tiles): the budget for 14
+    # classes (Willis, 8 x 160^3 fitted), fewer tiles above, at least 2
+    b = 8 if lm else int(min(64, max(2 if k > 14 else 8, 4 * 160 ** 3 * min(1.0, 14 / k) // min(max(tv), 160 ** 3))))
     print(f"[seg] tile rule: foreground extent p95 {E:.1f} mm -> {n} cells of 16 mm per axis (median tile "
           f"{float(np.median(tv)) ** (1 / 3):.0f}^3 voxels), batch {b} (was {TILE_CELLS} cells, {job['batch']})", flush=True)
     TILE_CELLS, job["batch"], LES_MM = n, b, E / 2
@@ -589,7 +591,7 @@ def train(job: dict) -> None:
     # (20/10: the token-cache runs resumed the cancelled tile runs' states, same iters / lr / seed)
     if os.environ.get("SFC_TILE_RULE") == "1" and tcache is not None and not LM:   # (31/10: landmarks are points,
         # their extent says nothing of the context they need: with the rule's 56^3 tiles fetal test MRE 1.86 vs 1.43)
-        tile_rule(job, [load(it) for it in split["train"][:40]], LM)
+        tile_rule(job, [load(it) for it in split["train"][:40]], LM, k)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
         {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
