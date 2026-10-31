@@ -383,6 +383,12 @@ class Patches:
                 vox = fg[list(fg)[self.rng.integers(len(fg))]]
                 c = vox[self.rng.integers(len(vox))].numpy()
                 start = np.clip(c - P // 2, 0, S - P)
+                if self.align[j] is not None:   # 31/10: a grid start keeping the voxel in the tile's middle half
+                    a = np.array(self.align[j])  # (snapping down put small lesions anywhere, up to the edge)
+                    lo, hi = np.maximum(0, c - P + P // 4), np.minimum(S - P, c - P // 4)
+                    lo, hi = -(-lo // a), hi // a
+                    start = np.where(hi >= lo, np.array([self.rng.integers(x, y + 1) if y >= x else 0
+                                                         for x, y in zip(lo, hi)]) * a, start)
             else:
                 start = np.array([self.rng.integers(s - p + 1) for s, p in zip(S, P)])
             if self.align[j] is not None:   # on the volume's 16 mm grid (token cache)

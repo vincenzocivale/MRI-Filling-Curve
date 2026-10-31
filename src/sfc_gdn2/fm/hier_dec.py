@@ -74,6 +74,19 @@ def _patchify_b(vol: torch.Tensor, k) -> torch.Tensor:
     return vol.reshape(G, gx, a, gy, b, gz, c).permute(0, 1, 3, 5, 2, 4, 6).reshape(G, gx * gy * gz, a * b * c)
 
 
+def _down_fg(y: torch.Tensor, s, k: int) -> torch.Tensor:
+    """Labels [B, *T] -> the deep supervision's [B, *T / s] keeping small structures (31/10: a stride dropped 2 mm
+    microbleeds at 1/4): a block takes its most frequent foreground class if it holds any, else background if it holds
+    any, else ignore (255)."""
+    best, cnt = None, None
+    for c in range(1, k):
+        f = F.avg_pool3d((y == c).float()[:, None], s, s)[:, 0]
+        best = torch.where(f > cnt, c, best) if best is not None else torch.where(f > 0, c, 0)
+        cnt = torch.maximum(cnt, f) if cnt is not None else f
+    bg = F.avg_pool3d((y == 0).float()[:, None], s, s)[:, 0] > 0
+    return torch.where(cnt > 0, best, torch.where(bg, 0, 255)).long()
+
+
 class HierDec(nn.Module):
     """`encoder` frozen: its cached 16 / 8 mm tokens (`cache`, every cell), and read live (no grad) at 4 / 2 mm under the
     cells of the level above with P(mixed) > tau (the validations during training too). `full` (segrun: the threshold's
@@ -450,7 +463,7 @@ class HierUNet(HierDec):
         if ys is not None:
             if not lm:   # deep supervision, nnU-Net's weights 0.5, 0.25; the token head's own loss
                 for w, hd, head, s in ((0.5, h1, self.ds[0], self.cum[1]), (0.25, hm, self.ds[1], self.cum[2])):
-                    aux = aux + w * loss_fn(head(hd).float(), ys[:, :: s[0], :: s[1], :: s[2]], self.out.out_channels)
+                    aux = aux + w * loss_fn(head(hd).float(), _down_fg(ys, s, self.out.out_channels), self.out.out_channels)
                 aux = aux + loss_fn(tok, ys, self.out.out_channels)
             self.aux, self.sel_y = aux, None
         h = self.d0(torch.cat([CubeDec._up(self.u0, h1, self.cum[1]), f0, ff], 1))
