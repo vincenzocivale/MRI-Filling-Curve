@@ -762,16 +762,16 @@ def train(job: dict) -> None:
                         finally:
                             net.cuse = "mixed"
                 else:   # probabilities kept for the landmark tasks (a point per landmark from each class's map)
-                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).to(dev)
-                             for v in val_v]
-                    if job.get("select") != "mre":
-                        preds = [p.argmax(0) for p in preds]
+                    # labels: argmax where the probabilities are, only the labels to the GPU (31/10: TotalSeg's ~50-class
+                    # whole-body probabilities of every val scan on the GPU ran out of memory)
+                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]) for v in val_v]
+                    preds = [p.to(dev) if job.get("select") == "mre" else p.argmax(0).to(dev) for p in preds]
                 ds = [dice_on(p.argmax(0) if p.dim() == 4 else p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
                 val = float(np.nanmean(ds))
                 rec = {"iter": it, "loss": lsum[0] / max(lsum[1], 1), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
                 if not LM and not getattr(net, "cascade", False):   # user 30/10: the Dice on a few training scans too (overfit)
-                    trp = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).to(dev).argmax(0) for v in tr_v]
+                    trp = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).argmax(0).to(dev) for v in tr_v]
                     rec["train_dice"] = float(np.nanmean([dice_on(p, v["y"].to(dev), k) for p, v in zip(trp, tr_v)]))
                     msg = f"train dice {rec['train_dice']:.4f} " + msg
                     if job.get("select") in ("f1", "det"):   # the lesion-wise F1 on them too (user 31/10: microbleeds)
