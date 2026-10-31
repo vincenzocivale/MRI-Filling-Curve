@@ -149,6 +149,7 @@ def tile_rule(job: dict, vols: list, lm: bool, k: int = 2) -> None:
     # classes scale the logits' memory (31/10: TotalSeg, ~50 classes, out of memory at 8 tiles): the budget for 14
     # classes (Willis, 8 x 160^3 fitted), fewer tiles above, at least 2
     b = 8 if lm else int(min(64, max(2 if k > 14 else 8, 4 * 160 ** 3 * min(1.0, 14 / k) // min(max(tv), 160 ** 3))))
+    b = int(os.environ.get("SFC_BATCH", b))   # user 31/10: the baselines' schedule (batch 2) with the rule's tile
     print(f"[seg] tile rule: foreground extent p95 {E:.1f} mm -> {n} cells of 16 mm per axis (median tile "
           f"{float(np.median(tv)) ** (1 / 3):.0f}^3 voxels), batch {b} (was {TILE_CELLS} cells, {job['batch']})", flush=True)
     TILE_CELLS, job["batch"], LES_MM = n, b, E / 2
