@@ -141,7 +141,7 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
         ext += [float((np.array([q.stop - q.start for q in sl]) * sp).max()) for sl in ndimage.find_objects(lab)]
         al.append(v["align"])
     E = float(np.percentile(ext, 95)) if ext else 160.0
-    n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(96 / float(np.median([max(a) for a in al])))))   # (v14: 48 -> 96 voxels, WMH 30^3 tiles)
+    n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(int(os.environ.get("SFC_TILE_MIN", "96")) / float(np.median([max(a) for a in al])))))   # v14: 48 -> 96 voxels
     for v in vols:
         tv.append(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])))
     b = 8 if lm else int(min(64, max(8, round(4 * 160 ** 3 / float(np.median(tv))))))   # (31/10: 8 x 160^3, ms_seg OOM)
