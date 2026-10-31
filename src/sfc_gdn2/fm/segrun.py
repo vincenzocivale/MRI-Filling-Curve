@@ -144,7 +144,9 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
     n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(int(os.environ.get("SFC_TILE_MIN", "96")) / float(np.median([max(a) for a in al])))))   # v14: 48 -> 96 voxels
     for v in vols:
         tv.append(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])))
-    b = 8 if lm else int(min(64, max(8, round(4 * 160 ** 3 / float(np.median(tv))))))   # (31/10: 8 x 160^3, ms_seg OOM)
+    # the batch from the largest tile, not the median (31/10: HIE, cmbpts, bladder out of memory when a batch drew the
+    # scans whose tiles are largest); 4 x 160^3 voxels (8 x: ms_seg out of memory)
+    b = 8 if lm else int(min(64, max(8, 4 * 160 ** 3 // min(max(tv), 160 ** 3))))
     print(f"[seg] tile rule: foreground extent p95 {E:.1f} mm -> {n} cells of 16 mm per axis (median tile "
           f"{float(np.median(tv)) ** (1 / 3):.0f}^3 voxels), batch {b} (was {TILE_CELLS} cells, {job['batch']})", flush=True)
     TILE_CELLS, job["batch"], LES_MM = n, b, E / 2
