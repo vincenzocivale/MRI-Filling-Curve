@@ -197,6 +197,7 @@ MISS_MM = 50.0   # a landmark not predicted at all counts as this radial error i
 
 
 TRAIN_EVAL = 6   # training scans scored at each validation (user 30/10)
+TRAIN_LOG = 125  # iterations between the running training lines (loss, the batches' soft Dice; user 31/10)
 LANDMARK_SIGMA_MM = 3.0   # landmark heatmaps (user, 23/10: landmarks are a regression, not a segmentation)
 
 
@@ -422,7 +423,9 @@ def group_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
             lg = call(net, torch.cat([x[i] for i in idx]).to(dev).float(), None if c is None else torch.cat([c[i] for i in idx]))
         sums.append(batch_sums(lg, yi.to(dev), k))
         aux = aux + pop_aux(net) * len(idx) / len(x)
-    loss = sums_loss([sum(s_[j] for s_ in sums) for j in range(5)]) + aux
+    tt = [sum(s_[j] for s_ in sums) for j in range(5)]
+    group_step.sums = [t.detach() for t in tt[2:]]   # the batch's soft Dice sums, for the running training log
+    loss = sums_loss(tt) + aux
     loss.backward()
     return loss.detach()
 
@@ -630,6 +633,7 @@ def train(job: dict) -> None:
         queue = [drawer.submit(draw) for _ in range(min(AHEAD, iters - start + 1))]
         tm = {"data": 0.0, "step": 0.0, "val": 0.0}   # seconds per part since the last val line (24/10: where the time goes)
         lsum = [0.0, 0]   # the training loss summed since the last val line (user 30/10: log the mean, not the last batch)
+        run_l, run_d = [0.0, 0], None   # the same every TRAIN_LOG iterations, + the batches' soft Dice (any_tile nets)
         # SFC_SEG_PROFILE="w,n" (27/10, where the step's time goes): after w iterations, n under cProfile + torch.profiler,
         # the tables to <out>.prof.txt, then the run stops (no val, no test)
         pw, pn = (int(v) for v in os.environ.get("SFC_SEG_PROFILE", "0,0").split(","))
@@ -685,6 +689,15 @@ def train(job: dict) -> None:
                 loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
             lsum = [lsum[0] + float(loss), lsum[1] + 1]
+            run_l = [run_l[0] + float(loss), run_l[1] + 1]
+            if getattr(group_step, "sums", None) is not None:   # user 31/10: the training batches' Dice as it goes
+                run_d = [a + b for a, b in zip(run_d, group_step.sums)] if run_d else list(group_step.sums)
+                group_step.sums = None
+            if it % TRAIN_LOG == 0:
+                td = "" if not run_d else \
+                    f" soft Dice {float(((2 * run_d[0][1:] + 1e-5) / (run_d[1][1:] + run_d[2][1:] + 1e-5)).mean()):.4f}"
+                print(f"[seg] it {it} train (last {run_l[1]} batches): loss {run_l[0] / max(run_l[1], 1):.3f}{td}", flush=True)
+                run_l, run_d = [0.0, 0], None
             if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
                 raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "
                                          f"{bool(torch.isfinite(logits).all())}, input finite "
