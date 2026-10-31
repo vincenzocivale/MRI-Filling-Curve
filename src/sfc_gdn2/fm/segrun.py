@@ -506,6 +506,28 @@ def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
     return ce + 1 - dice.mean()
 
 
+def vox_budget(job: dict, vols: list, patch, k: int) -> None:
+    """B' (user 31/10): every model the same budget of SFC_VOX_BUDGET voxels per step (2 x 160^3: a baseline's 160^3
+    patch at batch 2), filled with its own tile: the batch = budget // the largest training tile, between 2 (nnU-Net's
+    minimum) and 64. Ours (token grid): a tile of at most budget / 2 voxels (fewer 16 mm cells), above 14 classes fewer
+    tiles (logits' memory: TotalSeg 2). Baselines: their patch, the whole volume when they have none (MedicalNet)."""
+    global TILE_CELLS
+    V = int(os.environ["SFC_VOX_BUDGET"])
+    if vols and vols[0].get("align"):
+        tv = lambda n: max(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols)
+        while TILE_CELLS > 1 and tv(TILE_CELLS) > V // 2:
+            TILE_CELLS -= 1
+        t = tv(TILE_CELLS)
+        b = min(64, max(2, V // t))
+        b = max(2, int(b * min(1.0, 14 / k)))
+    else:
+        t = math.prod(patch) if patch else max(math.prod(v["x"].shape[1:]) for v in vols)
+        b = min(64, max(2, V // t))
+    print(f"[seg] voxel budget {V}: largest tile {t} voxels ({t ** (1 / 3):.0f}^3), {TILE_CELLS} cells, batch {b} "
+          f"({b * t / V:.0%} of the budget; was {job['batch']})", flush=True)
+    job["batch"] = b
+
+
 def train(job: dict) -> None:
     dev = torch.device(job["device"])
     rng = np.random.default_rng(job["seed"])
@@ -593,6 +615,8 @@ def train(job: dict) -> None:
     if os.environ.get("SFC_TILE_RULE") == "1" and tcache is not None and not LM:   # (31/10: landmarks are points,
         # their extent says nothing of the context they need: with the rule's 56^3 tiles fetal test MRE 1.86 vs 1.43)
         tile_rule(job, [load(it) for it in split["train"][:40]], LM, k)
+    if os.environ.get("SFC_VOX_BUDGET"):
+        vox_budget(job, [load(it) for it in split["train"][:40]] if tcache is not None or not patch else [], patch, k)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
         {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
