@@ -687,6 +687,8 @@ def train(job: dict) -> None:
                     logits = call(net, x.to(dev, non_blocking=True).float(), c)
                 loss = loss_fn(logits, y.to(dev), k) + pop_aux(net)
                 loss.backward()
+                with torch.no_grad():   # the batch's soft Dice sums for the running log (as group_step's)
+                    group_step.sums = list(batch_sums(logits.detach(), y.to(dev), k)[2:])
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
             lsum = [lsum[0] + float(loss), lsum[1] + 1]
             run_l = [run_l[0] + float(loss), run_l[1] + 1]
