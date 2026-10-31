@@ -128,7 +128,7 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
     """The tile and the batch from the task's fingerprint (user 31/10: "la dimensione della patch conta molto", a rule):
     on up to 40 training scans the foreground's components (26-connected), their largest extent in mm (p95, E); the
     tile 2 E per axis in 16 mm cells (TILE_CELLS), at least 48 voxels on the finest axis, at most TILE_CELLS; the batch
-    keeps the voxels per step of 8 tiles of 160^3, between 8 and 64 tiles (landmarks: 8, their step runs one tile at a
+    holds the voxels of 4 tiles of 160^3 (8: out of memory with the many tiles' fields), between 8 and 64 tiles (landmarks: 8, their step runs one tile at a
     time). The tokens give the global context; the tile only the local one."""
     from scipy import ndimage
     global TILE_CELLS
@@ -143,7 +143,7 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
     n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(48 / float(np.median([max(a) for a in al])))))
     for v in vols:
         tv.append(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])))
-    b = 8 if lm else int(min(64, max(8, round(8 * 160 ** 3 / float(np.median(tv))))))
+    b = 8 if lm else int(min(64, max(8, round(4 * 160 ** 3 / float(np.median(tv))))))   # (31/10: 8 x 160^3, ms_seg OOM)
     print(f"[seg] tile rule: foreground extent p95 {E:.1f} mm -> {n} cells of 16 mm per axis (median tile "
           f"{float(np.median(tv)) ** (1 / 3):.0f}^3 voxels), batch {b} (was {TILE_CELLS} cells, {job['batch']})", flush=True)
     TILE_CELLS, job["batch"] = n, b
