@@ -141,7 +141,7 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
         ext += [float((np.array([q.stop - q.start for q in sl]) * sp).max()) for sl in ndimage.find_objects(lab)]
         al.append(v["align"])
     E = float(np.percentile(ext, 95)) if ext else 160.0
-    n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(int(os.environ.get("SFC_TILE_MIN", "96")) / float(np.median([max(a) for a in al])))))   # v14: 48 -> 96 voxels
+    n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(int(os.environ.get("SFC_TILE_MIN", "48")) / float(np.median([max(a) for a in al])))))   # v14: 48 -> 96 voxels
     for v in vols:
         tv.append(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])))
     # the batch from the largest tile, not the median (31/10: HIE, cmbpts, bladder out of memory when a batch drew the
@@ -389,8 +389,8 @@ class Patches:
                 if self.align[j] is not None:   # a grid start holding the lesion whole (LES_MM around the voxel), anywhere
                     a = np.array(self.align[j])  # in the tile (v13's middle half taught fetal landmarks a centre bias)
                     m = np.ceil(LES_MM * a / 16).astype(int)   # 16 mm = one cell of `a` voxels
-                    if os.environ.get("SFC_SAMPLE_MID") == "1":   # v13's rule (ablation, 31/10): the middle half
-                        m = np.maximum(m, P // 4)
+                    if self.lm[j] is None and os.environ.get("SFC_SAMPLE_MID", "1") == "1":   # segmentation: the lesion
+                        m = np.maximum(m, P // 4)   # in the tile's middle half (v13); landmarks anywhere (user 31/10)
                     lo, hi = np.maximum(0, c - P + 1 + m), np.minimum(S - P, c - m)
                     lo, hi = -(-lo // a), hi // a
                     start = np.where(hi >= lo, np.array([self.rng.integers(x, y + 1) if y >= x else 0
