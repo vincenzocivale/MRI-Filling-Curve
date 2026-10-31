@@ -228,7 +228,7 @@ MISS_MM = 50.0   # a landmark not predicted at all counts as this radial error i
 
 
 TRAIN_EVAL = 6   # training scans scored at each validation (user 30/10)
-TRAIN_LOG = 125  # iterations between the running training lines (loss, the batches' soft Dice; user 31/10)
+TRAIN_LOG = int(os.environ.get("SFC_TRAIN_LOG", "125"))  # iterations between the running training lines (loss, the batches' soft Dice; user 31/10)
 LANDMARK_SIGMA_MM = 3.0   # landmark heatmaps (user, 23/10: landmarks are a regression, not a segmentation)
 
 
