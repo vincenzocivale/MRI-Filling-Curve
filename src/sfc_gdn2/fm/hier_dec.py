@@ -240,6 +240,7 @@ class HierDec(nn.Module):
                         loss = loss + 0.5 * ((bce * pos).sum() / pos.sum().clamp(min=1)
                                              + (bce * (1 - pos)).sum() / (1 - pos).sum().clamp(min=1))
             f = self.fproj(d) if self.fnorm is None else self.fnorm(self.fproj(d))
+            ups = {}   # (grid, output size) -> the tiles' cell grids, one interpolation per group (31/10: B 64 tiles)
             for b, (k, c0, n, front, N, keep, inc), tb, pb, fb in zip(live, geo, t.split(cnt), pm.split(cnt), f.split(cnt)):
                 row = torch.zeros(N, dtype=torch.bool, device=dev)
                 row[keep] = True
@@ -251,11 +252,15 @@ class HierDec(nn.Module):
                 grid = fb.new_zeros(nt, N, C)
                 grid[:, keep] = fb[None] * inc.T[:, :, None].to(fb.dtype)
                 o, st = grid_[j]   # the cells' span on the output's grid (stride st), the tile cropped from it
-                up = F.interpolate(grid.transpose(1, 2).reshape(nt, C, *n), size=[max(1, a * kk // s) for a, kk, s in zip(n, k, st)],
-                                   mode="trilinear", align_corners=False)
-                lo, z = [f_ // s for f_, s in zip(front, st)], sz[o]
-                up = up[:, :, lo[0]: lo[0] + z[0], lo[1]: lo[1] + z[1], lo[2]: lo[2] + z[2]]
-                field[o][b][:, :, : up.shape[2], : up.shape[3], : up.shape[4]] += up.to(fdt)
+                size = tuple(max(1, a * kk // s) for a, kk, s in zip(n, k, st))
+                ups.setdefault((tuple(n), size), []).append((b, o, [f_ // s for f_, s in zip(front, st)],
+                                                             grid.transpose(1, 2).reshape(nt, C, *n)))
+            for (_, size), items in ups.items():
+                up_all = F.interpolate(torch.cat([g_ for *_, g_ in items]), size=list(size), mode="trilinear", align_corners=False)
+                for (b, o, lo, _), up in zip(items, up_all.split(nt)):
+                    z = sz[o]
+                    up = up[:, :, lo[0]: lo[0] + z[0], lo[1]: lo[1] + z[1], lo[2]: lo[2] + z[2]]
+                    field[o][b][:, :, : up.shape[2], : up.shape[3], : up.shape[4]] += up.to(fdt)
         out = [torch.stack(field[o]) for o in sorted(field)]
         return (out[0] if self.grid is None else out), loss
 

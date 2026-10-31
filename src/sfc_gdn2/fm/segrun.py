@@ -124,6 +124,31 @@ def call(net, x: torch.Tensor, ctx):
     return net(x) if ctx is None else net(x, ctx.to(x.device))
 
 
+def tile_rule(job: dict, vols: list, lm: bool) -> None:
+    """The tile and the batch from the task's fingerprint (user 31/10: "la dimensione della patch conta molto", a rule):
+    on up to 40 training scans the foreground's components (26-connected), their largest extent in mm (p95, E); the
+    tile 2 E per axis in 16 mm cells (TILE_CELLS), at least 48 voxels on the finest axis, at most TILE_CELLS; the batch
+    keeps the voxels per step of 8 tiles of 160^3, between 8 and 64 tiles (landmarks: 8, their step runs one tile at a
+    time). The tokens give the global context; the tile only the local one."""
+    from scipy import ndimage
+    global TILE_CELLS
+    ext, al, tv = [], [], []
+    for v in vols:
+        y = v["y"].reshape(v["x"].shape[1:]).numpy()
+        sp = np.asarray([float(a) for a in v["ctx"][:3]])
+        lab, _ = ndimage.label((y > 0) & (y < 255), np.ones((3, 3, 3)))
+        ext += [float((np.array([q.stop - q.start for q in sl]) * sp).max()) for sl in ndimage.find_objects(lab)]
+        al.append(v["align"])
+    E = float(np.percentile(ext, 95)) if ext else 160.0
+    n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(48 / float(np.median([max(a) for a in al])))))
+    for v in vols:
+        tv.append(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])))
+    b = 8 if lm else int(min(64, max(8, round(8 * 160 ** 3 / float(np.median(tv))))))
+    print(f"[seg] tile rule: foreground extent p95 {E:.1f} mm -> {n} cells of 16 mm per axis (median tile "
+          f"{float(np.median(tv)) ** (1 / 3):.0f}^3 voxels), batch {b} (was {TILE_CELLS} cells, {job['batch']})", flush=True)
+    TILE_CELLS, job["batch"] = n, b
+
+
 def tile_of(patch, align, k: int = 2):
     """The tile in voxels: the wrapper's patch, or under the token cache TILE_CELLS cells of 16 mm per axis (`align`),
     fewer where voxels x classes would pass TILE_MAX (TotalSeg's 0.25 mm scans: 640 x 640 x 200 voxels x 50 classes,
@@ -550,6 +575,8 @@ def train(job: dict) -> None:
     out_p.parent.mkdir(parents=True, exist_ok=True)
     # + the wrapper's whole config and the tile rule: a run of another decoder in the same folder is never resumed
     # (20/10: the token-cache runs resumed the cancelled tile runs' states, same iters / lr / seed)
+    if os.environ.get("SFC_TILE_RULE") == "1" and tcache is not None:
+        tile_rule(job, [load(it) for it in split["train"][:40]], LM)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
         {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
