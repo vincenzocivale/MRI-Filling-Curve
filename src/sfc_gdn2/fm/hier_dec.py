@@ -34,7 +34,7 @@ OPEN_MAX = 1 << 14   # v10: open cells per tile and live level at most (the high
 SEQ_MAX = 4095       # v10: sequences per live call at most (GDN-2 kernels: a grid axis of sequences x 16 heads <= 65535)
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
-PDROP = 0.25             # HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9-v13 off,
+PDROP = float(__import__("os").environ.get("SFC_PDROP", "0.25"))   # HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9-v13 off,
                          # v14 on for every task (fetal test MRE 1.43 with it, 1.65 without; Willis unchanged)
 ALPHAS = (1.0, 0.5, 0.0)   # HierUNet v9: the U-Net head's weight in the mix with the token head, chosen on val
 

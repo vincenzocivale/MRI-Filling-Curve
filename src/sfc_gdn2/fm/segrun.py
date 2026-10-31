@@ -389,6 +389,8 @@ class Patches:
                 if self.align[j] is not None:   # a grid start holding the lesion whole (LES_MM around the voxel), anywhere
                     a = np.array(self.align[j])  # in the tile (v13's middle half taught fetal landmarks a centre bias)
                     m = np.ceil(LES_MM * a / 16).astype(int)   # 16 mm = one cell of `a` voxels
+                    if os.environ.get("SFC_SAMPLE_MID") == "1":   # v13's rule (ablation, 31/10): the middle half
+                        m = np.maximum(m, P // 4)
                     lo, hi = np.maximum(0, c - P + 1 + m), np.minimum(S - P, c - m)
                     lo, hi = -(-lo // a), hi // a
                     start = np.where(hi >= lo, np.array([self.rng.integers(x, y + 1) if y >= x else 0
