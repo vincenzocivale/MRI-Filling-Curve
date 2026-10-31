@@ -581,7 +581,8 @@ def train(job: dict) -> None:
     out_p.parent.mkdir(parents=True, exist_ok=True)
     # + the wrapper's whole config and the tile rule: a run of another decoder in the same folder is never resumed
     # (20/10: the token-cache runs resumed the cancelled tile runs' states, same iters / lr / seed)
-    if os.environ.get("SFC_TILE_RULE") == "1" and tcache is not None:
+    if os.environ.get("SFC_TILE_RULE") == "1" and tcache is not None and not LM:   # (31/10: landmarks are points,
+        # their extent says nothing of the context they need: with the rule's 56^3 tiles fetal test MRE 1.86 vs 1.43)
         tile_rule(job, [load(it) for it in split["train"][:40]], LM)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
         {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
