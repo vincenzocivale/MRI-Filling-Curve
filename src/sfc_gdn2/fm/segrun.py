@@ -571,6 +571,8 @@ def train(job: dict) -> None:
             net.plan([it["id"] for it in split["train"]])
         val_v = [load(it) for it in split["val"]]
         data = Patches(train_v, patch, k, rng, fit=getattr(net, "any_tile", False))
+        # the training scans scored at each validation (user 30-31/10): the first TRAIN_EVAL holding foreground
+        tr_v = [v for v in train_v if bool(((v["y"] > 0) & (v["y"] < 255)).any())][:TRAIN_EVAL]
         del train_v
         params = [p for p in net.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=job["lr"], weight_decay=1e-4)
@@ -712,9 +714,16 @@ def train(job: dict) -> None:
                 rec = {"iter": it, "loss": lsum[0] / max(lsum[1], 1), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
                 if not LM and not getattr(net, "cascade", False):   # user 30/10: the Dice on a few training scans too (overfit)
-                    rec["train_dice"] = float(np.nanmean([dice_on(sliding(net, xv.to(dev).float(), patch, k, amp, cv).to(dev).argmax(0),
-                                                                  yv.to(dev), k) for (xv, yv, _), cv in zip(data.vols[:TRAIN_EVAL], data.ctx[:TRAIN_EVAL])]))
+                    trp = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).to(dev).argmax(0) for v in tr_v]
+                    rec["train_dice"] = float(np.nanmean([dice_on(p, v["y"].to(dev), k) for p, v in zip(trp, tr_v)]))
                     msg = f"train dice {rec['train_dice']:.4f} " + msg
+                    if job.get("select") in ("f1", "det"):   # the lesion-wise F1 on them too (user 31/10: microbleeds)
+                        md = "det" if job["select"] == "det" else True
+                        rec["train_f1"] = float(np.nanmean([_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), md,
+                                                                            sp=v.get("sp"), pts=v.get("pts")) for p, v in zip(trp, tr_v)],
+                                                                    True) for c in range(1, k)]))
+                        msg = f"train F1 {rec['train_f1']:.3f} " + msg
+                    del trp
                 if getattr(net, "crank", False) and getattr(net, "cascade", False) and not LM:
                     rec |= {"val_dice_vol": [float(d) for d in ds], "rank_dice_vol": [float(d) for d in rds],
                             "rank_dice": float(np.nanmean(rds))}
