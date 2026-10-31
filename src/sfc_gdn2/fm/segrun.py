@@ -53,6 +53,7 @@ from .worker import build, fail, prepared
 # token-cache runs (20/10): tiles of TILE_CELLS 16 mm cells per axis (16 cm, as the resampled models' 160 voxels at
 # ~1 mm) instead of 160 native voxels (67 cm of TotalSeg's 4.2 mm voxels, 7 cm of SOOP's 0.45 mm)
 TILE_CELLS = 10
+LES_MM = 0.0   # tile_rule: half the p95 foreground extent; a lesion-centred tile holds it whole (Patches.sample)
 AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
 REFRESH = 125   # fm/dense_dec CubeDec: iterations between the training scans' cube refreshes
@@ -131,7 +132,7 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
     holds the voxels of 4 tiles of 160^3 (8: out of memory with the many tiles' fields), between 8 and 64 tiles (landmarks: 8, their step runs one tile at a
     time). The tokens give the global context; the tile only the local one."""
     from scipy import ndimage
-    global TILE_CELLS
+    global TILE_CELLS, LES_MM
     ext, al, tv = [], [], []
     for v in vols:
         y = v["y"].reshape(v["x"].shape[1:]).numpy()
@@ -140,13 +141,13 @@ def tile_rule(job: dict, vols: list, lm: bool) -> None:
         ext += [float((np.array([q.stop - q.start for q in sl]) * sp).max()) for sl in ndimage.find_objects(lab)]
         al.append(v["align"])
     E = float(np.percentile(ext, 95)) if ext else 160.0
-    n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(48 / float(np.median([max(a) for a in al])))))
+    n = min(TILE_CELLS, max(math.ceil(2 * E / 16), math.ceil(96 / float(np.median([max(a) for a in al])))))   # (v14: 48 -> 96 voxels, WMH 30^3 tiles)
     for v in vols:
         tv.append(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])))
     b = 8 if lm else int(min(64, max(8, round(4 * 160 ** 3 / float(np.median(tv))))))   # (31/10: 8 x 160^3, ms_seg OOM)
     print(f"[seg] tile rule: foreground extent p95 {E:.1f} mm -> {n} cells of 16 mm per axis (median tile "
           f"{float(np.median(tv)) ** (1 / 3):.0f}^3 voxels), batch {b} (was {TILE_CELLS} cells, {job['batch']})", flush=True)
-    TILE_CELLS, job["batch"] = n, b
+    TILE_CELLS, job["batch"], LES_MM = n, b, E / 2
 
 
 def tile_of(patch, align, k: int = 2):
@@ -383,9 +384,10 @@ class Patches:
                 vox = fg[list(fg)[self.rng.integers(len(fg))]]
                 c = vox[self.rng.integers(len(vox))].numpy()
                 start = np.clip(c - P // 2, 0, S - P)
-                if self.align[j] is not None:   # 31/10: a grid start keeping the voxel in the tile's middle half
-                    a = np.array(self.align[j])  # (snapping down put small lesions anywhere, up to the edge)
-                    lo, hi = np.maximum(0, c - P + P // 4), np.minimum(S - P, c - P // 4)
+                if self.align[j] is not None:   # a grid start holding the lesion whole (LES_MM around the voxel), anywhere
+                    a = np.array(self.align[j])  # in the tile (v13's middle half taught fetal landmarks a centre bias)
+                    m = np.ceil(LES_MM * a / 16).astype(int)   # 16 mm = one cell of `a` voxels
+                    lo, hi = np.maximum(0, c - P + 1 + m), np.minimum(S - P, c - m)
                     lo, hi = -(-lo // a), hi // a
                     start = np.where(hi >= lo, np.array([self.rng.integers(x, y + 1) if y >= x else 0
                                                          for x, y in zip(lo, hi)]) * a, start)
