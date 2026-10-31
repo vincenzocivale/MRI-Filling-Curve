@@ -294,7 +294,8 @@ class HierDec(nn.Module):
                 up = F.interpolate(grid.permute(0, 2, 3, 1).reshape(G * nt, C, *n),
                                    size=[max(1, a * kk // s) for a, kk, s in zip(n, k, st)], mode="trilinear", align_corners=False)
                 lo, z = [f_ // s for f_, s in zip(front, st)], sz[o]
-                up = up[:, :, lo[0]: lo[0] + z[0], lo[1]: lo[1] + z[1], lo[2]: lo[2] + z[2]].reshape(G, nt, C, *up.shape[2:])
+                up = up[:, :, lo[0]: lo[0] + z[0], lo[1]: lo[1] + z[1], lo[2]: lo[2] + z[2]]
+                up = up.reshape(G, nt, C, *up.shape[2:])   # (the cropped shape: 31/10, the uncropped one broke every run)
                 for q, b in enumerate(bs):
                     field[o][b][:, :, : up.shape[3], : up.shape[4], : up.shape[5]] += up[q].to(fdt)
         out = [torch.stack(field[o]) for o in sorted(field)]
