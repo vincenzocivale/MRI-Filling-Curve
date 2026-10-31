@@ -762,10 +762,10 @@ def train(job: dict) -> None:
                         finally:
                             net.cuse = "mixed"
                 else:   # probabilities kept for the landmark tasks (a point per landmark from each class's map)
-                    # labels: argmax where the probabilities are, only the labels to the GPU (31/10: TotalSeg's ~50-class
-                    # whole-body probabilities of every val scan on the GPU ran out of memory)
-                    preds = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]) for v in val_v]
-                    preds = [p.to(dev) if job.get("select") == "mre" else p.argmax(0).to(dev) for p in preds]
+                    # labels: argmax scan by scan, only the labels kept (31/10: TotalSeg's ~50-class whole-body
+                    # probabilities of every val scan held at once, on the GPU when they fit, ran out of memory)
+                    lab = (lambda p: p.to(dev)) if job.get("select") == "mre" else (lambda p: p.argmax(0).to(dev))
+                    preds = [lab(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])) for v in val_v]
                 ds = [dice_on(p.argmax(0) if p.dim() == 4 else p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
                 val = float(np.nanmean(ds))
                 rec = {"iter": it, "loss": lsum[0] / max(lsum[1], 1), "val_dice": val, "min": (time.time() - t0) / 60}
