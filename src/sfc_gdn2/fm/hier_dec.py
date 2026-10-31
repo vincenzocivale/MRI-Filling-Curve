@@ -363,21 +363,23 @@ class HierDec(nn.Module):
         hs, grp, tot, at = [], [], 0, 0
         try:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                x = pe(allp[gi, cells], pe.weights(sp, k))
-                q = g[cells]
+                wts, q = pe.weights(sp, k), g[cells]
+                oe = om[gi, p]                                                # the open places among those read
                 for i in range(len(lens) + 1):
                     if grp and (i == len(lens) or tot + lens[i] > LIVE_MAX or len(grp) >= SEQ_MAX):
+                        # embedded per call and only the open places kept (31/10: TotalSeg, every cell mixed, ran
+                        # out of memory with the whole group's read cells embedded at once)
                         cu = torch.tensor([0] + grp, device=dev).cumsum(0).to(torch.int32)
-                        hs.append(self.encoder.flat(x[at: at + tot], cu, pos=q[at: at + tot]).float())
+                        sl = slice(at, at + tot)
+                        h = self.encoder.flat(pe(allp[gi[sl], cells[sl]], wts), cu, pos=q[sl])
+                        hs.append(h[oe[sl]].float())
                         at, grp, tot = at + tot, [], 0
                     if i < len(lens):
                         grp.append(lens[i])
                         tot += lens[i]
         finally:
             pe.patch_mm = mm0
-        h = torch.cat(hs)
-        oe = om[gi, p]                                                        # the open places among those read
-        return h[oe][(gi[oe] * N + cells[oe]).argsort()]
+        return torch.cat(hs)[(gi[oe] * N + cells[oe]).argsort()]
 
 
 class HierUNet(HierDec):
