@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import itertools
 import math
+import os
 
 import torch
 from torch import nn
@@ -135,6 +136,8 @@ class HierDec(nn.Module):
         self.full = False   # eval reads every cell (thresholds as masks): segrun sets it for the threshold's choice and the test
         self.sel_y, self.aux, self._n = None, 0.0, 0
         self.off = set()    # levels left out of the field (diagnosis: what each one adds)
+        if lo := os.environ.get("SFC_LEVELS_OFF"):   # (01/11, user) the decoder's knock-out at test: e.g. "2" or "4,2" mm
+            self.off = {LV.index(float(x)) for x in lo.split(",")}
         # the CK-convs' shapes depend on the spacing (a few per task): cuDNN's autotuning pays (29/10: 7.5 -> 6.5 s per step)
         torch.backends.cudnn.benchmark = True
 
