@@ -36,6 +36,8 @@ LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
 PDROP = float(__import__("os").environ.get("SFC_PDROP", "0.1"))   # default 0.1 (user 31/10, as the tokens' dropout); HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9-v13 off,
                          # v14 on for every task (fetal test MRE 1.43 with it, 1.65 without; Willis unchanged)
+LIVE_ZSCORE = __import__("os").environ.get("SFC_LIVE_ZSCORE") == "1"   # HierUNet: the live reads on z-scored voxels, as
+                         # every run up to 01/11 (the paper table); default: x / p99, the pretraining's input (user 01/11)
 ALPHAS = (1.0, 0.5, 0.0)   # HierUNet v9: the U-Net head's weight in the mix with the token head, chosen on val
 
 
@@ -434,18 +436,22 @@ class HierUNet(HierDec):
         if self.grid is None:   # no plan (no training scan in the cache yet): CubeDec's default strides
             self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, (1, 1, 1))] * 2
         rows = ctx.tolist()
+        xr = x   # the cascade's live reads take the pretraining's input (x / p99), the U-Net the z-score (01/11, user)
         if self.vol_stats:
             ms = torch.tensor([self.vol_stats[int(r[6])] for r in rows], device=x.device, dtype=x.dtype)
             x = (x - ms[:, 0, None, None, None, None]) / ms[:, 1, None, None, None, None]
+            if LIVE_ZSCORE:
+                xr = x
         T0 = tuple(x.shape[2:])
-        x = F.pad(x, [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)])
+        pad = [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)]
+        x, xr = F.pad(x, pad), F.pad(xr, pad)
         ys = None
         if self.sel_y is not None and self.training:
             ys = F.pad(self.sel_y.to(x.device).reshape(len(x), *T0).long(),
                        [p for t, m in zip(reversed(T0), reversed(self.cum[2])) for p in (0, -t % m)], value=255)
         full, self.full = self.full, False   # (full: the alphas' pass; the cascade reads by the training threshold)
         try:
-            (fc, ff), aux = self.fields(x[:, 0], [tuple(r[:3]) for r in rows], [self.cache.ids[int(r[6])] for r in rows],
+            (fc, ff), aux = self.fields(xr[:, 0], [tuple(r[:3]) for r in rows], [self.cache.ids[int(r[6])] for r in rows],
                                         [[int(v) for v in r[7:10]] for r in rows], ys)
         finally:
             self.full = full
