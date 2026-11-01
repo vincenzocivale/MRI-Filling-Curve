@@ -547,9 +547,16 @@ def _unpack(v: torch.Tensor) -> torch.Tensor:
     return c + c.transpose(-1, -2) - torch.diag_embed(c.diagonal(dim1=-2, dim2=-1))
 
 
+def _grains() -> list[int]:
+    """(01/11, user) the readings' ablation: SFC_READ_GRAINS, e.g. "16" / "8" / "16,8", keeps only those multigrain
+    levels in our readings (default every level: 16 / 8 / 4 / 2 mm)."""
+    return [int(g) for g in os.environ.get("SFC_READ_GRAINS", "16,8,4,2").split(",")]
+
+
 def _tri_one(path: Path) -> dict:   # every stored covariance (fm/sfc: per level and block), in name order
     f = torch.load(path, map_location="cpu", weights_only=False)["features"]
-    return {"C": torch.stack([f[k] for k in sorted(k for k in f if "tricov" in k)]).float()}
+    lv = lambda k: int(k[1:k.index(":")]) if k.startswith("g") and ":" in k else 16
+    return {"C": torch.stack([f[k] for k in sorted(k for k in f if "tricov" in k and lv(k) in _grains())]).float()}
 
 
 def _tri_sqrt_one(path: Path) -> dict:
@@ -569,7 +576,8 @@ def second_order(d: Path, ids: list[str], dim: int = 16, fit: set | None = None)
     square root of P^T C P of each (iSQRT-COV normalisation), upper triangle, concatenated (16 / 8 / 4 / 2 mm x the
     depth quartiles). Every covariance of a volume in one batched matmul + eigh, the files read by SFC_IO_WORKERS
     processes; cached in <d>/_second_order_exact.pt (with the fit set)."""
-    cache = d / "_second_order_exact.pt"
+    g = _grains()
+    cache = d / ("_second_order_exact.pt" if g == [16, 8, 4, 2] else f"_second_order_exact_g{'-'.join(map(str, g))}.pt")
     key = sorted(fit) if fit else None
     if cache.exists() and (c := torch.load(cache))["ids"] == ids and c["fit"] == key:
         return c["feats"]
@@ -665,8 +673,9 @@ def readings(m: str, d: Path, fit: set | None = None) -> tuple[list[str], dict[s
     w = f["mean"].shape[1] // 2
     if torch.equal(f["mean"][:, :w], f["mean"][:, w:]):  # one-stream encoder: bi = h ++ h, keep h (half the fits)
         f = {k: v[:, :w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
+    g = _grains()
     for k in [k for k in f if f"g8:{k}" in f]:   # multigrain (fm/sfc.multigrain, 27/10): each statistic of every level
-        f[k] = torch.cat([f[k], *(f[f"g{m}:{k}"] for m in (8, 4, 2))], 1)   # (16 / 8 / 4 / 2 mm), concatenated
+        f[k] = torch.cat([f[k] if m == 16 else f[f"g{m}:{k}"] for m in (16, 8, 4, 2) if m in g], 1)   # concatenated
     cov = second_order(d, ids, fit=fit)["covsqrt"]
     inter = sorted((k[4:] for k in f if k.startswith("mean_b")), key=lambda b: int(b[2:]))  # "_b4", "_b8", "_b12"
     blocks = torch.cat([*(f["mean" + b] for b in inter), f["mean"]], 1)
