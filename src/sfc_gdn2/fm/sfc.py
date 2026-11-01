@@ -20,6 +20,7 @@ bench-extract / bench-probe / bench-segdec treat it like any of them. Runs in ou
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import nibabel.orientations as nio
@@ -1142,7 +1143,14 @@ class SFC(Wrapper):
     def _encoder(self, pretrained: bool = True):
         from ..model import Encoder
 
-        enc = Encoder.from_config(self.run_cfg)
+        pretrained = pretrained and not os.environ.get("SFC_ENC_RANDOM")   # bench-extract's random encoder (probes)
+        if seed := os.environ.get("SFC_ENC_SEED"):   # (01/11, user) the random-encoder seeds: only the encoder's draw
+            # changes; built under a forked RNG in both builds, so the decoder's init and the data stay those of the job seed
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(int(seed))
+                enc = Encoder.from_config(self.run_cfg)
+        else:
+            enc = Encoder.from_config(self.run_cfg)
         if pretrained:
             enc.load_state_dict(torch.load(self.ckpt, map_location="cpu"))
         return enc
@@ -1158,7 +1166,7 @@ class SFC(Wrapper):
             from .hier_dec import HierDec, HierUNet
             net = (HierUNet if a.get("hier_unet") else HierDec)(enc, str(a["token_cache"]), n_out, self.curves,
                                                                  int(self.run_cfg["seed"]))
-            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
+            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else f"random{os.environ.get('SFC_ENC_SEED', '')}", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}
             return net, ["encoder"], SEG_PATCH
         if a.get("dense_dec"):   # fm/dense_dec (28/10): the dense control decoder on the cached 16 / 8 mm tokens
@@ -1172,7 +1180,7 @@ class SFC(Wrapper):
             else:
                 net = DenseDec(enc, tc, n_out, a.get("dense_mg"), float(a.get("dense_width") or 1), bool(a.get("dense_4mm")),
                                bool(a.get("dense_sub")), bool(a.get("dense_notok")))
-            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
+            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else f"random{os.environ.get('SFC_ENC_SEED', '')}", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}
             return net, ["encoder"], SEG_PATCH
         gone = [n for n in SEG_GONE if a.get(n)] + [f"{n}={a[n]}" for n, ok in (("encoder", None), ("fine_head", "mix"),
@@ -1194,7 +1202,7 @@ class SFC(Wrapper):
                      fine_live4=bool(a.get("fine_live4")), cascade_rank=bool(a.get("cascade_rank")),
                      c_patch=bool(a.get("c_patch")), cascade_ring=bool(a.get("cascade_ring")))
         if isinstance(net.cache, TokenCache):   # checked at its first read (segrun also builds a random net it never runs)
-            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else "random", "taps": list(enc.taps),
+            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else f"random{os.environ.get('SFC_ENC_SEED', '')}", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}   # (blocks: always None since block_plan's removal)
         if enc.taps and getattr(net, "fine_tok", None) is not None:   # each finer level reads last ++ taps (the depth
             u = 1 if net.unique else 2        # quartiles concatenated as the probe, user 27/10) straight into its fine_tok (a
@@ -1265,7 +1273,9 @@ class SFC(Wrapper):
                 "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt)}}
 
     def provenance(self) -> dict:
-        return super().provenance() | {"checkpoint": str(self.ckpt), "torch": torch.__version__}
+        return super().provenance() | {"checkpoint": str(self.ckpt), "torch": torch.__version__,
+                                       "encoder_random": bool(os.environ.get("SFC_ENC_RANDOM")),
+                                       "encoder_seed": os.environ.get("SFC_ENC_SEED")}
 
 
 build = SFC
