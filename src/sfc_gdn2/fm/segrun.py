@@ -539,8 +539,11 @@ def vox_budget(job: dict, vols: list, patch, k: int) -> None:
         mean_tv = lambda n: float(np.mean([math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols]))
         max_tv = lambda n: max(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols)
         TILE_CELLS = max([1] + [n for n in range(1, 21) if mean_tv(n) <= V / B and max_tv(n) <= V // 2])
-        b = max(2, int(B * min(1.0, 14 / k)))
         t = mean_tv(TILE_CELLS)
+        # the tile rounds down to whole 16 mm cells: refill the budget with that tile (01/11: Willis kept B = 2 on 127^3
+        # tiles, 49 % of the budget; B' had 4)
+        B = min(64, max(B, int(V // t)))
+        b = max(2, int(B * min(1.0, 14 / k)))
         print(f"[seg] planner thr {thr}: L {L:.0f} voxels, f {f:.4f}, E95 {E:.1f} mm -> {b} tiles of {TILE_CELLS} cells "
               f"(mean {t ** (1 / 3):.0f}^3, largest {max_tv(TILE_CELLS) ** (1 / 3):.0f}^3), {b * t / V:.0%} of the budget on average; "
               f"was {job['batch']}", flush=True)
