@@ -536,8 +536,9 @@ def vox_budget(job: dict, vols: list, patch, k: int, lm: bool = False) -> None:
         tmin = (2 * E / h) ** 3
         B = next((b for b in range(2, 65) if V / b >= tmin and b / 3 * min(L, V / b) + 2 / 3 * f * V >= thr * V), 64)
         B = max(2, min(B, int(V // max(tmin, 1.0))))
-        if lm:   # points (landmarks): the target is the whole constellation, not a lesion (01/11: the lesion rule gave fetal
-            B = 2   # 64 tiles of 28^3, val MRE 10 mm): the largest tile, then refilled below
+        if lm:   # landmark localisation (one named point per class per scan, heatmap regression): the target is the whole
+            B = 2   # constellation, the largest tile, then refilled below (01/11: the lesion rule gave fetal 64 tiles of 28^3,
+            # val MRE 10 mm). Instance detection (cmbpts: 2 mm spheres around point annotations) keeps the lesion rule.
         mean_tv = lambda n: float(np.mean([math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols]))
         max_tv = lambda n: max(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols)
         TILE_CELLS = max([1] + [n for n in range(1, 21) if mean_tv(n) <= V / B and max_tv(n) <= V // 2])
