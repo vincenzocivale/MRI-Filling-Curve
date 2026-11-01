@@ -1167,23 +1167,44 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
     largest only) that improves the task's metric (Dice, or lesion F1); no rule if nothing does (user, 23/10:
     nnU-Net-style post-processing chosen on val, the same for every task)."""
     rule = {}
+    boxes = None
+    if f1 != "det" and vals and vals[0][1] is None:   # argmax only (many classes): each class on the bounding box of its
+        # predicted and true voxels, found for all classes in one pass per volume; same masks and scores, the components
+        # and filters on the box only (01/11: TotalSeg's ~50 classes on whole-body volumes took hours)
+        from scipy import ndimage
+        boxes = []
+        for lab, _, y, *_ in vals:
+            a, b = ndimage.find_objects(lab.astype(np.int32), k - 1), ndimage.find_objects(y.astype(np.int32), k - 1)
+            boxes.append([None if sa is None and sb is None else tuple(
+                slice(min(x.start for x in (u, v) if x is not None), max(x.stop for x in (u, v) if x is not None))
+                for u, v in zip(sa or (None,) * lab.ndim, sb or (None,) * lab.ndim)) for sa, sb in zip(a, b)])
     for c in range(1, k):
-        t = [(y == c) for _, _, y, *_ in vals]
+        if boxes is not None:   # this class's view of the val volumes (an empty 1-voxel box where it is absent)
+            vals_c = []
+            for (lab, q, y, *rest), bx in zip(vals, boxes):
+                s = bx[c - 1] if c - 1 < len(bx) and bx[c - 1] is not None else tuple(slice(0, 1) for _ in lab.shape)
+                if c - 1 >= len(bx) or bx[c - 1] is None:
+                    vals_c.append((np.zeros((1,) * lab.ndim, lab.dtype), q, np.zeros((1,) * lab.ndim, y.dtype), *rest))
+                else:
+                    vals_c.append((lab[s], q, y[s], *rest))
+        else:
+            vals_c = vals
+        t = [(y == c) for _, _, y, *_ in vals_c]
         if not any(x.any() for x in t):
             continue
         gts = [_components(tt) if f1 else None for tt in t]
-        base = _metric([_score(lab == c, tt, f1, g, sp=sp, pts=pp) for (lab, _, _, sp, pp), tt, g in zip(vals, t, gts)], f1)
+        base = _metric([_score(lab == c, tt, f1, g, sp=sp, pts=pp) for (lab, _, _, sp, pp), tt, g in zip(vals_c, t, gts)], f1)
         best, br = base, None
-        taus = (None,) + (TAUS if vals[0][1] is not None else ())
+        taus = (None,) + (TAUS if vals_c[0][1] is not None else ())
         for tau in taus:   # the thresholded masks' components once per tau, the filters on top of them
-            comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, *_ in vals]
+            comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, *_ in vals_c]
             for smin in sorted({0, *sizes.get(c, ())}) if f1 != "det" else (0,):   # det: the threshold only
                 for largest in (False, True) if f1 != "det" else (False,):
                     if tau is None and not smin and not largest:
                         continue
                     sc = _metric([_score(_pp_class(lab, q, c, tau, smin, largest, cp), tt, f1, g,
                                          cp if f1 == "det" else None, sp, pp)
-                                  for (lab, q, _, sp, pp), tt, g, cp in zip(vals, t, gts, comps)], f1)
+                                  for (lab, q, _, sp, pp), tt, g, cp in zip(vals_c, t, gts, comps)], f1)
                     if sc > best + 1e-4:
                         best, br = sc, (tau, int(smin), largest)
         if br is not None:
