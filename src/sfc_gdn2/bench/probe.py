@@ -346,6 +346,15 @@ def run_task(name: str, cfg: dict, rows: pd.DataFrame, feats: dict[str, torch.Te
     """rows: the task's volumes (with `split`); feats/index: the model's globals and id -> row."""
     y_all, classes = targets(rows, cfg)
     sel = {s: np.flatnonzero(rows["split"].to_numpy() == s) for s in ("train", "val", "test")}
+    if frac := os.environ.get("SFC_TRAIN_FRAC"):   # (01/11, user) the label-efficiency curve: this fraction of the train
+        # subjects (per class for classification, at least one each), drawn with SFC_DATA_SEED; val and test unchanged
+        rng = np.random.default_rng(2000 + int(os.environ.get("SFC_DATA_SEED", "0")))
+        tr = rows.iloc[sel["train"]]
+        lab = (pd.Series(tr.eval(cfg["label"]).to_numpy(), index=tr["subject"]).groupby(level=0).first()
+               if cfg["type"] in ("class", "ordinal") else pd.Series(0, index=tr["subject"].unique()))
+        keep = np.concatenate([rng.choice(np.sort(g.index.to_numpy()), max(1, round(float(frac) * len(g))), replace=False)
+                               for _, g in lab.groupby(lab)])
+        sel["train"] = sel["train"][tr["subject"].isin(keep).to_numpy()]
     rid = torch.tensor([index[i] for i in rows["id"]])
     y = {s: y_all[sel[s]].to(device) for s in sel}
     kind = KINDS[cfg["type"]](cfg, y["train"].cpu())
