@@ -506,7 +506,7 @@ def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
     return ce + 1 - dice.mean()
 
 
-def vox_budget(job: dict, vols: list, patch, k: int) -> None:
+def vox_budget(job: dict, vols: list, patch, k: int, lm: bool = False) -> None:
     """B' (user 31/10): every model the same budget of SFC_VOX_BUDGET voxels per step (2 x 160^3: a baseline's 160^3
     patch at batch 2), filled with its own tile: the batch = budget // the largest training tile, between 2 (nnU-Net's
     minimum) and 64. Ours (token grid): a tile of at most budget / 2 voxels (fewer 16 mm cells), above 14 classes fewer
@@ -536,6 +536,8 @@ def vox_budget(job: dict, vols: list, patch, k: int) -> None:
         tmin = (2 * E / h) ** 3
         B = next((b for b in range(2, 65) if V / b >= tmin and b / 3 * min(L, V / b) + 2 / 3 * f * V >= thr * V), 64)
         B = max(2, min(B, int(V // max(tmin, 1.0))))
+        if lm:   # points (landmarks): the target is the whole constellation, not a lesion (01/11: the lesion rule gave fetal
+            B = 2   # 64 tiles of 28^3, val MRE 10 mm): the largest tile, then refilled below
         mean_tv = lambda n: float(np.mean([math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols]))
         max_tv = lambda n: max(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols)
         TILE_CELLS = max([1] + [n for n in range(1, 21) if mean_tv(n) <= V / B and max_tv(n) <= V // 2])
@@ -653,7 +655,7 @@ def train(job: dict) -> None:
         tile_rule(job, [load(it) for it in split["train"][:40]], LM, k)
     if os.environ.get("SFC_VOX_BUDGET"):
         vox_budget(job, [load(it) for it in split["train"][:None if os.environ.get("SFC_PLANNER_THR") else 40]]
-                   if tcache is not None or not patch else [], patch, k)
+                   if tcache is not None or not patch else [], patch, k, LM)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
         {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
