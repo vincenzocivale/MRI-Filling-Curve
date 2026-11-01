@@ -513,6 +513,39 @@ def vox_budget(job: dict, vols: list, patch, k: int) -> None:
     tiles (logits' memory: TotalSeg 2). Baselines: their patch, the whole volume when they have none (MedicalNet)."""
     global TILE_CELLS
     V = int(os.environ["SFC_VOX_BUDGET"])
+    thr = float(os.environ.get("SFC_PLANNER_THR", "0"))
+    if thr and vols and vols[0].get("align"):
+        # planner (user 01/11): the largest tile (most context) whose steps still see thr x V lesion voxels on average.
+        # From the training labels: L = size-biased mean component (the one a foreground-centred tile lands on), f = the
+        # foreground share, E = p95 component extent. E[lesion voxels per step] = B/3 min(L, V/B) + 2/3 f V (1/3 of the
+        # tiles foreground-centred, segrun's sampling); B the smallest in [2, 64] reaching thr V, the tile at least 2 E.
+        from scipy import ndimage
+        sz, ext, fg, vx = [], [], [], []
+        for v in vols:
+            y = v["y"].reshape(v["x"].shape[1:]).numpy()
+            sp = np.asarray([float(a) for a in v["ctx"][:3]])
+            m = (y > 0) & (y < 255)
+            lab, n = ndimage.label(m, np.ones((3, 3, 3)))
+            if n:
+                sz += np.bincount(lab.ravel())[1:].tolist()
+                ext += [float((np.array([q.stop - q.start for q in sl]) * sp).max()) for sl in ndimage.find_objects(lab)]
+            fg.append(float(m.mean())), vx.append(float(np.prod(sp)) ** (1 / 3))
+        sz = np.asarray(sz, float)
+        L = float((sz ** 2).sum() / max(sz.sum(), 1.0))
+        f, E, h = float(np.mean(fg)), float(np.percentile(ext, 95)) if ext else 160.0, float(np.median(vx))
+        tmin = (2 * E / h) ** 3
+        B = next((b for b in range(2, 65) if V / b >= tmin and b / 3 * min(L, V / b) + 2 / 3 * f * V >= thr * V), 64)
+        B = max(2, min(B, int(V // max(tmin, 1.0))))
+        mean_tv = lambda n: float(np.mean([math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols]))
+        max_tv = lambda n: max(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols)
+        TILE_CELLS = max([1] + [n for n in range(1, 21) if mean_tv(n) <= V / B and max_tv(n) <= V // 2])
+        b = max(2, int(B * min(1.0, 14 / k)))
+        t = mean_tv(TILE_CELLS)
+        print(f"[seg] planner thr {thr}: L {L:.0f} voxels, f {f:.4f}, E95 {E:.1f} mm -> {b} tiles of {TILE_CELLS} cells "
+              f"(mean {t ** (1 / 3):.0f}^3, largest {max_tv(TILE_CELLS) ** (1 / 3):.0f}^3), {b * t / V:.0%} of the budget on average; "
+              f"was {job['batch']}", flush=True)
+        job["batch"] = b
+        return
     if vols and vols[0].get("align"):
         tv = lambda n: max(math.prod(min(n * a, s) for a, s in zip(v["align"], v["x"].shape[1:])) for v in vols)
         while TILE_CELLS > 1 and tv(TILE_CELLS) > V // 2:
@@ -616,7 +649,8 @@ def train(job: dict) -> None:
         # their extent says nothing of the context they need: with the rule's 56^3 tiles fetal test MRE 1.86 vs 1.43)
         tile_rule(job, [load(it) for it in split["train"][:40]], LM, k)
     if os.environ.get("SFC_VOX_BUDGET"):
-        vox_budget(job, [load(it) for it in split["train"][:40]] if tcache is not None or not patch else [], patch, k)
+        vox_budget(job, [load(it) for it in split["train"][:None if os.environ.get("SFC_PLANNER_THR") else 40]]
+                   if tcache is not None or not patch else [], patch, k)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
         {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
