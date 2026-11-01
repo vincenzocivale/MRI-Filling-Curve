@@ -12,6 +12,7 @@ model. Two stages, as SLURM jobs:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,11 @@ def select(rows: pd.DataFrame, cfg: dict, rng: np.random.Generator) -> dict[str,
     `test_query`, if set)."""
     sel = {s: rows.index[rows["split"] == s].to_numpy() for s in ("train", "val", "test")}
     sel["train"] = rng.permutation(sel["train"])[:MAX_TRAIN]
+    if ds := os.environ.get("SFC_DATA_SEED"):   # (01/11, user) ablation basket: the seed varies the input only, 90 % of
+        # the train subjects drawn with it; init, data order, val and test stay those of the job seed
+        subj = np.sort(rows.loc[sel["train"], "subject"].unique())
+        keep = np.random.default_rng(1000 + int(ds)).choice(subj, round(0.9 * len(subj)), replace=False)
+        sel["train"] = sel["train"][rows.loc[sel["train"], "subject"].isin(keep).to_numpy()]
     sel["val"] = rng.permutation(sel["val"])[:MAX_VAL]
     if cfg.get("test_query"):
         sel["test"] = rows.loc[sel["test"]].query(cfg["test_query"]).index.to_numpy()
