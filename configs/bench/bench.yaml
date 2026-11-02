@@ -1,6 +1,6 @@
 # Downstream benchmark of the external FMs and ours (src/sfc_gdn2/bench/): `sfc bench-split` writes the volume list
 # and the fixed subject-level splits; `sfc bench-extract <this> --group <g>` writes features; `sfc bench-probe` the
-# volume tasks; `sfc bench-segdec` segmentation. configs/leonardo/bench.yaml: alias of this file (jobs queued before).
+# volume tasks; `sfc bench-segdec` segmentation.
 catalog: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/catalog.csv.gz
 totalseg_meta: /leonardo_scratch/large/userexternal/fcorrent/datasets/raw/TotalSegmentator/MRI_v300/Totalsegmentator_dataset_v300/meta.csv
 out_dir: /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/bench   # volumes.csv, splits.csv, SHA256SUMS

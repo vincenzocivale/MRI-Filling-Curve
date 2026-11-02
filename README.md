@@ -76,8 +76,8 @@ No dataset or GDN-2 code is redistributed here (`THIRD_PARTY.md`).
 `slurm/submit.py` turns a YAML preset (`slurm/presets/`: `dbg` 1 GPU on the debug QOS, `1gpu`, `4gpu` torchrun
 DDP, `cpu` on `lrd_all_serial`) into a batch script and submits it: usage, examples, multi-node and `--chain` (runs
 past the 24 h limit) in `python slurm/submit.py -h`. Mail: `cp slurm/local.yaml.example slurm/local.yaml` once.
-Configs carry Leonardo paths (runs and raw data on `$SCRATCH`, metadata on `$WORK`). `configs/leonardo/` keeps
-aliases of the benchmark configs for jobs queued before the move to `configs/bench/`.
+Configs carry Leonardo paths (runs and raw data on `$SCRATCH`, metadata on `$WORK`): `configs/pretrain_lejepa.yaml`,
+`configs/bench/`, `configs/fm/`.
 flash-attn's upstream wheels need GLIBC 2.32 (Leonardo: 2.28); build it with `slurm/build_flash_attn.sh`.
 
 ## External foundation models

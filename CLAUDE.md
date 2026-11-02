@@ -24,7 +24,7 @@ ruff check .
 
 GDN-2 is at `/leonardo_work/IscrC_SFMRI/fcorrent/repos/GatedDeltaNet-2` (on the env's path via `gdn2.pth`).
 flash-attn is built from source (`slurm/build_flash_attn.sh`): the upstream wheels need GLIBC 2.32, Leonardo has 2.28.
-Configs carry Leonardo paths (runs and raw data on $SCRATCH); `configs/leonardo/` only aliases the benchmark configs.
+Configs carry Leonardo paths (runs and raw data on $SCRATCH): `configs/pretrain_lejepa.yaml`, `configs/bench/`, `configs/fm/`.
 GPU work goes through SLURM (`python slurm/submit.py slurm/presets/<p>.yaml -- <cmd>`, 4x A100 64GB per node);
 short analyses and checks (< ~15 min) go through `python slurm/qrun.py [--mem 16] [--gpu] -- <cmd>` instead: an
 `srun --overlap` step inside a running job of yours (no queue, no extra hours, own memory limit so the host never
