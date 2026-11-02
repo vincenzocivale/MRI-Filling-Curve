@@ -27,9 +27,9 @@ Logs in outputs/slurm/. Short analyses: slurm/qrun.py (a step in a running job, 
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import shutil
-import os
 import subprocess
 import sys
 from pathlib import Path
