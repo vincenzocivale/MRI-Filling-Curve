@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import copy
+import gc
 import importlib
 import itertools
 import json
@@ -196,6 +197,7 @@ def main(job_path: str) -> None:
             res = lead.features_batch([x for _, x, _ in buf])
         except Exception:  # noqa: BLE001 -- the batch one by one, each failure logged per item
             print(f"[fm] batch of {len(buf)} failed, one by one:\n{traceback.format_exc()}", flush=True)
+            gc.collect(), torch.cuda.empty_cache()   # the failed batch's tensors (else the fallback OOMs too)
             for b in buf:
                 one(*b)
             buf.clear()
