@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -79,23 +80,29 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
     ids = {s: sorted(i["id"] for i in items if i["split"] == s and (task != "wmh_seg" or "FLAIR" in i["id"]))
            for s in ("train", "val")}
     ids = {s: v[:limit] if limit else v for s, v in ids.items()}   # limit: a smoke test on a few volumes
-    order = [15, *TAPS]
+    # ablation B (02/11): SFC_PROBE_LAST=1 reads the last block only; SFC_PROBE_SUBMM=<mm> sets the output sub-grid of each
+    # cell to that voxel size (default: 4 per edge, i.e. a quarter of the cell)
+    order = [15] if os.environ.get("SFC_PROBE_LAST") else [15, *TAPS]
     nb, out = len(order), {}
     load = lambda i: torch.load(SEG_INPUTS / f"{i}.pt", map_location="cpu", weights_only=False)
     for mm in mms:
         t0, xtx = time.time(), None
+        SB = max(1, round(mm / float(os.environ["SFC_PROBE_SUBMM"]))) if os.environ.get("SFC_PROBE_SUBMM") else SUB
         for i in ids["train"]:   # pass 1: X^T X and X^T Y per block, nothing stored
             r = load(i)
             x, sp, y = r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda()
             X, g, k, xr = _tokens(enc, seed, x, sp, mm)
             t = POS[task](y).float()
-            if xr.shape[1:] != y.shape:   # resampled input: the target on its grid
-                t = F.interpolate(t[None, None], size=list(xr.shape[1:]), mode="trilinear", align_corners=False)[0, 0]
-            T = F.adaptive_avg_pool3d(_pad(t, g, k)[None, None], [gg * SUB for gg in g])[0, 0]
-            T = T.reshape(g[0], SUB, g[1], SUB, g[2], SUB).permute(0, 2, 4, 1, 3, 5).reshape(-1, SUB ** 3)
+            if xr.shape[1:] != y.shape:   # resampled input: the native target straight onto the sub-grid (no 1 mm step)
+                t = F.interpolate(t[None, None], size=[round(n * SB / kk) for n, kk in zip(xr.shape[1:], k)],
+                                  mode="trilinear", align_corners=False)[0, 0]
+                T = _pad(t, g, [SB] * 3)
+            else:
+                T = F.adaptive_avg_pool3d(_pad(t, g, k)[None, None], [gg * SB for gg in g])[0, 0]
+            T = T.reshape(g[0], SB, g[1], SB, g[2], SB).permute(0, 2, 4, 1, 3, 5).reshape(-1, SB ** 3)
             if xtx is None:
                 xtx = torch.zeros(nb, X.shape[-1] + 1, X.shape[-1] + 1, device="cuda")
-                xty = torch.zeros(nb, X.shape[-1] + 1, SUB ** 3, device="cuda")
+                xty = torch.zeros(nb, X.shape[-1] + 1, SB ** 3, device="cuda")
             for bi in range(nb):
                 Xb = _block(X, bi)
                 xtx[bi] += Xb.T @ Xb
@@ -116,12 +123,14 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
             for bi in range(nb):
                 Xb = _block(X, bi)
                 for ai in range(len(ALPHAS)):
-                    p = (Xb @ W[bi, ai]).reshape(g[0], g[1], g[2], SUB, SUB, SUB).permute(0, 3, 1, 4, 2, 5)
-                    p = F.interpolate(p.reshape(1, 1, *(gg * SUB for gg in g)), size=[gg * kk for gg, kk in zip(g, k)],
-                                      mode="trilinear", align_corners=False)[0, 0]
-                    p = p[: xr.shape[1], : xr.shape[2], : xr.shape[3]]
-                    if p.shape != y.shape:   # resampled input: Dice on the native voxels
-                        p = F.interpolate(p[None, None], size=list(y.shape), mode="trilinear", align_corners=False)[0, 0]
+                    p = (Xb @ W[bi, ai]).reshape(g[0], g[1], g[2], SB, SB, SB).permute(0, 3, 1, 4, 2, 5).reshape(*(gg * SB for gg in g))
+                    if xr.shape[1:] == y.shape:
+                        p = F.interpolate(p[None, None], size=[gg * kk for gg, kk in zip(g, k)], mode="trilinear",
+                                          align_corners=False)[0, 0][: y.shape[0], : y.shape[1], : y.shape[2]]
+                    else:   # resampled input: from the sub-grid straight to the native voxels (Dice there)
+                        e = [round(n * SB / kk) for n, kk in zip(xr.shape[1:], k)]
+                        p = F.interpolate(p[: e[0], : e[1], : e[2]][None, None], size=list(y.shape), mode="trilinear",
+                                          align_corners=False)[0, 0]
                     p = p[keep]
                     pos = p[None] > th
                     tp = (pos & gt).sum(1).float()
