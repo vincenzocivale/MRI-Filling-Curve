@@ -66,6 +66,7 @@ def _pad(v, g, k):
     return F.pad(v, [p for n, gg, kk in zip(reversed(v.shape), reversed(g), reversed(k)) for p in (0, gg * kk - n)])
 
 
+ANY = lambda y: (y > 0) & (y != 255)   # any labelled class vs not (task seg names without an entry below)
 POS = {"wmh_seg": lambda y: y == 1, "cow_seg": lambda y: (y > 0) & (y != 255),   # Willis: any vessel class
        "prostate_lesion": lambda y: (y > 0) & (y != 255), "heart_seg": lambda y: (y > 0) & (y != 255)}   # heart: any class
 KEEP = {"wmh_seg": lambda y: (y != 255) & (y != 2), "cow_seg": lambda y: y != 255, "prostate_lesion": lambda y: y != 255, "heart_seg": lambda y: y != 255}
@@ -93,7 +94,7 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
             r = load(i)
             x, sp, y = r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda()
             X, g, k, xr = _tokens(enc, seed, x, sp, mm)
-            t = POS[task](y).float()
+            t = POS.get(task, ANY)(y).float()
             if xr.shape[1:] != y.shape:   # resampled input: the native target straight onto the sub-grid (no 1 mm step)
                 t = F.interpolate(t[None, None], size=[round(n * SB / kk) for n, kk in zip(xr.shape[1:], k)],
                                   mode="trilinear", align_corners=False)[0, 0]
@@ -115,8 +116,8 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
         th = THRESH.cuda()[:, None]
         def vol_dice(x, sp, y, mm=mm, dice=dice, W=W, SB=SB, th=th):   # Dice of one val volume per (block, alpha, threshold), on the native voxels of y
             X, g, k, xr = _tokens(enc, seed, x, sp, mm)
-            keep = KEEP[task](y)
-            gt = POS[task](y)[keep]
+            keep = KEEP.get(task, lambda y: y != 255)(y)
+            gt = POS.get(task, ANY)(y)[keep]
             dv = torch.zeros_like(dice)
             for bi in range(nb):
                 Xb = _block(X, bi)
@@ -254,6 +255,8 @@ def main() -> None:
             res["prostate"] = wmh(enc, seed, a.mm, a.limit, "prostate_lesion")
         if "heart" in a.tasks:   # (02/11, W6) HVSMR, heart (any class) vs not, same probe
             res["heart"] = wmh(enc, seed, a.mm, a.limit, "heart_seg")
+        for t in (t for t in a.tasks if t.endswith("_seg")):   # any seg task by name (e.g. bladder_seg), any class vs not
+            res[t] = wmh(enc, seed, a.mm, a.limit, t)
         if "idh" in a.tasks:
             res["idh"] = idh(w, enc, seed, Path(a.cache), Path(a.out).with_suffix(".idh.pt"), a.idh_mm,
                              a.idh_part and tuple(a.idh_part))
