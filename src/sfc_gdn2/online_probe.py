@@ -41,15 +41,18 @@ THRESH = torch.linspace(0.02, 0.6, 30)
 
 
 def _tokens(enc, seed, x, sp, mm):
-    """[1, *S] voxels -> [cells, blocks, d] tokens at `mm` (rows: last ++ taps), the grid and k."""
-    from .data.volume import patch_dims, patch_grid
+    """[1, *S] voxels -> [cells, blocks, d] tokens at `mm` (rows: last ++ taps), the grid, k and the voxels read
+    (ablation B: SFC_RESPACE resamples them to 1 mm or calls them 1 mm, data.volume.respace)."""
+    from .data.volume import patch_dims, patch_grid, respace
     from .fm.token_cache import read
 
-    k = patch_dims(sp.tolist(), mm)
+    x, s = respace(x, sp)
+    sp = sp.new_tensor(s)
+    k = patch_dims(s, mm)
     a = read(enc, ["raster"], seed, x, sp, k, mm, 30_000, 32, 8, taps=True, want=["raster"])["raster"]
     g = patch_grid(tuple(x.shape[1:]), k).tolist()
     # on the CPU, moved one block at a time (2 mm: up to ~1.6M cells x 8 blocks, ~26 GB in fp16)
-    return torch.from_numpy(a).reshape(-1, 1 + len(enc.taps), enc.dim), g, k
+    return torch.from_numpy(a).reshape(-1, 1 + len(enc.taps), enc.dim), g, k, x
 
 
 def _block(X, bi):
@@ -62,14 +65,19 @@ def _pad(v, g, k):
     return F.pad(v, [p for n, gg, kk in zip(reversed(v.shape), reversed(g), reversed(k)) for p in (0, gg * kk - n)])
 
 
-def wmh(enc, seed, mms, limit: int = 0) -> dict:
+POS = {"wmh_seg": lambda y: y == 1, "cow_seg": lambda y: (y > 0) & (y != 255)}      # Willis: any vessel class
+KEEP = {"wmh_seg": lambda y: (y != 255) & (y != 2), "cow_seg": lambda y: y != 255}
+
+
+def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
     from .bench.segdec import task_items
     from .io import load_yaml
 
     vols = pd.read_csv(MV / "volumes.csv", low_memory=False, dtype={"session": str})
     tasks = load_yaml("configs/bench/probe_tasks_v2.yaml")
-    items = task_items({"wmh_seg": tasks["wmh_seg"]}, vols, pd.read_csv(MV / "splits.csv"), 0)["wmh_seg"]
-    ids = {s: sorted(i["id"] for i in items if i["split"] == s and "FLAIR" in i["id"]) for s in ("train", "val")}
+    items = task_items({task: tasks[task]}, vols, pd.read_csv(MV / "splits.csv"), 0)[task]
+    ids = {s: sorted(i["id"] for i in items if i["split"] == s and (task != "wmh_seg" or "FLAIR" in i["id"]))
+           for s in ("train", "val")}
     ids = {s: v[:limit] if limit else v for s, v in ids.items()}   # limit: a smoke test on a few volumes
     order = [15, *TAPS]
     nb, out = len(order), {}
@@ -79,8 +87,11 @@ def wmh(enc, seed, mms, limit: int = 0) -> dict:
         for i in ids["train"]:   # pass 1: X^T X and X^T Y per block, nothing stored
             r = load(i)
             x, sp, y = r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda()
-            X, g, k = _tokens(enc, seed, x, sp, mm)
-            T = F.adaptive_avg_pool3d(_pad((y == 1).float(), g, k)[None, None], [gg * SUB for gg in g])[0, 0]
+            X, g, k, xr = _tokens(enc, seed, x, sp, mm)
+            t = POS[task](y).float()
+            if xr.shape[1:] != y.shape:   # resampled input: the target on its grid
+                t = F.interpolate(t[None, None], size=list(xr.shape[1:]), mode="trilinear", align_corners=False)[0, 0]
+            T = F.adaptive_avg_pool3d(_pad(t, g, k)[None, None], [gg * SUB for gg in g])[0, 0]
             T = T.reshape(g[0], SUB, g[1], SUB, g[2], SUB).permute(0, 2, 4, 1, 3, 5).reshape(-1, SUB ** 3)
             if xtx is None:
                 xtx = torch.zeros(nb, X.shape[-1] + 1, X.shape[-1] + 1, device="cuda")
@@ -97,16 +108,19 @@ def wmh(enc, seed, mms, limit: int = 0) -> dict:
         for i in ids["val"]:     # pass 2: predicted per volume, Dice per (block, alpha, threshold)
             r = load(i)
             x, sp, y = r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda()
-            X, g, k = _tokens(enc, seed, x, sp, mm)
-            keep = (y != 255) & (y != 2)
-            gt = (y == 1)[keep]
+            X, g, k, xr = _tokens(enc, seed, x, sp, mm)
+            keep = KEEP[task](y)
+            gt = POS[task](y)[keep]
             for bi in range(nb):
                 Xb = _block(X, bi)
                 for ai in range(len(ALPHAS)):
                     p = (Xb @ W[bi, ai]).reshape(g[0], g[1], g[2], SUB, SUB, SUB).permute(0, 3, 1, 4, 2, 5)
                     p = F.interpolate(p.reshape(1, 1, *(gg * SUB for gg in g)), size=[gg * kk for gg, kk in zip(g, k)],
                                       mode="trilinear", align_corners=False)[0, 0]
-                    p = p[: y.shape[0], : y.shape[1], : y.shape[2]][keep]
+                    p = p[: xr.shape[1], : xr.shape[2], : xr.shape[3]]
+                    if p.shape != y.shape:   # resampled input: Dice on the native voxels
+                        p = F.interpolate(p[None, None], size=list(y.shape), mode="trilinear", align_corners=False)[0, 0]
+                    p = p[keep]
                     pos = p[None] > th
                     tp = (pos & gt).sum(1).float()
                     dice[bi, ai] += 2 * tp / (pos.sum(1) + gt.sum()).clamp_min(1)
@@ -115,7 +129,7 @@ def wmh(enc, seed, mms, limit: int = 0) -> dict:
         out[str(int(mm))] = {"best": round(float(best.max()), 4), "block": order[int(best.argmax())],
                              "last": round(float(best[0]), 4),
                              "per_block": {str(b): round(float(v), 4) for b, v in zip(order, best)}}
-        print(f"[online] WMH {mm:g} mm: Dice best {out[str(int(mm))]['best']:.3f} (block {out[str(int(mm))]['block']}), "
+        print(f"[online] {task} {mm:g} mm: Dice best {out[str(int(mm))]['best']:.3f} (block {out[str(int(mm))]['block']}), "
               f"last block {out[str(int(mm))]['last']:.3f}, {time.time() - t0:.0f} s", flush=True)
     out["volumes"] = {s: len(v) for s, v in ids.items()}
     return out
@@ -152,8 +166,8 @@ def idh(w, enc, seed, cache: Path, save: Path, mm: float = 16.0, part: tuple[int
             f.with_suffix(".tmp").rename(f)
         r = torch.load(f, map_location="cpu")
         x, sp = r["x"].cuda().float(), r["sp"].float().cuda()
-        X, g, k = _tokens(enc, seed, x, sp, mm)
-        fg = F.avg_pool3d(_pad(x[0], g, k)[None, None], k)[0, 0].flatten() > 0.05
+        X, g, k, xr = _tokens(enc, seed, x, sp, mm)
+        fg = F.avg_pool3d(_pad(xr[0], g, k)[None, None], k)[0, 0].flatten() > 0.05
         feats.append(X[fg if fg.any() else slice(None)][:, cols].float().mean(0).cpu())
     if part is not None:   # one share of the volumes (several GPUs): features only, the fit runs on the merge
         torch.save({"ids": list(rows["id"].iloc[list(sel)]), "idx": list(sel), "of": part[1],
@@ -204,6 +218,8 @@ def main() -> None:
     with torch.no_grad():
         if "wmh" in a.tasks:
             res["wmh"] = wmh(enc, seed, a.mm, a.limit)
+        if "cow" in a.tasks:   # ablation B (02/11): Willis, vessel vs not, same ridge probe as WMH
+            res["cow"] = wmh(enc, seed, a.mm, a.limit, "cow_seg")
         if "idh" in a.tasks:
             res["idh"] = idh(w, enc, seed, Path(a.cache), Path(a.out).with_suffix(".idh.pt"), a.idh_mm,
                              a.idh_part and tuple(a.idh_part))

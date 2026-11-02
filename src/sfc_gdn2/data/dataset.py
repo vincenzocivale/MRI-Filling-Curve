@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 
 import numpy as np
@@ -9,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .pool import n_patch
-from .volume import decode, patch_dims, patch_grid, patchify
+from .volume import decode, patch_dims, patch_grid, patchify, respace
 
 
 class PatchDataset(Dataset):
@@ -44,8 +45,9 @@ class PatchDataset(Dataset):
                 i = int(fits[torch.randint(len(fits), ())])
         else:
             raise RuntimeError(f"10 unreadable scans in a row, last {self.paths[i]}")
+        vol, spacing = respace(torch.from_numpy(np.array(arr)), spacing)   # ablation B: SFC_RESPACE
         k = patch_dims(spacing, self.patch_mm)
-        return {"volume": torch.from_numpy(np.array(arr)), "grid": patch_grid(arr.shape, k), "k": torch.tensor(k),
+        return {"volume": vol, "grid": patch_grid(vol.shape, k), "k": torch.tensor(k),
                 "spacing": torch.tensor(spacing, dtype=torch.float32),
                 "affine": torch.tensor(affine, dtype=torch.float64), "index": i}
 
@@ -170,7 +172,8 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, sessions, seed: int 
               "prefetch_factor": prefetch if workers else None}
     rows = rows.reset_index(drop=True)
     budget_mm = data.get("budget_patch_mm") or data["patch_mm"]  # with patch_mm_choices: the smallest (most tokens)
-    sizes = [n_patch(tuple(map(int, s.split("x"))), tuple(map(float, z.split("x"))), budget_mm)
+    fake = os.environ.get("SFC_RESPACE") == "fake"   # ablation B: patches counted at the voxels' fake 1 mm
+    sizes = [n_patch(tuple(map(int, s.split("x"))), (1.0, 1.0, 1.0) if fake else tuple(map(float, z.split("x"))), budget_mm)
              for s, z in zip(rows["shape"], rows["spacing"])]
     weights = mix_weights(rows, data.get("mix_by", ["dataset", "modality"]), float(data.get("mix_alpha", 1.0)))
     for name, share in (data.get("mix_share") or {}).items():   # (02/11, W6) dataset `name` drawn with this share of scans

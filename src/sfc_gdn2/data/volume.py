@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import os
 import zipfile
 from pathlib import Path
 
@@ -14,6 +15,21 @@ import torch.nn.functional as F
 def patch_dims(spacing, patch_mm: float) -> tuple[int, int, int]:
     """Native voxels per patch axis: the whole number closest to `patch_mm` mm (>= 1)."""
     return tuple(max(1, round(patch_mm / float(z))) for z in spacing[:3])
+
+
+def respace(x: torch.Tensor, spacing):
+    """Ablation B (02/11), env SFC_RESPACE: "" native; "1mm" trilinear resampling of the last 3 axes to 1 mm isotropic;
+    "fake" the voxels kept but called 1 mm, so a 16 mm patch is always 16^3 voxels with one weight set (= a Conv3d
+    patch embedding, nnFoundation's native-voxel pretraining). -> (x, spacing [3] floats)."""
+    mode, sp = os.environ.get("SFC_RESPACE", ""), [float(z) for z in spacing[:3]]
+    if not mode:
+        return x, sp
+    assert mode in ("1mm", "fake"), mode
+    if mode == "1mm":   # ponytail: trilinear, no antialiasing on downsampling (nnU-Net's spline has none either)
+        size = [max(1, round(n * z)) for n, z in zip(x.shape[-3:], sp)]
+        x = F.interpolate(x.float().reshape(1, 1, *x.shape[-3:]), size=size, mode="trilinear",
+                          align_corners=False).reshape(*x.shape[:-3], *size)
+    return x, [1.0, 1.0, 1.0]
 
 
 def open_image(path: str | Path):
