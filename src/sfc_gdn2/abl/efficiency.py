@@ -41,14 +41,27 @@ BASE = f"{RUNS}/tune/p28_final/gp_main/lejepa-9270a0b6e4/encoder_step024000.pt"
 OURS = {"small": (SMALL, {}, None), "base": (BASE, {}, None),
         "large": (SMALL, {}, {"d_model": 2048, "depth": 8, "num_heads": 32, "attn_every": 2}),
         "small_8mm": (SMALL, {"patch_mm": 8}, None), "small_4mm": (SMALL, {"patch_mm": 4}, None)}
-EXTERNAL = ["openmind_resencl_mae", "bsf_ukb_pretrain", "openmind_primusm_mae", "nnfoundation_vit"]
+EXTERNAL = ["openmind_resencl_mae", "bsf_ukb_pretrain", "openmind_primusm_mae", "nnfoundation_vit",
+            # (02/11, user: the rest of the benchmark on the Pareto)
+            "nnunet_totalseg_mr_870", "brainiac", "fomo26", "nnfoundation_cnn", "medicalnet_resnet50_23dataset",
+            "openmind_resencl_simclr", "bsf_atlas_pretrain"]
 # external wrapper -> its encoder modules (what is timed / counted; Primus' decoder head up_projection is not)
 # the timed pass runs twice over the volumes: enc_s / feat_s the first time (after the warm-up: a volume of a new
 # length may still meet a Triton compile / autotune), enc_s2 / feat_s2 the second (steady state); memory: the second
 REPS = (1, 2)
 ENCODER = {"openmind": lambda w: [w.network.down_projection, w.network.eva] if w.is_primus else [w.network.encoder],
            "nnfoundation": lambda w: [w.network.down_projection, w.network.eva] if w.is_primus else [w.network.encoder],
-           "brainsegfounder": lambda w: [w.swin]}
+           "brainsegfounder": lambda w: [w.swin],
+           # the trained network nnU-Net's predictor runs (features' _Replay swap only replays recorded maps)
+           "nnunet": lambda w: [w.predictor.network.encoder],
+           "brainiac": lambda w: [w.model.backbone],   # MONAI ViT-B/16 at 96^3
+           "fomo26": lambda w: [w.model.encoder],      # resenc_unet_b's encoder, called by _encode (late fusion)
+           # MedicalNet ResNet-50: the backbone, without the conv_seg head (its forward runs it after layer4)
+           "medicalnet": lambda w: [getattr(w.model, n) for n in ("conv1", "bn1", "relu", "maxpool", "layer1", "layer2",
+                                                                  "layer3", "layer4")]}
+# encoder calls per volume in the benchmark's features() that repeat the same forward: time and FLOPs divided by it
+# (BrainIAC's features runs backbone(x) and model(x) = backbone(x)[0][:, 0], two identical forwards)
+REPEAT = {"brainiac": 2}
 
 
 def volumes(task: str, n: int) -> list[str]:
@@ -136,7 +149,7 @@ def external(job: dict) -> None:
         t = sync_time()
         out = w.features(p)
         r["feat_s" + sfx] = sync_time() - t
-        r["enc_s" + sfx], r["calls"] = hooks.t, hooks.calls
+        r["enc_s" + sfx], r["calls"] = hooks.t / REPEAT.get(cfg["model"], 1), hooks.calls
         r["peak_gb"] = torch.cuda.max_memory_allocated() / 2**30
         r["act_gb"] = (torch.cuda.max_memory_allocated() - base) / 2**30
         r["meta"] = {k: out["meta"].get(k) for k in ("input_shape", "preprocessed_shape", "padded_shape", "patch_size",
@@ -147,11 +160,12 @@ def external(job: dict) -> None:
         for p, r in zip(preps, rows):
             hooks.flops = 0
             w.features(p)
-            r["flops_counter"] = hooks.flops
+            r["flops_counter"] = hooks.flops / REPEAT.get(cfg["model"], 1)
     except Exception as e:   # noqa: BLE001 (an env whose torch lacks a usable flop counter: latency / memory only)
         print(f"{job['name']}: FlopCounterMode failed: {e!r}", flush=True)
     s = summary(job["name"], rows, params, {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
-                                            "encoder_modules": [type(m).__name__ for m in mods]})
+                                            "encoder_modules": [type(m).__name__ for m in mods],
+                                            "repeat_divisor": REPEAT.get(cfg["model"], 1)})
     Path(job["out"]).write_text(json.dumps({"summary": s, "volumes": rows}, indent=1, default=str))
     print(json.dumps(s), flush=True)
 
