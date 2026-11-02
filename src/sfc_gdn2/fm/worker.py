@@ -158,6 +158,55 @@ def main(job_path: str) -> None:
             (out / "_failed" / f"{item_id}.txt").unlink(missing_ok=True)
         except Exception:  # noqa: BLE001 -- logged per item, the shard goes on
             fail(out, item_id, traceback.format_exc())
+    def emit(w, cfg, out, it, res, t_pre, t_feat):   # one result: CPU, background write, progress line
+        nonlocal done
+        res = to_cpu(trim(res, cfg.get("save")))
+        res |= {"id": it["id"], "image": it["image"]}
+        dst = out / f"{it['id']}.pt"
+        while len(pending) >= 2:
+            pending.pop(0).result()
+        pending.append(saver.submit(save, res, dst, out, it["id"]))
+        done += 1
+        shapes = {k: tuple(v.shape) for k, v in res["features"].items() if isinstance(v, torch.Tensor)}
+        print(f"[fm] {cfg['model']} {it['id']}: {shapes} canonical={res['canonical']} pre={t_pre:.1f}s "
+              f"net={t_feat:.1f}s -> {dst}", flush=True)
+
+    def one(it, x, t_pre):   # every wrapper on one item, as before
+        for i, (w, cfg, out) in enumerate(zip(wrappers, cfgs, outs)):
+            if (out / f"{it['id']}.pt").exists() and not job.get("overwrite"):
+                continue
+            try:
+                t0 = time.time()
+                res = w.finish(x if i == len(wrappers) - 1 else copy.deepcopy(x))
+                emit(w, cfg, out, it, res, t_pre, time.time() - t0)
+            except Exception:  # noqa: BLE001 -- logged per item, the shard goes on
+                fail(out, it["id"], traceback.format_exc())
+
+    # (02/11) SFC_BATCH_TOKENS > 0: one model with features_batch reads several volumes per call, up to that many 16 mm
+    # tokens (padded: batch x the largest grid); a failed batch falls back to one by one
+    budget = int(os.environ.get("SFC_BATCH_TOKENS", "0"))
+    batched = budget > 0 and len(wrappers) == 1 and hasattr(lead, "features_batch")
+    buf = []
+
+    def flush():
+        if not buf:
+            return
+        t0 = time.time()
+        try:
+            res = lead.features_batch([x for _, x, _ in buf])
+        except Exception:  # noqa: BLE001 -- the batch one by one, each failure logged per item
+            print(f"[fm] batch of {len(buf)} failed, one by one:\n{traceback.format_exc()}", flush=True)
+            for b in buf:
+                one(*b)
+            buf.clear()
+            return
+        dt = (time.time() - t0) / len(buf)
+        for (it, _, t_pre), r in zip(buf, res):
+            r.setdefault("derived", [])
+            emit(lead, cfgs[0], outs[0], it, r | {"model": cfgs[0].get("model"), "provenance": lead.provenance()}, t_pre, dt)
+        print(f"[fm] batch of {len(buf)}: {dt:.2f}s per volume", flush=True)
+        buf.clear()
+
     for it, x, err, t_pre in prepared(lead, cfgs[0], items, workers):
         if workers > 0 and not err and hasattr(lead, "preprocess_gpu"):
             try:
@@ -170,25 +219,14 @@ def main(job_path: str) -> None:
             for o in outs:
                 fail(o, it["id"], err)
             continue
-        for i, (w, cfg, out) in enumerate(zip(wrappers, cfgs, outs)):
-            dst = out / f"{it['id']}.pt"
-            if dst.exists() and not job.get("overwrite"):
-                continue
-            try:
-                t0 = time.time()
-                res = w.finish(x if i == len(wrappers) - 1 else copy.deepcopy(x))
-                t_feat = time.time() - t0
-                res = to_cpu(trim(res, cfg.get("save")))
-                res |= {"id": it["id"], "image": it["image"]}
-                while len(pending) >= 2:
-                    pending.pop(0).result()
-                pending.append(saver.submit(save, res, dst, out, it["id"]))
-                done += 1
-                shapes = {k: tuple(v.shape) for k, v in res["features"].items() if isinstance(v, torch.Tensor)}
-                print(f"[fm] {cfg['model']} {it['id']}: {shapes} canonical={res['canonical']} pre={t_pre:.1f}s "
-                      f"net={t_feat:.1f}s -> {dst}", flush=True)
-            except Exception:  # noqa: BLE001 -- logged per item, the shard goes on
-                fail(out, it["id"], traceback.format_exc())
+        if not batched:
+            one(it, x, t_pre)
+            continue
+        tok = lambda b: int(b[1]["grid"].prod())
+        if buf and (len(buf) + 1) * max(tok((None, x)), *(tok(b) for b in buf)) > budget:
+            flush()
+        buf.append((it, x, t_pre))
+    flush()
     for f in pending:
         f.result()
     saver.shutdown()

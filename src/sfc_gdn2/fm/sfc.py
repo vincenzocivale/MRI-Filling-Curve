@@ -1020,58 +1020,85 @@ def multigrain(enc, curves: list, seed: int, vol: torch.Tensor, sp: torch.Tensor
     copy of h) -> g<mm>:mean, g<mm>:std_b<k>, g<mm>:tricov_b<k>, ... (covariance); a level the scan cannot
     hold (cells under 8 voxels, nothing left) repeats the level above (`above`: the 16 mm ones, same names).
     bench.probe concatenates the levels."""
+    return multigrain_batch(enc, curves, seed, [vol], [sp], thr, [above], [keep])[0]
+
+
+def multigrain_batch(enc, curves: list, seed: int, vols: list, sps: list, thr: float, aboves: list, keeps: list) -> list:
+    """`multigrain` of several volumes (02/11): each level reads the cells of every volume in one encoder call per curve
+    (their groups packed back to back, cu_seqlens), the same per volume as one by one."""
     from ..curves import grid_coords, keys
     from ..data.volume import patch_dims, patch_grid, patchify
 
     assert enc.bidir != "late", "multigrain: one-stream encoders (bi = h ++ h)"
-    dev, d, pe, mm0 = vol.device, enc.dim, enc.patch_embed, enc.patch_embed.patch_mm
+    dev, d, pe, mm0 = vols[0].device, enc.dim, enc.patch_embed, enc.patch_embed.patch_mm
     names = ["", *(f"_b{t + 1}" for t in enc.taps)]
-    out, prev, budget, kp, gp = {}, None, None, None, None   # prev: the level above's cell scores (-inf: not a parent)
+    B = len(vols)
+    outs = [{} for _ in range(B)]
+    st = [{"prev": None, "on": True} for _ in range(B)]   # prev: the level above's cell scores (-inf: not a parent)
     for mm in FINE:
-        k = patch_dims(sp.tolist(), mm)
-        g = _dt(patch_grid(vol.shape, k).tolist(), dev)
-        p = patchify(vol, k)
-        xyz = grid_coords(g[None], len(p))[0]
-        if prev is None:   # 8 mm: every cell
-            sel = torch.arange(len(p), device=dev)
-        else:              # the children of the top parents, at most `budget` cells
-            par = torch.minimum(((xyz + 0.5) * _dt(k, dev) / _dt(kp, dev)).long(), gp - 1)
-            pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
-            order = prev.argsort(descending=True)
-            n = torch.bincount(pidx, minlength=len(prev))[order].cumsum(0)
-            top = order[(n <= budget) & (prev[order] > -torch.inf)]
-            sel = torch.isin(pidx, top).nonzero()[:, 0]
-        if not fine_ok(k) or not len(sel) or len(sel) > MIX_MAX:   # (whole-body scans at 8 mm: the level above's)
-            prev = None
+        reads = []   # (volume, x [cells, d], q, g, lab, fg, p, sel, k)
+        for i, (vol, sp) in enumerate(zip(vols, sps)):
+            if not st[i]["on"]:
+                continue
+            k = patch_dims(sp.tolist(), mm)
+            g = _dt(patch_grid(vol.shape, k).tolist(), dev)
+            p = patchify(vol, k)
+            xyz = grid_coords(g[None], len(p))[0]
+            prev = st[i]["prev"]
+            if prev is None:   # 8 mm: every cell
+                sel = torch.arange(len(p), device=dev)
+            else:              # the children of the top parents, at most `budget` cells
+                kp, gp = st[i]["kp"], st[i]["gp"]
+                par = torch.minimum(((xyz + 0.5) * _dt(k, dev) / _dt(kp, dev)).long(), gp - 1)
+                pidx = (par[:, 0] * gp[1] + par[:, 1]) * gp[2] + par[:, 2]
+                order = prev.argsort(descending=True)
+                n = torch.bincount(pidx, minlength=len(prev))[order].cumsum(0)
+                top = order[(n <= st[i]["budget"]) & (prev[order] > -torch.inf)]
+                sel = torch.isin(pidx, top).nonzero()[:, 0]
+            if not fine_ok(k) or not len(sel) or len(sel) > MIX_MAX:   # (whole-body scans at 8 mm: the level above's)
+                st[i]["on"] = False
+                continue
+            q, fg = xyz[sel], p[sel].mean(1) > thr
+            lab = SegNet._groups(q, g) if len(sel) < len(p) else torch.zeros(len(sel), dtype=torch.long, device=dev)
+            pe.patch_mm = mm
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                x = pe(p[sel], pe.weights(sp, k))
+            reads.append((i, x, q, g, lab, fg, p, sel, k))
+        if not reads:
             break
-        q, fg = xyz[sel], p[sel].mean(1) > thr
-        nfg, fg = int(fg.sum()), fg if fg.any() else torch.ones_like(fg)
-        lab = SegNet._groups(q, g) if len(sel) < len(p) else torch.zeros(len(sel), dtype=torch.long, device=dev)
-        pe.patch_mm = mm
-        h = 0
+        hs = [0] * len(reads)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            x = pe(p[sel], pe.weights(sp, k))
-            cu = torch.cat([lab.new_zeros(1), torch.bincount(lab).cumsum(0)]).int()
-            for c in curves:
-                kk = keys(c, q, g, seed)
-                o = (lab * (int(kk.max()) + 1) + kk).argsort()
-                h = h + enc.flat(x[o], cu, pos=q[o]).float()[o.argsort()]
+            for c in curves:   # every volume's groups in one call: groups back to back, volume after volume
+                xs, ps, cus, os_, base = [], [], [], [], 0
+                for _, x, q, g, lab, *_ in reads:
+                    kk = keys(c, q, g, seed)
+                    o = (lab * (int(kk.max()) + 1) + kk).argsort()
+                    xs.append(x[o]), ps.append(q[o]), os_.append(o)
+                    cus.append(torch.bincount(lab).cumsum(0) + base)
+                    base += len(x)
+                cu = torch.cat([cus[0].new_zeros(1), *cus]).int()
+                h = enc.flat(torch.cat(xs), cu, pos=torch.cat(ps)).float()
+                for r, (o, hh) in enumerate(zip(os_, h.split([len(x) for x in xs]))):
+                    hs[r] = hs[r] + hh[o.argsort()]
         pe.patch_mm = mm0
-        if keep is not None:   # fm/dense_dec: each level's cells read and their tokens (the decoder's multigrain input)
-            keep[mm] = (q.short().cpu(), (h / len(curves)).half().cpu(), list(k))
-        h = h[fg] / len(curves)
-        for j, nm in enumerate(names):
-            s, m = torch.std_mean(h[:, j * d: (j + 1) * d], 0, correction=0)
-            out[f"g{int(mm)}:mean{nm}"], out[f"g{int(mm)}:std{nm}"] = m.half(), s.half()
-            out[f"g{int(mm)}:tricov{nm}"] = tricov(h[:, j * d: (j + 1) * d])
-        prev = torch.full((len(p),), -torch.inf, device=dev)
-        prev[sel[fg]] = p[sel[fg]].float().std(1)
-        budget, kp, gp = max(nfg, 1), k, g
-    for mm in FINE:   # the levels not read: the level above's
-        for nm, v in above.items():
-            if f"g{int(mm)}:{nm}" not in out:
-                out[f"g{int(mm)}:{nm}"] = out.get(f"g{int(mm) * 2}:{nm}", v)
-    return out
+        for (i, x, q, g, lab, fg, p, sel, k), h in zip(reads, hs):
+            nfg, fg = int(fg.sum()), fg if fg.any() else torch.ones_like(fg)
+            if keeps[i] is not None:   # fm/dense_dec: each level's cells read and their tokens (the decoder's multigrain input)
+                keeps[i][mm] = (q.short().cpu(), (h / len(curves)).half().cpu(), list(k))
+            h = h[fg] / len(curves)
+            for j, nm in enumerate(names):
+                s_, m = torch.std_mean(h[:, j * d: (j + 1) * d], 0, correction=0)
+                outs[i][f"g{int(mm)}:mean{nm}"], outs[i][f"g{int(mm)}:std{nm}"] = m.half(), s_.half()
+                outs[i][f"g{int(mm)}:tricov{nm}"] = tricov(h[:, j * d: (j + 1) * d])
+            prev = torch.full((len(p),), -torch.inf, device=dev)
+            prev[sel[fg]] = p[sel[fg]].float().std(1)
+            st[i] |= {"prev": prev, "budget": max(nfg, 1), "kp": k, "gp": g}
+    for out, above in zip(outs, aboves):
+        for mm in FINE:   # the levels not read: the level above's
+            for nm, v in above.items():
+                if f"g{int(mm)}:{nm}" not in out:
+                    out[f"g{int(mm)}:{nm}"] = out.get(f"g{int(mm) * 2}:{nm}", v)
+    return outs
 
 
 def checkpoint_path(path: str | Path, step: int | None = None) -> Path:
@@ -1235,42 +1262,62 @@ class SFC(Wrapper):
 
     @torch.no_grad()
     def features(self, prepared: dict) -> dict:
+        return self.features_batch([prepared])[0]
+
+    @torch.no_grad()
+    def features_batch(self, preps: list) -> list:
+        """(02/11) several volumes in one encoder call: their 16 mm tokens packed (encoder_extractor, any grid / spacing,
+        no resampling); the same features as one by one. One patch size per call (else one by one)."""
         from ..data.volume import patchify
 
         dev = torch.device(self.device)
         self.extractor()   # built (and the encoder) before its kernel takes this volume's patch size
         pe = self._extract_enc.patch_embed
-        pe.patch_mm = prepared["meta"].get("patch_mm", pe.patch_mm)
-        a, c = prepared["value"]
-        k, grid = prepared["k"], prepared["grid"]
-        vol = prepared["volume"].to(dev).float() * a + c
-        x = patchify(vol, k.tolist())
-        out = self.extractor()({"patches": [x], "grid": grid[None].to(dev), "k": k[None].to(dev),
-                                "spacing": prepared["spacing"][None].to(dev)})
+        mms = {p["meta"].get("patch_mm", pe.patch_mm) for p in preps}
+        if len(mms) > 1:
+            return [r for p in preps for r in self.features_batch([p])]
+        pe.patch_mm = mms.pop()
+        vols, xs = [], []
+        for p in preps:
+            a, c = p["value"]
+            vols.append(p["volume"].to(dev).float() * a + c)
+            xs.append(patchify(vols[-1], p["k"].tolist()))
+        out = self.extractor()({"patches": xs, "grid": torch.stack([p["grid"] for p in preps]).to(dev),
+                                "k": torch.stack([p["k"] for p in preps]).to(dev),
+                                "spacing": torch.stack([p["spacing"] for p in preps]).to(dev)})
         d, n = self._dim, len(self._taps) + 1
 
         def block(v, j):  # [..., 2dn] = fwd (last block, taps) ++ bwd (same) -> block j's fwd ++ bwd [..., 2d]
             return torch.cat([v[..., j * d: (j + 1) * d], v[..., (n + j) * d: (n + j + 1) * d]], -1)
 
-        bi, g = block(out["bi"][0, : len(x)], 0), grid.tolist()
-        feats = {"map": bi.T.reshape(bi.shape[1], *g), "fg": out["fg"][0, : len(x)].view(*g)}  # last block's tokens
-        for stat in ("mean", "std"):  # per block: last (no suffix), taps (_b<block>)
-            feats |= {stat + ("" if j == 0 else f"_b{self._taps[j - 1] + 1}"): block(out[stat][0], j) for j in range(n)}
-        # multigrain (27/10): the head features below 16 mm; off for another patch size (args.patch_mm) or encoder none
-        if self.args.get("multigrain", True) and not self.args.get("patch_mm") and self.args.get("encoder") != "none":
-            above = {s: v[: self._dim].half() for s, v in feats.items() if s.startswith(("mean", "std"))}
-            fgk = out["fg"][0, : len(x)]   # 16 mm covariances per block, foreground tokens (exact: bench.probe.second_order)
-            fgk = fgk if fgk.any() else torch.ones_like(fgk)
-            for j in range(n):
-                nm = "" if j == 0 else f"_b{self._taps[j - 1] + 1}"
-                feats[f"tricov{nm}"] = above[f"tricov{nm}"] = tricov(block(out["bi"][0, : len(x)], j)[fgk, : self._dim])
-            if pe.patch_mm == self.run_cfg["data"]["patch_mm"]:
-                feats |= multigrain(self._extract_enc, self.curves, int(self.run_cfg["seed"]), vol,
-                                    prepared["spacing"].to(dev), self.run_cfg["objective"].get("fg_threshold", 0.05), above)
-            else:   # read at fallback_mm (whole-body scans): every level repeats it
-                feats |= {f"g{int(m)}:{s}": v for m in FINE for s, v in above.items()}
-        return {"features": feats, "canonical": "mean", "derived": [],
-                "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt)}}
+        res, fine = [], []
+        for i, (prepared, vol, x) in enumerate(zip(preps, vols, xs)):
+            grid = prepared["grid"]
+            bi, g = block(out["bi"][i, : len(x)], 0), grid.tolist()
+            feats = {"map": bi.T.reshape(bi.shape[1], *g), "fg": out["fg"][i, : len(x)].view(*g)}  # last block's tokens
+            for stat in ("mean", "std"):  # per block: last (no suffix), taps (_b<block>)
+                feats |= {stat + ("" if j == 0 else f"_b{self._taps[j - 1] + 1}"): block(out[stat][i], j) for j in range(n)}
+            # multigrain (27/10): the head features below 16 mm; off for another patch size (args.patch_mm) or encoder none
+            if self.args.get("multigrain", True) and not self.args.get("patch_mm") and self.args.get("encoder") != "none":
+                above = {s: v[: self._dim].half() for s, v in feats.items() if s.startswith(("mean", "std"))}
+                fgk = out["fg"][i, : len(x)]   # 16 mm covariances per block, foreground tokens (exact: bench.probe.second_order)
+                fgk = fgk if fgk.any() else torch.ones_like(fgk)
+                for j in range(n):
+                    nm = "" if j == 0 else f"_b{self._taps[j - 1] + 1}"
+                    feats[f"tricov{nm}"] = above[f"tricov{nm}"] = tricov(block(out["bi"][i, : len(x)], j)[fgk, : self._dim])
+                if pe.patch_mm == self.run_cfg["data"]["patch_mm"]:
+                    fine.append((i, vol, prepared["spacing"].to(dev), above))
+                else:   # read at fallback_mm (whole-body scans): every level repeats it
+                    feats |= {f"g{int(m)}:{s}": v for m in FINE for s, v in above.items()}
+            res.append({"features": feats, "canonical": "mean", "derived": [],
+                        "meta": prepared["meta"] | {"curves": self.curves, "checkpoint": str(self.ckpt)}})
+        if fine:   # the finer levels of every volume of the batch, packed per level
+            mg = multigrain_batch(self._extract_enc, self.curves, int(self.run_cfg["seed"]), [f[1] for f in fine],
+                                  [f[2] for f in fine], self.run_cfg["objective"].get("fg_threshold", 0.05),
+                                  [f[3] for f in fine], [None] * len(fine))
+            for (i, *_), m in zip(fine, mg):
+                res[i]["features"] |= m
+        return res
 
     def provenance(self) -> dict:
         return super().provenance() | {"checkpoint": str(self.ckpt), "torch": torch.__version__,
