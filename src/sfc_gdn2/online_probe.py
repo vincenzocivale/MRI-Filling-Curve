@@ -168,7 +168,7 @@ def idh(w, enc, seed, cache: Path, save: Path, mm: float = 16.0, part: tuple[int
         x, sp = r["x"].cuda().float(), r["sp"].float().cuda()
         X, g, k, xr = _tokens(enc, seed, x, sp, mm)
         fg = F.avg_pool3d(_pad(xr[0], g, k)[None, None], k)[0, 0].flatten() > 0.05
-        feats.append(X[fg if fg.any() else slice(None)][:, cols].float().mean(0).cpu())
+        feats.append(X[fg.cpu() if fg.any() else slice(None)][:, cols].float().mean(0).cpu())
     if part is not None:   # one share of the volumes (several GPUs): features only, the fit runs on the merge
         torch.save({"ids": list(rows["id"].iloc[list(sel)]), "idx": list(sel), "of": part[1],
                     "feats": torch.stack(feats).half()}, save.with_suffix(f".part{part[0]}.pt"))
