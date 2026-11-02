@@ -998,7 +998,7 @@ def wsums(logits: torch.Tensor, lab: torch.Tensor, w: torch.Tensor, k: int) -> l
             (w[:, None] * p).sum(0), (w[:, None] * oh).sum(0)]
 
 
-FINE = (8.0, 4.0, 2.0)   # multigrain levels below the 16 mm extraction
+FINE = tuple(float(g) for g in os.environ.get("SFC_FINE", "8,4,2").split(","))   # multigrain levels below the 16 mm extraction (02/11: SFC_FINE=8 for the 16+8 reading)
 
 
 def tricov(t: torch.Tensor) -> torch.Tensor:
