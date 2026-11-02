@@ -146,6 +146,18 @@ def main(job_path: str) -> None:
           f"{job.get('workers', 0)} preprocessing workers", flush=True)
     done = 0
     workers = int(job.get("workers", 0))
+    # (02/11) the writes in a background thread: a Large file is ~55 MB and on a busy Lustre the write took ~3 s against
+    # ~0.8 s of GPU per volume; at most 2 writes in flight (host RAM)
+    saver, pending = cf.ThreadPoolExecutor(1), []
+
+    def save(res, dst, out, item_id):
+        try:
+            tmp = dst.with_suffix(".tmp")
+            torch.save(res, tmp)
+            os.replace(tmp, dst)
+            (out / "_failed" / f"{item_id}.txt").unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 -- logged per item, the shard goes on
+            fail(out, item_id, traceback.format_exc())
     for it, x, err, t_pre in prepared(lead, cfgs[0], items, workers):
         if workers > 0 and not err and hasattr(lead, "preprocess_gpu"):
             try:
@@ -168,16 +180,18 @@ def main(job_path: str) -> None:
                 t_feat = time.time() - t0
                 res = to_cpu(trim(res, cfg.get("save")))
                 res |= {"id": it["id"], "image": it["image"]}
-                tmp = dst.with_suffix(".tmp")
-                torch.save(res, tmp)
-                os.replace(tmp, dst)
-                (out / "_failed" / f"{it['id']}.txt").unlink(missing_ok=True)
+                while len(pending) >= 2:
+                    pending.pop(0).result()
+                pending.append(saver.submit(save, res, dst, out, it["id"]))
                 done += 1
                 shapes = {k: tuple(v.shape) for k, v in res["features"].items() if isinstance(v, torch.Tensor)}
                 print(f"[fm] {cfg['model']} {it['id']}: {shapes} canonical={res['canonical']} pre={t_pre:.1f}s "
-                      f"net={t_feat:.1f}s {dst.stat().st_size / 2**20:.1f}MB -> {dst}", flush=True)
+                      f"net={t_feat:.1f}s -> {dst}", flush=True)
             except Exception:  # noqa: BLE001 -- logged per item, the shard goes on
                 fail(out, it["id"], traceback.format_exc())
+    for f in pending:
+        f.result()
+    saver.shutdown()
     print(f"[fm] done: {done} files written", flush=True)
 
 
