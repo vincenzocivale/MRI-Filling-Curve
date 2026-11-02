@@ -56,7 +56,6 @@ TILE_CELLS = 10
 LES_MM = 0.0   # tile_rule: half the p95 foreground extent; a lesion-centred tile holds it whole (Patches.sample)
 AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
-REFRESH = 125   # fm/dense_dec CubeDec: iterations between the training scans' cube refreshes
 SLIDE_BATCH = int(os.environ.get("SFC_SLIDE_BATCH", "4"))   # sliding: tiles per forward (halved on OOM)
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
@@ -171,8 +170,6 @@ def tile_of(patch, align, k: int = 2):
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch)."""
     lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
-    if getattr(net, "cube", False) and not net.preparing and ctx is not None:   # fm/dense_dec cubes: placed on this scan
-        net.prepare(x, ctx, lambda: sliding(net, x, patch, n_out, amp, ctx))
     S = tuple(x.shape[1:])
     patch = S if patch is None else tuple(min(p, s) for p, s in zip(patch, S)) if getattr(net, "any_tile", False) \
         else tuple(patch)
@@ -195,7 +192,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
             with amp():
                 cx = None if ctx is None else torch.stack(
                     [torch.cat([ctx.float(), torch.tensor(t, dtype=torch.float)]) if corner else ctx for t in part])
-                lg = call(net, torch.stack([xp[(slice(None), *sl)] for sl in sls]), cx)   # fm/dense_dec: tokens by corner
+                lg = call(net, torch.stack([xp[(slice(None), *sl)] for sl in sls]), cx)   # fm/hier_dec: tokens by corner
         except torch.cuda.OutOfMemoryError:
             if bs == 1:
                 raise
@@ -256,13 +253,13 @@ def focal_heatmap(logits: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
 
 
 def sel_target(net, y) -> None:
-    """fm/dense_dec CubeDec: the labels of the tiles the next forward trains its selector on."""
+    """fm/hier_dec: the labels of the tiles the next forward trains its P(mixed) selector on."""
     if hasattr(net, "sel_y"):
         net.sel_y = y
 
 
 def pop_aux(net):
-    """The auxiliary loss the last forward left (CubeDec's selector), 0 otherwise."""
+    """The auxiliary loss the last forward left (hier_dec's selector, deep supervision), 0 otherwise."""
     a = getattr(net, "aux", 0.0)
     if hasattr(net, "aux"):
         net.aux = 0.0
@@ -590,7 +587,7 @@ def train(job: dict) -> None:
             ctx = torch.cat([ctx, torch.tensor([float(vid[it["id"]])])])
             if hasattr(tcache, "ensure"):   # LiveCache: its levels read and written now if the folder lacks them
                 tcache.ensure(it["id"], r["x"], r["ctx"])
-        if hasattr(net, "vol_stats"):   # fm/dense_dec CubeDec: z-score per scan on its nonzero voxels (nnU-Net's)
+        if hasattr(net, "vol_stats"):   # fm/hier_dec HierUNet: z-score per scan on its nonzero voxels (nnU-Net's)
             nz = r["x"][r["x"] != 0].float()
             net.vol_stats[vid[it["id"]]] = (float(nz.mean()), float(nz.std()) + 1e-6)
         v = {"x": r["x"], "y": r["y"], "grid_from_gt": r["grid_from_gt"], "id": it["id"], "ctx": ctx,
@@ -606,13 +603,11 @@ def train(job: dict) -> None:
 
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
-    if hasattr(net, "plan"):   # fm/dense_dec CubeDec: the task's fingerprint (training scans) -> strides and fine levels
+    if hasattr(net, "plan"):   # fm/hier_dec HierUNet: the task's fingerprint (training scans) -> strides
         net.plan([it["id"] for it in split["train"]])
     # on disk as the run goes, so a killed job resumes: the training state every 10 min (.last.pt), the best state
     # until the test is written (.best.pt), the test volumes done (.test.json)
     out_p = Path(job["out"])
-    if hasattr(net, "cube_dir"):   # fm/dense_dec cubes: the training scans' cubes kept next to the result (resumes reload them)
-        net.cube_dir = out_p.with_suffix(".cubes")
     ckpt, last, part = (out_p.with_suffix(s) for s in (".best.pt", ".last.pt", ".test.json"))
     out_p.parent.mkdir(parents=True, exist_ok=True)
     # + the wrapper's whole config and the tile rule: a run of another decoder in the same folder is never resumed
@@ -665,16 +660,6 @@ def train(job: dict) -> None:
                 torch.cuda.set_rng_state(state["cuda_rng"])
             best, curve, start, t0 = state["best"], state["curve"], state["it"] + 1, t0 - state["min"] * 60
             print(f"[seg] resumed from {last} at iter {state['it']} ({state['min']:.1f} min done)", flush=True)
-            if hasattr(net, "on_val"):   # fm/dense_dec cubes: the training scans' cubes live in RAM, placed again
-                net.eval()
-                net.on_val(0, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
-                           lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv), resume=True)
-        elif hasattr(net, "fit_selector"):   # fm/dense_dec CubeDec: the selector's probe, then the first cubes
-            net.fit_selector([(xv, yv, cv) for (xv, yv, _), cv in zip(data.vols, data.ctx)],
-                             [(v["x"], v["y"], v["ctx"]) for v in val_v])
-            net.eval()
-            net.on_val(0, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
-                       lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv))
         t_save = time.time()
 
         def save_last(it: int) -> None:
@@ -734,8 +719,6 @@ def train(job: dict) -> None:
                                                               + "\n\n" + buf.getvalue())
                     print(f"[seg] profile: {head} -> {out_p.with_suffix('.prof.txt')}", flush=True)
                     return
-            if hasattr(net, "refresh") and it % REFRESH == 0:   # fm/dense_dec CubeDec: cubes from the selector's maps
-                net.refresh([(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)], it)
             ta = time.time()
             x, y, c = queue.pop(0).result()
             if it + len(queue) < iters:
@@ -821,9 +804,6 @@ def train(job: dict) -> None:
                     best = {"val": val, "iter": it, "score": score, "state": trained()} | \
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
                         ({"val_f1": rec["val_f1"]} if "val_f1" in rec else {})
-                if hasattr(net, "on_val"):   # fm/dense_dec cubes: the next fine level placed on the training scans
-                    net.on_val(it, every, [(xv, cv) for (xv, _, _), cv in zip(data.vols, data.ctx)],
-                               lambda xv, cv: sliding(net, xv.to(dev).float(), patch, k, amp, cv))
                 set_mode()
                 pat = int(job.get("patience") or 0)   # screening: once learning (> 0), no new best for `pat` validations,
                 # never before 60 % of the budget (CMB p20 d4 Dmix, 24/10: F1 .018 / .024 then 0, learns after 7500)

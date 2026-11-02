@@ -42,6 +42,17 @@ LIVE_ZSCORE = __import__("os").environ.get("SFC_LIVE_ZSCORE") == "1"   # HierUNe
 ALPHAS = (1.0, 0.5, 0.0)   # HierUNet v9: the U-Net head's weight in the mix with the token head, chosen on val
 
 
+def block(a: int, b: int, stride: int = 1) -> nn.Sequential:
+    """HierUNet's stage (CubeDec's, fm/dense_dec until 02/11): two 3^3 convs, InstanceNorm, LeakyReLU (nnU-Net's)."""
+    return nn.Sequential(nn.Conv3d(a, b, 3, stride, 1), nn.InstanceNorm3d(b, affine=True), nn.LeakyReLU(0.01, True),
+                         nn.Conv3d(b, b, 3, 1, 1), nn.InstanceNorm3d(b, affine=True), nn.LeakyReLU(0.01, True))
+
+
+def _up(u: nn.ConvTranspose3d, h: torch.Tensor, st) -> torch.Tensor:
+    """The transposed conv with this plan's stride per axis (kernel = stride: an axis not halved keeps one tap)."""
+    return F.conv_transpose3d(h, u.weight[:, :, : st[0], : st[1], : st[2]], u.bias, stride=tuple(st))
+
+
 def axis_taps(s: float, rank: int, dev, r: float = R_MM) -> torch.Tensor:
     """[2J + 1, rank]: per tap (voxels at offsets -J..J of spacing s mm, the window [-r, r] mm centred on the voxel) the
     integral of each B-spline (on the window) over the tap voxel's part of the window, in mm (midpoint rule, 0.02 mm)."""
@@ -404,7 +415,6 @@ class HierUNet(HierDec):
 
     def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
         super().__init__(encoder, cache, n_out, curves, seed)
-        from .dense_dec import block
         del self.stem, self.head, self.head2, self.out   # no CK-convs
         self.TAUS, self.read_taus = ALPHAS, [0.5]   # segrun's threshold pass chooses the heads' mix (alpha) here
         # no per-cell LayerNorm on the field (30/10: every read cell at the same norm, small details amplified, slow start;
@@ -437,7 +447,6 @@ class HierUNet(HierDec):
         print(f"[seg] hier_unet plan: strides {self.cum[1]} / {self.cum[2]}", flush=True)
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        from .dense_dec import CubeDec
         from .segrun import loss_fn
         if self.grid is None:   # no plan (no training scan in the cache yet): CubeDec's default strides
             self.grid = [(0, tuple(self.cum[2]))] * 2 + [(1, (1, 1, 1))] * 2
@@ -475,14 +484,14 @@ class HierUNet(HierDec):
         f1 = self.e1(f0)
         hm = self.mid(torch.cat([self.e2(f1), fc], 1))
         st = [b // a for a, b in zip(self.cum[1], self.cum[2])]
-        h1 = self.d1(torch.cat([CubeDec._up(self.u1, hm, st), f1, F.avg_pool3d(ff, self.cum[1], self.cum[1])], 1))
+        h1 = self.d1(torch.cat([_up(self.u1, hm, st), f1, F.avg_pool3d(ff, self.cum[1], self.cum[1])], 1))
         if ys is not None:
             if not lm:   # deep supervision, nnU-Net's weights 0.5, 0.25; the token head's own loss
                 for w, hd, head, s in ((0.5, h1, self.ds[0], self.cum[1]), (0.25, hm, self.ds[1], self.cum[2])):
                     aux = aux + w * loss_fn(head(hd).float(), _down_fg(ys, s, self.out.out_channels), self.out.out_channels)
                 aux = aux + loss_fn(tok, ys, self.out.out_channels)
             self.aux, self.sel_y = aux, None
-        h = self.d0(torch.cat([CubeDec._up(self.u0, h1, self.cum[1]), f0, ff], 1))
+        h = self.d0(torch.cat([_up(self.u0, h1, self.cum[1]), f0, ff], 1))
         o = self.out(h)
         if lm or self.training:   # training: segrun's loss on the U-Net head (the token head's is in aux)
             return o[:, :, : T0[0], : T0[1], : T0[2]]

@@ -142,7 +142,7 @@ def multigrain_batch(enc, curves: list, seed: int, vols: list, sps: list, thr: f
         pe.patch_mm = mm0
         for (i, x, q, g, lab, fg, p, sel, k), h in zip(reads, hs):
             nfg, fg = int(fg.sum()), fg if fg.any() else torch.ones_like(fg)
-            if keeps[i] is not None:   # fm/dense_dec: each level's cells read and their tokens (the decoder's multigrain input)
+            if keeps[i] is not None:   # each level's cells read and their tokens (fm/dense_dec's input until 02/11)
                 keeps[i][mm] = (q.short().cpu(), (h / len(curves)).half().cpu(), list(k))
             h = h[fg] / len(curves)
             for j, nm in enumerate(names):
@@ -255,22 +255,8 @@ class SFC(Wrapper):
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else f"random{os.environ.get('SFC_ENC_SEED', '')}", "taps": list(enc.taps),
                              "curves": list(self.curves), "blocks": None}
             return net, ["encoder"], SEG_PATCH
-        if a.get("dense_dec"):   # fm/dense_dec (28/10): the dense control decoder on the cached 16 / 8 mm tokens
-            from .dense_dec import CubeDec, DenseDec, NativeDec
-            tc = str(a["token_cache"]).removeprefix("live:")
-            if a.get("dense_native"):   # tokens at the U-Net stage of their own resolution (user 28/10)
-                net = NativeDec(enc, tc, n_out, a.get("dense_mg"), bool(a.get("dense_notok")), bool(a.get("dense_cubes")),
-                                self.curves, int(self.run_cfg["seed"]))
-            elif a.get("dense_cubes"):   # simpleA + the cubes (3 stages, user 28/10)
-                net = CubeDec(enc, str(a["token_cache"]), n_out, self.curves, int(self.run_cfg["seed"]))
-            else:
-                net = DenseDec(enc, tc, n_out, a.get("dense_mg"), float(a.get("dense_width") or 1), bool(a.get("dense_4mm")),
-                               bool(a.get("dense_sub")), bool(a.get("dense_notok")))
-            net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else f"random{os.environ.get('SFC_ENC_SEED', '')}", "taps": list(enc.taps),
-                             "curves": list(self.curves), "blocks": None}
-            return net, ["encoder"], SEG_PATCH
-        raise ValueError("sfc segmentation: args.hier_dec / args.hier_unet (fm/hier_dec.py) or args.dense_dec; Dmix (SegNet) "
-                         "was removed on 02/11 (in git before that date)")
+        raise ValueError("sfc segmentation: args.hier_dec / args.hier_unet (fm/hier_dec.py); Dmix (SegNet) and the dense "
+                         "decoders (fm/dense_dec.py) were removed on 02/11 (in git before that date)")
 
     def extractor(self):
         if self._extract is None:
