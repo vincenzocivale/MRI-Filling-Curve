@@ -169,14 +169,10 @@ def tile_of(patch, align, k: int = 2):
 
 @torch.no_grad()
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Tensor:
-    """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch); ours (fm/sfc.SegNet,
-    the cascade) the whole scan in one pass, coarse to fine."""
+    """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch)."""
     lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
     if getattr(net, "cube", False) and not net.preparing and ctx is not None:   # fm/dense_dec cubes: placed on this scan
         net.prepare(x, ctx, lambda: sliding(net, x, patch, n_out, amp, ctx))
-    if getattr(net, "cascade", False) and ctx is not None:
-        with amp():
-            return net.landmark_predict(x, ctx.to(x.device), n_out) if lm else net.cascade_predict(x, ctx.to(x.device), n_out)
     S = tuple(x.shape[1:])
     patch = S if patch is None else tuple(min(p, s) for p, s in zip(patch, S)) if getattr(net, "any_tile", False) \
         else tuple(patch)
@@ -279,14 +275,8 @@ def landmark_step(net, x, y, c, amp, dev) -> torch.Tensor:
     parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
         [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
     parts = [(a, heatmaps(b.to(dev), a.shape[2:]), u) for a, b, u in parts]   # the maps on the GPU (heat_spec)
-    if getattr(net, "cascade", False):   # ours: every tile in one call, the cascade's levels read for all at once (24/10)
-        with amp():
-            loss = net.landmark_sums([a.to(dev).float() for a, _, _ in parts], [b for _, b, _ in parts],
-                                     [u.to(dev) for _, _, u in parts], parts[0][1].shape[1] + 1)
-        loss.backward()
-        return loss.detach()
     tot = 0.0
-    for xi, yi, ci in parts:   # the other models: one scan at a time
+    for xi, yi, ci in parts:   # one scan at a time
         sel_target(net, (yi.amax(1) > 0.1).to(torch.uint8))
         with amp():
             lg = call(net, xi.to(dev).float(), ci)
@@ -305,19 +295,14 @@ def landmark(p: torch.Tensor) -> torch.Tensor:
 def mre_on(pred: torch.Tensor, y: torch.Tensor, spacing, k: int) -> float:
     """Landmarks: mean radial error (mm) between the GT centroid of each class present in the GT and the predicted point,
     on the model grid (canonical: axis permutations / flips of the native voxels, so distances are the world's).
-    pred: class probabilities [k, *S] -> landmark() (every landmark gets a point); labels [*S] (the cascade's val
-    pass) -> centroid of the class, a class not predicted counts MISS_MM."""
+    pred: class probabilities [k, *S] -> landmark() (every landmark gets a point)."""
     sp = torch.as_tensor(spacing, dtype=torch.float, device=pred.device)
     err = []
     for c in range(1, k):
         g = (y == c).nonzero().float()
         if not len(g):
             continue
-        if pred.dim() == y.dim() + 1:
-            err.append(float(((g.mean(0) - landmark(pred[c])) * sp).norm()))
-            continue
-        q = (pred == c).nonzero().float()
-        err.append(float(((g.mean(0) - q.mean(0)) * sp).norm()) if len(q) else MISS_MM)
+        err.append(float(((g.mean(0) - landmark(pred[c])) * sp).norm()))
     return float(np.mean(err)) if err else float("nan")
 
 
@@ -471,25 +456,9 @@ def group_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
 
 
 def sums_loss(t: list) -> torch.Tensor:
-    """SegNet.cascade_sums' sums -> CE per voxel + 1 - mean soft Dice of the classes > 0 (loss_fn's)."""
+    """batch_sums' sums (summed over calls) -> CE per voxel + 1 - mean soft Dice of the classes > 0 (loss_fn's)."""
     ce, n, inter, psum, tsum = t
     return ce / n.clamp_min(1) + 1 - ((2 * inter[1:] + 1e-5) / (psum[1:] + tsum[1:] + 1e-5)).mean()
-
-
-def cascade_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
-    """Ours (fm/sfc.SegNet, the Dmix cascade): the point head's loss plus head_w x each level head's, one backward; tiles
-    of several shapes in one call (24/10: the levels read for all of them at once)."""
-    if isinstance(x, list):
-        x, y, c = [t.to(dev).float() for t in x], [u.to(dev) for u in y], [v.to(dev) for v in c]
-    else:
-        x, y, c = x.to(dev).float(), y.to(dev), c.to(dev)
-    with amp():
-        fin, aux = net.cascade_sums(x, y, c, k)
-    loss = sums_loss(fin) + net.head_w * sum(sums_loss(a) for a in aux)
-    if getattr(net, "_rloss", None) is not None:   # cascade_rank: the ranker's ListNet (its own parameters)
-        loss, net._rloss = loss + net._rloss, None
-    loss.backward()
-    return loss.detach()
 
 
 def loss_fn(logits: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
@@ -591,13 +560,10 @@ def train(job: dict) -> None:
     # the true points: the task's points csv (id, i, j, k: GT voxels) when given, else the label's components' centroids
     # (2 mm spheres closer than ~4 mm merge: ~3 % of the cmbpts lesions, Ettore 28/10)
     PTS = read_points(job["items"][0]["points"]) if DET and job["items"][0].get("points") else None
-    net.lm_prior = float(os.environ.get("SFC_LM_PRIOR", "0"))   # landmark_predict: + the level heads' log-sigmoid (diagnosis)
-    if getattr(net, "cascade", False):   # our decoder trains on large tiles (whole scans mostly): 16 cells of 16 mm per
-        global TILE_CELLS, TILE_MAX         # axis, capped by voxels only (no dense logits: points)
-        TILE_CELLS, TILE_MAX = 16, 3e8 * k
-    if hasattr(net, "tile_max"):   # fm/dense_dec: dense activations, tiles of ~160^3 voxels on the token grid
+    if hasattr(net, "tile_max"):   # fm/hier_dec: dense activations, tiles of ~160^3 voxels on the token grid
+        global TILE_MAX
         TILE_MAX = net.tile_max(k)
-    # token cache (SegNet args.token_cache): tiles start on each volume's 16 mm grid and pass (volume, corner) in ctx
+    # token cache (args.token_cache, fm/hier_dec): tiles start on each volume's 16 mm grid and pass (volume, corner) in ctx
     tcache = getattr(net, "cache", None)
     vid = {it["id"]: n for n, it in enumerate(job["items"])}
     if tcache is not None:
@@ -779,9 +745,6 @@ def train(job: dict) -> None:
             if LM:
                 loss = landmark_step(net, x, y, c, amp, dev)
                 logits = torch.zeros(1, device=dev)
-            elif getattr(net, "cascade", False):
-                loss = cascade_step(net, x, y, c, k, amp, dev)
-                logits = torch.zeros(1, device=dev)
             elif isinstance(x, list) and getattr(net, "any_tile", False):   # tiles of several shapes, grouped by shape
                 loss = group_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
@@ -818,24 +781,16 @@ def train(job: dict) -> None:
             tm["data"], tm["step"] = tm["data"] + tb - ta, tm["step"] + tc - tb
             if it % every == 0 or it == iters:
                 net.eval()
-                if getattr(net, "cascade", False) and not LM:   # one pass: the levels' thresholds on val and the val predictions
-                    preds = net.cascade_val(val_v, k, amp)
-                    if getattr(net, "crank", False):   # cascade_rank: the same val pass with the ranker's order (logged only)
-                        net.cuse = "rank"
-                        try:
-                            rds = [dice_on(p, v["y"].to(dev), k) for p, v in zip(net.cascade_val(val_v, k, amp), val_v)]
-                        finally:
-                            net.cuse = "mixed"
-                else:   # probabilities kept for the landmark tasks (a point per landmark from each class's map)
-                    # labels: argmax scan by scan, only the labels kept (31/10: TotalSeg's ~50-class whole-body
-                    # probabilities of every val scan held at once, on the GPU when they fit, ran out of memory)
-                    lab = (lambda p: p.to(dev)) if job.get("select") == "mre" else (lambda p: p.argmax(0).to(dev))
-                    preds = [lab(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])) for v in val_v]
+                # probabilities kept for the landmark tasks (a point per landmark from each class's map); labels: argmax
+                # scan by scan, only the labels kept (31/10: TotalSeg's ~50-class whole-body probabilities of every val
+                # scan held at once, on the GPU when they fit, ran out of memory)
+                lab = (lambda p: p.to(dev)) if job.get("select") == "mre" else (lambda p: p.argmax(0).to(dev))
+                preds = [lab(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])) for v in val_v]
                 ds = [dice_on(p.argmax(0) if p.dim() == 4 else p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
                 val = float(np.nanmean(ds))
                 rec = {"iter": it, "loss": lsum[0] / max(lsum[1], 1), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
-                if not LM and not getattr(net, "cascade", False):   # user 30/10: the Dice on a few training scans too (overfit)
+                if not LM:   # user 30/10: the Dice on a few training scans too (overfit)
                     trp = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).argmax(0).to(dev) for v in tr_v]
                     rec["train_dice"] = float(np.nanmean([dice_on(p, v["y"].to(dev), k) for p, v in zip(trp, tr_v)]))
                     msg = f"train dice {rec['train_dice']:.4f} " + msg
@@ -846,10 +801,6 @@ def train(job: dict) -> None:
                                                                     True) for c in range(1, k)]))
                         msg = f"train F1 {rec['train_f1']:.3f} " + msg
                     del trp
-                if getattr(net, "crank", False) and getattr(net, "cascade", False) and not LM:
-                    rec |= {"val_dice_vol": [float(d) for d in ds], "rank_dice_vol": [float(d) for d in rds],
-                            "rank_dice": float(np.nanmean(rds))}
-                    msg += f" rank dice {rec['rank_dice']:.4f}"
                 if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
                     mre = float(np.mean([mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
                     rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
@@ -888,25 +839,6 @@ def train(job: dict) -> None:
         # the last iteration's state kept too (user 30/10: never delete checkpoints; diagnosis of the val's choice)
         torch.save({"key": key, "it": it, "state": trained()}, out_p.with_suffix(".final.pt"))
         last.unlink(missing_ok=True)
-    if LM and getattr(net, "ctopk_eval", None) and "lm_topk" not in best:
-        # landmark cascade (user, 24/10): the cells per landmark scaled on the val MRE of the best state, once (x1 is the
-        # selection's own pass; x0.5 and x2 two more), kept for the test
-        load_trained(best["state"])
-        net.eval()
-        val_v, t0k = [load(it) for it in split["val"]], list(net.ctopk_eval)
-        by = {1.0: best["val_mre"]}
-        for f in (0.5, 2.0):
-            net.ctopk_eval = [max(1, round(t * f)) for t in t0k]
-            by[f] = float(np.mean([mre_on(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).to(dev),
-                                          v["y"].to(dev), v["sp"], k) for v in val_v]))
-        f = min(by, key=lambda t: (by[t], t))
-        best |= {"lm_topk": [max(1, round(t * f)) for t in t0k], "val_mre": by[f],
-                 "mre_by_topk": {"x" + str(t): m for t, m in sorted(by.items())}}
-        net.ctopk_eval = best["lm_topk"]
-        print(f"[seg] landmark cells per level {best['lm_topk']}: val MRE {by[f]:.2f} mm "
-              f"({' '.join(f'x{t}:{m:.2f}' for t, m in sorted(by.items()))})", flush=True)
-        del val_v
-        torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     if hasattr(net, "read_taus") and not LM and "read_tau" not in best:
         # fm/hier_dec (user 30/10): the read threshold for the test chosen on val with the best state, one pass (every
         # cell read, each threshold a mask: the decoder returns their log-probabilities side by side), by the task's own
@@ -945,8 +877,6 @@ def train(job: dict) -> None:
         if job.get("save_pred"):   # the best state's val predictions kept anyway (user, 24/10: lesion counts on val)
             load_trained(best["state"])
             net.eval()
-            if "lm_topk" in best:
-                net.ctopk_eval = best["lm_topk"]
             pv = out_p.with_suffix(".pred_val")
             for it in split["val"]:
                 if not (pv / f"{it['id']}.npz").exists():
@@ -964,22 +894,6 @@ def train(job: dict) -> None:
         return
     load_trained(best.pop("state"))
     net.eval()
-    if os.environ.get("SFC_CASCADE_ORACLE") and getattr(net, "cascade", False) and not LM:
-        # diagnosis (user 27/10): the val Dice / lesion F1 with the cascade as trained and with an oracle gate (every truly
-        # mixed cell read down, the thresholds as calibrated) -> how much the gate loses; nothing written but the log
-        val_v = [load(it) for it in split["val"]]
-        for net.oracle in (False, True):
-            preds = net.cascade_val(val_v, k, amp)
-            dv = float(np.nanmean([dice_on(p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]))
-            pc = [_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), False) for p, v in zip(preds, val_v)], False)
-                  for c in range(1, k)]
-            f1 = [_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), True) for p, v in zip(preds, val_v)], True)
-                  for c in range(1, k)]
-            print(f"[seg] oracle gate {net.oracle}: val Dice {dv:.4f}, pooled per class {np.round(pc, 4).tolist()}, "
-                  f"lesion F1 per class {np.round(f1, 4).tolist()}, refined {net.last_refined:.4f}", flush=True)
-        return
-    if "lm_topk" in best:   # the val-chosen cells per landmark for the test and the saved val predictions
-        net.ctopk_eval = best["lm_topk"]
     rule, f1 = {}, "det" if DET else job.get("select") == "f1"
     pv = out_p.with_suffix(".pred_val")
     if not LM:   # val predictions of the best state -> the post-processing rule (chosen on val only)
@@ -1009,7 +923,6 @@ def train(job: dict) -> None:
         rule = choose_postproc(vals, k, sizes, f1)
         del vals
     tkey = key | {"best_iter": best["iter"], "postproc": {str(c): r for c, r in rule.items()}} | \
-        ({"lm_topk": best["lm_topk"]} if "lm_topk" in best else {}) | \
         ({"read_tau": best["read_tau"]} if "read_tau" in best else {})   # (only when chosen: other runs' partial tests resume)
     done = json.loads(part.read_text()) if part.exists() else {}
     res = done["res"] if done.get("key") == tkey else {"per_volume": [], "per_class": [], "test_ids": []}

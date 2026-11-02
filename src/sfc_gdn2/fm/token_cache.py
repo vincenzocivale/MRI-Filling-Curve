@@ -3,22 +3,19 @@ frozen encoder on every tile at three resolutions.
 
 Per volume and level (16, 8, 4 mm) the tokens of the whole scan on nested grids: the cell is k4 = round(4 / spacing)
 voxels per axis at 4 mm, 2 k4 at 8 mm, 4 k4 at 16 mm, so a tile whose corner sits on the 16 mm grid holds whole
-cells of every level. Each token is the encoder's reading along each curve of the run (averaged), as SegNet's: at
-every level as last block ++ the decoder's taps (the width SegNet.proj takes; each decoder keeps its channels). A scan
+cells of every level. Each token is the encoder's reading along each curve of the run (averaged): at every level as
+last block ++ the decoder's taps (each decoder keeps its channels). A scan
 whose grid holds more than `nmax` tokens is read in windows of `block` cells per axis with `margin` cells of context
 on every side, keeping each window's centre (TotalSeg whole-body at 4 mm: ~5e6 tokens); the 4 mm level only where
 fine_ok. Stored as <out>/<id>.<mm>.<curve>.npy [gx, gy, gz, C] fp16 + <out>/<id>.json {k4, spacing, shape}; <curve>
 is one curve read alone or `mean` (the curves' average); a file without the tag (caches before 24/10) is the mean.
-The decoder reads the mean; main() writes other curves only if job["curves"] {mm: [names]} asks (each read once).
-
-    python -m sfc_gdn2.fm.token_cache <job.json>   {inputs, ids, out, checkpoint, args, shard, nmax, block, margin,
-                                                    curves, random: the seeded random encoder, for the random-encoder baseline}
+The decoder reads the mean. Written live by LiveCache ("live:<folder>", fm/hier_dec) as segrun loads each scan (the
+separate cache job, main(), removed 02/11 with Dmix).
 """
 from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -50,7 +47,7 @@ class TokenCache:
         self.root, self.ids, self._fd, self._pool = Path(root), [], {}, ThreadPoolExecutor(32)
         self._io, self._ahead, self.levels, self._meta, self._gen = ThreadPoolExecutor(16), {}, (16.0,), {}, 0
         self._recent = {}
-        self.sig = None    # {checkpoint, taps, curves, pretrained} of the reading encoder (SegNet sets it), checked once
+        self.sig = None    # {checkpoint, taps, curves, pretrained} of the reading encoder (seg_net sets it), checked once
 
     def check(self) -> None:
         """The folder's tokens are this encoder's (27/10: a folder's tokens of another encoder went unnoticed): <root>/cache.json written by the LiveCache that starts the folder, else compared; folders started
@@ -89,8 +86,8 @@ class TokenCache:
         self._ahead = {k: v for k, v in self._ahead.items() if v[0] >= self._gen - keep - 1}
 
     def prefetch(self, ctx: torch.Tensor, T) -> None:
-        """Start reading the tokens a batch of tiles will ask for (ctx rows as SegNet takes them, tiles of T voxels)
-        while the current batch trains: the levels in `self.levels` (set by SegNet)."""
+        """Start reading the tokens a batch of tiles will ask for (ctx rows as segrun builds them, tiles of T voxels)
+        while the current batch trains: the levels in `self.levels` (set by the decoder)."""
         for r in ctx.tolist():
             i, corner = self.ids[int(r[6])], [int(v) for v in r[7:10]]
             V = [max(1, min(int(e) - c, t)) for e, c, t in zip(r[3:6], corner, T)]
@@ -182,34 +179,6 @@ def read(encoder, curves, seed, x, sp, k, mm, nmax, block, margin, taps: bool, w
     return out if want else out["mean"]
 
 
-def main(path: str) -> None:
-    from .api import load_config
-    from .sfc import SFC
-
-    job = json.loads(Path(path).read_text())
-    cfg = load_config("configs/fm/sfc_gdn2.yaml")
-    cfg["checkpoint"], cfg["args"] = job["checkpoint"], job.get("args", {})
-    w = SFC(cfg, "cuda")
-    if job.get("random"):   # the random-encoder baseline reads tokens of a random encoder (seeded), not the trained one
-        torch.manual_seed(0)
-    net = w.seg_net(2, pretrained=not job.get("random"))[0].cuda().eval()   # the decoder's taps, the run's curves
-    enc, curves, seed = net.encoder, net.enc_curves, net.seed
-    out = Path(job["out"])
-    out.mkdir(parents=True, exist_ok=True)
-    i0, n = (int(v) for v in job.get("shard", "0/1").split("/"))
-    ids = sorted(job["ids"])[i0::n]
-    cv = {float(m): list(v) for m, v in (job.get("curves") or {}).items()}
-    print(f"[cache] curves per level {cv or 'mean'}", flush=True)
-    for c, i in enumerate(ids):
-        lv = [(mm, m) for mm, m in LEVELS if mm >= float(job.get("min_mm", 4))]
-        if (out / f"{i}.json").exists() and all(level_file(out, i, mm, w).exists() for mm, _ in lv for w in cv.get(mm, ["mean"])):
-            continue
-        r = torch.load(Path(job["inputs"]) / f"{i}.pt", map_location="cpu", weights_only=False)
-        k4 = write_volume(enc, curves, seed, r["x"], r["ctx"], out, i, cv, float(job.get("min_mm", 4)),
-                          job.get("nmax", 200_000), job.get("block", 64), job.get("margin", 8))
-        print(f"[cache] {c + 1}/{len(ids)} {i} k4 {list(k4)}", flush=True)
-
-
 def write_volume(enc, curves, seed, x, ctx, out: Path, i: str, cv: dict, min_mm: float = 4.0,
                  nmax: int = 200_000, block: int = 64, margin: int = 8) -> list:
     """Volume i's levels >= min_mm (cv: {mm: curves}, else the mean) and <out>/<i>.json, written last (the volume's
@@ -234,14 +203,11 @@ def write_volume(enc, curves, seed, x, ctx, out: Path, i: str, cv: dict, min_mm:
     os.replace(tmp, out / f"{i}.json")
     return k4
 
-if __name__ == "__main__":
-    main(sys.argv[1])
-
 
 class LiveCache(TokenCache):
     """A TokenCache that writes the volumes it lacks itself (24/10, user: the cache live, on $FAST; no separate cache
     job): segrun calls ensure() as it loads each volume, which reads the missing levels with the job's frozen encoder
-    exactly as main() (the decoder's last ++ taps, the curves' mean) and writes them to the folder, so later
+    (the decoder's last ++ taps, the curves' mean) and writes them to the folder, so later
     runs (seeds, other tasks on the same volumes) only read. token_cache "live:<folder>"."""
 
     def __init__(self, root, net):
