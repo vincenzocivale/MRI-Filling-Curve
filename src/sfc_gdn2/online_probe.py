@@ -67,8 +67,8 @@ def _pad(v, g, k):
 
 
 POS = {"wmh_seg": lambda y: y == 1, "cow_seg": lambda y: (y > 0) & (y != 255),   # Willis: any vessel class
-       "prostate_lesion": lambda y: (y > 0) & (y != 255)}
-KEEP = {"wmh_seg": lambda y: (y != 255) & (y != 2), "cow_seg": lambda y: y != 255, "prostate_lesion": lambda y: y != 255}
+       "prostate_lesion": lambda y: (y > 0) & (y != 255), "heart_seg": lambda y: (y > 0) & (y != 255)}   # heart: any class
+KEEP = {"wmh_seg": lambda y: (y != 255) & (y != 2), "cow_seg": lambda y: y != 255, "prostate_lesion": lambda y: y != 255, "heart_seg": lambda y: y != 255}
 
 
 def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
@@ -252,6 +252,8 @@ def main() -> None:
             res["cow"] = wmh(enc, seed, a.mm, a.limit, "cow_seg")
         if "prostate" in a.tasks:   # (02/11) prostate lesions (ADC), same probe
             res["prostate"] = wmh(enc, seed, a.mm, a.limit, "prostate_lesion")
+        if "heart" in a.tasks:   # (02/11, W6) HVSMR, heart (any class) vs not, same probe
+            res["heart"] = wmh(enc, seed, a.mm, a.limit, "heart_seg")
         if "idh" in a.tasks:
             res["idh"] = idh(w, enc, seed, Path(a.cache), Path(a.out).with_suffix(".idh.pt"), a.idh_mm,
                              a.idh_part and tuple(a.idh_part))
