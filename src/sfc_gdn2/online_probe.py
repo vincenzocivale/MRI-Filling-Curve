@@ -66,8 +66,9 @@ def _pad(v, g, k):
     return F.pad(v, [p for n, gg, kk in zip(reversed(v.shape), reversed(g), reversed(k)) for p in (0, gg * kk - n)])
 
 
-POS = {"wmh_seg": lambda y: y == 1, "cow_seg": lambda y: (y > 0) & (y != 255)}      # Willis: any vessel class
-KEEP = {"wmh_seg": lambda y: (y != 255) & (y != 2), "cow_seg": lambda y: y != 255}
+POS = {"wmh_seg": lambda y: y == 1, "cow_seg": lambda y: (y > 0) & (y != 255),   # Willis: any vessel class
+       "prostate_lesion": lambda y: (y > 0) & (y != 255)}
+KEEP = {"wmh_seg": lambda y: (y != 255) & (y != 2), "cow_seg": lambda y: y != 255, "prostate_lesion": lambda y: y != 255}
 
 
 def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
@@ -112,10 +113,7 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
         W = torch.stack([torch.linalg.solve(xtx + al * scale * eye, xty) for al in ALPHAS], 1)   # [nb, alphas, d+1, S^3]
         dice = torch.zeros(nb, len(ALPHAS), len(THRESH), device="cuda")
         th = THRESH.cuda()[:, None]
-        dvs = []   # per val volume [blocks, alphas, thresholds]: bootstrap intervals downstream (02/11)
-        for i in ids["val"]:     # pass 2: predicted per volume, Dice per (block, alpha, threshold)
-            r = load(i)
-            x, sp, y = r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda()
+        def vol_dice(x, sp, y, mm=mm, dice=dice, W=W, SB=SB, th=th):   # Dice of one val volume per (block, alpha, threshold), on the native voxels of y
             X, g, k, xr = _tokens(enc, seed, x, sp, mm)
             keep = KEEP[task](y)
             gt = POS[task](y)[keep]
@@ -127,7 +125,7 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
                     if xr.shape[1:] == y.shape:
                         p = F.interpolate(p[None, None], size=[gg * kk for gg, kk in zip(g, k)], mode="trilinear",
                                           align_corners=False)[0, 0][: y.shape[0], : y.shape[1], : y.shape[2]]
-                    else:   # resampled input: from the sub-grid straight to the native voxels (Dice there)
+                    else:   # resampled or thickened input: from the sub-grid straight to the native voxels (Dice there)
                         e = [round(n * SB / kk) for n, kk in zip(xr.shape[1:], k)]
                         p = F.interpolate(p[: e[0], : e[1], : e[2]][None, None], size=list(y.shape), mode="trilinear",
                                           align_corners=False)[0, 0]
@@ -135,6 +133,11 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
                     pos = p[None] > th
                     tp = (pos & gt).sum(1).float()
                     dv[bi, ai] = 2 * tp / (pos.sum(1) + gt.sum()).clamp_min(1)
+            return dv
+        dvs = []   # per val volume [blocks, alphas, thresholds]: bootstrap intervals downstream (02/11)
+        for i in ids["val"]:     # pass 2: predicted per volume, Dice per (block, alpha, threshold)
+            r = load(i)
+            dv = vol_dice(r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda())
             dice += dv
             dvs.append(dv.flatten().cpu())
         dice /= len(ids["val"])
@@ -144,6 +147,18 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
                              "last": round(float(best[0]), 4),
                              "per_block": {str(b): round(float(v), 4) for b, v in zip(order, best)},
                              "vols": [round(float(d[ib]), 4) for d in dvs], "ids": ids["val"]}
+        for f in [float(v) for v in os.environ.get("SFC_PROBE_THICK", "").split(",") if v]:
+            # (02/11) the same head (block, ridge, threshold chosen above) on val slices made f times thicker: the thickest axis
+            # averaged (a thicker acquisition, nothing interpolated), Dice on the original mask
+            vt = []
+            for i in ids["val"]:
+                r = load(i)
+                x, sp, y = r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda()
+                a = int(sp.argmax()); size = list(x.shape[1:]); size[a] = max(1, round(size[a] / f))
+                sp2 = sp.clone(); sp2[a] = sp[a] * x.shape[1 + a] / size[a]
+                vt.append(float(vol_dice(F.adaptive_avg_pool3d(x[None], size)[0], sp2, y).flatten()[ib]))
+            out[f"{int(mm)}_t{f:g}"] = {"best": round(sum(vt) / len(vt), 4), "vols": [round(v, 4) for v in vt]}
+            print(f"[online] {task} {mm:g} mm, slices x{f:g}: Dice {sum(vt) / len(vt):.3f} (same head)", flush=True)
         print(f"[online] {task} {mm:g} mm: Dice best {out[str(int(mm))]['best']:.3f} (block {out[str(int(mm))]['block']}), "
               f"last block {out[str(int(mm))]['last']:.3f}, {time.time() - t0:.0f} s", flush=True)
     out["volumes"] = {s: len(v) for s, v in ids.items()}
@@ -235,6 +250,8 @@ def main() -> None:
             res["wmh"] = wmh(enc, seed, a.mm, a.limit)
         if "cow" in a.tasks:   # ablation B (02/11): Willis, vessel vs not, same ridge probe as WMH
             res["cow"] = wmh(enc, seed, a.mm, a.limit, "cow_seg")
+        if "prostate" in a.tasks:   # (02/11) prostate lesions (ADC), same probe
+            res["prostate"] = wmh(enc, seed, a.mm, a.limit, "prostate_lesion")
         if "idh" in a.tasks:
             res["idh"] = idh(w, enc, seed, Path(a.cache), Path(a.out).with_suffix(".idh.pt"), a.idh_mm,
                              a.idh_part and tuple(a.idh_part))
