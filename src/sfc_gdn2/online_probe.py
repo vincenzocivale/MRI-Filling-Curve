@@ -227,7 +227,7 @@ def main() -> None:
     cfg["checkpoint"], cfg["args"] = a.ckpt, {"curves": ["raster"]}
     w = SFC(cfg, "cuda")
     enc = w._encoder().cuda().eval().requires_grad_(False)
-    enc.taps, enc.depth = TAPS, None
+    enc.taps, enc.depth = (() if os.environ.get("SFC_PROBE_LAST") else TAPS), None   # last block only: no taps (Small has 8 blocks)
     seed = int(w.run_cfg["seed"])
     res = {"ckpt": str(a.ckpt), "step": int(Path(a.ckpt).stem.split("step")[-1]) if "step" in Path(a.ckpt).stem else None}
     with torch.no_grad():
