@@ -105,12 +105,14 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
         W = torch.stack([torch.linalg.solve(xtx + al * scale * eye, xty) for al in ALPHAS], 1)   # [nb, alphas, d+1, S^3]
         dice = torch.zeros(nb, len(ALPHAS), len(THRESH), device="cuda")
         th = THRESH.cuda()[:, None]
+        dvs = []   # per val volume [blocks, alphas, thresholds]: bootstrap intervals downstream (02/11)
         for i in ids["val"]:     # pass 2: predicted per volume, Dice per (block, alpha, threshold)
             r = load(i)
             x, sp, y = r["x"].cuda().float(), r["ctx"][:3].float().cuda(), r["y"].cuda()
             X, g, k, xr = _tokens(enc, seed, x, sp, mm)
             keep = KEEP[task](y)
             gt = POS[task](y)[keep]
+            dv = torch.zeros_like(dice)
             for bi in range(nb):
                 Xb = _block(X, bi)
                 for ai in range(len(ALPHAS)):
@@ -123,12 +125,16 @@ def wmh(enc, seed, mms, limit: int = 0, task: str = "wmh_seg") -> dict:
                     p = p[keep]
                     pos = p[None] > th
                     tp = (pos & gt).sum(1).float()
-                    dice[bi, ai] += 2 * tp / (pos.sum(1) + gt.sum()).clamp_min(1)
+                    dv[bi, ai] = 2 * tp / (pos.sum(1) + gt.sum()).clamp_min(1)
+            dice += dv
+            dvs.append(dv.flatten().cpu())
         dice /= len(ids["val"])
+        ib = int(dice.flatten().argmax())   # the val-best (block, alpha, threshold): its Dice per volume
         best = dice.flatten(1).amax(1)   # per block, over ridge strength and threshold (chosen on val)
         out[str(int(mm))] = {"best": round(float(best.max()), 4), "block": order[int(best.argmax())],
                              "last": round(float(best[0]), 4),
-                             "per_block": {str(b): round(float(v), 4) for b, v in zip(order, best)}}
+                             "per_block": {str(b): round(float(v), 4) for b, v in zip(order, best)},
+                             "vols": [round(float(d[ib]), 4) for d in dvs], "ids": ids["val"]}
         print(f"[online] {task} {mm:g} mm: Dice best {out[str(int(mm))]['best']:.3f} (block {out[str(int(mm))]['block']}), "
               f"last block {out[str(int(mm))]['last']:.3f}, {time.time() - t0:.0f} s", flush=True)
     out["volumes"] = {s: len(v) for s, v in ids.items()}
