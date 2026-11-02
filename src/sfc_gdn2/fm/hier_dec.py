@@ -366,12 +366,15 @@ class HierDec(nn.Module):
         cells = order[p]
         mm0, pe.patch_mm = pe.patch_mm, mm
         hs, grp, tot, at = [], [], 0, 0
+        # (02/11) SEQ_MAX assumed 16 heads: the Large has 32 (Triton 'invalid argument', grid axis sequences x heads > 65535)
+        nh = max(getattr(getattr(b, "mix", None), "num_heads", 0) or getattr(b, "h", 0) for b in self.encoder.blocks)
+        smax = min(SEQ_MAX, 65535 // max(nh, 1))
         try:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 wts, q = pe.weights(sp, k), g[cells]
                 oe = om[gi, p]                                                # the open places among those read
                 for i in range(len(lens) + 1):
-                    if grp and (i == len(lens) or tot + lens[i] > LIVE_MAX or len(grp) >= SEQ_MAX):
+                    if grp and (i == len(lens) or tot + lens[i] > LIVE_MAX or len(grp) >= smax):
                         # embedded per call and only the open places kept (31/10: TotalSeg, every cell mixed, ran
                         # out of memory with the whole group's read cells embedded at once)
                         cu = torch.tensor([0] + grp, device=dev).cumsum(0).to(torch.int32)
