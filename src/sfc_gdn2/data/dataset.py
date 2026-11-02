@@ -173,6 +173,11 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, sessions, seed: int 
     sizes = [n_patch(tuple(map(int, s.split("x"))), tuple(map(float, z.split("x"))), budget_mm)
              for s, z in zip(rows["shape"], rows["spacing"])]
     weights = mix_weights(rows, data.get("mix_by", ["dataset", "modality"]), float(data.get("mix_alpha", 1.0)))
+    for name, share in (data.get("mix_share") or {}).items():   # (02/11, W6) dataset `name` drawn with this share of scans
+        w = torch.ones(len(rows), dtype=torch.float64) if weights is None else weights
+        m = torch.from_numpy((rows["dataset"] == name).to_numpy())
+        w[m] *= share / (1 - share) * w[~m].sum() / w[m].sum()
+        weights = w
     ds = PatchDataset(rows, data["patch_mm"], sizes)
     plan = BudgetBatches(sizes, int(data["patches_per_batch"]), batch_size, seed, sessions, weights, rank, world)
     return ScanBatches(ds, plan, **common)
