@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -38,9 +39,14 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=1500)
     ap.add_argument("--val-every", type=int, default=50)
     ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--lr-warm", type=float, default=0.1, help="fraction of the iterations of linear lr warm-up")
+    ap.add_argument("--l2", type=float, default=1.0, help="the starting head's L2, the same for every model (strong: "
+                    "the encoder must adapt, 04/11); -1 = the table's chosen L2")
     ap.add_argument("--enc-lr", type=float, default=1.0)
-    ap.add_argument("--smooth", type=float, default=0.1, help="label smoothing of the fine-tuning CE")
+    ap.add_argument("--smooth", type=float, default=0.0, help="label smoothing of the fine-tuning CE")
+    ap.add_argument("--light", action="store_true", help="ours: one curve (hilbert, ablation C) and 16 + 8 mm "
+                    "(ablation R) instead of the table's reading; the frozen probe then refitted on the L2 grid")
     ap.add_argument("--warm", type=float, default=0.0)
     ap.add_argument("--patience", type=int, default=6, help="validations without a new best before stopping (0: off)")
     ap.add_argument("--subset", type=int, default=0, help="pilot: the first n train volumes, n // 2 val and test")
@@ -62,9 +68,13 @@ def main() -> None:
     y, classes = targets(rows, cfg)
     items = [{"id": r["id"], "image": r["input"], "split": r["split"], "y": int(v)}
              for (_, r), v in zip(rows.iterrows(), y.tolist())]
+    if a.light:   # the reading's knobs reach the model's env through the environment (fm/sfc FINE, probe._grains)
+        assert a.model.startswith("sfc_gdn2"), "--light: ours"
+        os.environ |= {"SFC_FINE": "8", "SFC_READ_GRAINS": "16,8"}
+        a.fm_set = [*a.fm_set, "args.curves=[hilbert]"]
     fm = override(load_config(f"configs/fm/{a.model}.yaml"), a.fm_set)
     out = Path(a.out) / a.task / f"{a.model}.json"
-    cache = str(Path(CACHE) / f"{a.model}_t")   # (04/11) the table reading's inputs (ours: the extraction's dict)
+    cache = str(Path(CACHE) / f"{a.model}_t")   # (the same inputs for both readings: the extraction's dict)   # (04/11) the table reading's inputs (ours: the extraction's dict)
     print(f"[clsft] {a.model} {a.task}: {len(items)} volumes, classes {classes}", flush=True)
     if a.stage in ("all", "prep"):
         run_in_env(fm["env"], "sfc_gdn2.fm.clsrun", {"stage": "prep", "cfg": fm, "cache": cache, "items": items,
@@ -81,8 +91,10 @@ def main() -> None:
         run_in_env(fm["env"], "sfc_gdn2.fm.clsrun",
                    {"stage": "train", "cfg": fm, "cache": cache, "items": items, "device": "cuda", "out": str(out),
                     "iters": a.iters, "val_every": a.val_every, "batch": a.batch, "lr": a.lr, "enc_lr": a.enc_lr,
-                    "warm": a.warm, "seed": a.seed, "feature": table["feature"], "head": table["head"],
-                    "l2": table["l2"], "smooth": a.smooth} | ({"patience": a.patience} if a.patience else {}))
+                    "warm": a.warm, "seed": a.seed, "feature": "mean" if a.light else table["feature"],
+                    "head": "linear" if a.light or a.l2 >= 0 else table["head"],
+                    "l2": a.l2 if a.l2 >= 0 else (None if a.light else table["l2"]), "smooth": a.smooth,
+                    "lr_warm": a.lr_warm} | ({"patience": a.patience} if a.patience else {}))
     res = json.loads(out.read_text())
     tp = res["test_pred"]
     test_rows = rows.set_index("id").loc[tp["id"]].reset_index()

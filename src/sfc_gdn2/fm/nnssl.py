@@ -177,6 +177,13 @@ class NnsslWrapper(Wrapper):
         over the crop's foreground) from the wrapper's own network and hooks, with gradient; EVA blocks checkpointed."""
         assert self.is_primus and pretrained and feature.startswith("crop_fg_"), feature
         net = self.network
+        # no stochastic layers when fine-tuning (04/11): the plan keeps the pretraining's patch_drop_rate 0.8 (80 % of the
+        # tokens dropped in train mode: the features unlike the frozen probe's) and drop_path 0.2
+        net.eva.patch_drop = None
+        for b in net.eva.blocks:
+            for nm in ("drop_path", "drop_path1", "drop_path2"):
+                if hasattr(b, nm):
+                    setattr(b, nm, torch.nn.Identity())
         net.eva.blocks = torch.nn.ModuleList(_Ckpt(b) for b in net.eva.blocks)   # (the tap hooks sit on the inner
         net.requires_grad_(True)                                                    # blocks: still fired)
         return CropFgReader(self, feature[len("crop_fg_"):]), ["net.down_projection", "net.eva"]

@@ -30,6 +30,8 @@ import torch.nn.functional as F
 
 from .worker import build, fail, prepared
 
+L2_GRID = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)   # bench/probe.py's (pandas-free copy: externals' envs)
+
 
 def prep(job: dict) -> None:
     w = build(job["cfg"], job["device"])
@@ -100,22 +102,42 @@ def train(job: dict) -> None:
     F_tr = feats(split["train"])
     mu, sd = F_tr.mean(0), F_tr.std(0).clamp_min(1e-6)
     hidden = 256 if job["head"] == "mlp" else 0
-    torch.manual_seed(0)
-    head = torch.nn.Sequential(*([torch.nn.Linear(F_tr.shape[1], hidden), torch.nn.GELU()] if hidden else []),
-                               torch.nn.Linear(hidden or F_tr.shape[1], k)).to(dev)
-    o = torch.optim.LBFGS(head.parameters(), max_iter=500, line_search_fn="strong_wolfe")
-    y_t, X_tr, l2 = torch.tensor(y_tr, device=dev), (F_tr - mu) / sd, float(job["l2"])
+    y_t, X_tr = torch.tensor(y_tr, device=dev), (F_tr - mu) / sd
 
-    def closure(X=X_tr):
-        o.zero_grad()
-        ls = F.cross_entropy(head(X), y_t, weight=wts) + l2 * sum(p.square().sum() for p in head.parameters()
-                                                                      if p.ndim > 1)
-        ls.backward()
-        return ls
-    o.step(closure)
-    del F_tr, X_tr
+    def fit(l2: float, X=None):
+        X = X_tr if X is None else X
+        torch.manual_seed(0)
+        h = torch.nn.Sequential(*([torch.nn.Linear(X.shape[1], hidden), torch.nn.GELU()] if hidden else []),
+                                torch.nn.Linear(hidden or X.shape[1], k)).to(dev)
+        o = torch.optim.LBFGS(h.parameters(), max_iter=500, line_search_fn="strong_wolfe")
+
+        def closure():
+            o.zero_grad()
+            ls = F.cross_entropy(h(X), y_t, weight=wts) + l2 * sum(p.square().sum() for p in h.parameters()
+                                                                       if p.ndim > 1)
+            ls.backward()
+            return ls
+        o.step(closure)
+        with torch.no_grad():
+            h.train_ce = float(F.cross_entropy(h(X), y_t, weight=wts))   # the fine-tuning's first loss must match it
+        return h
+
+    if job.get("l2") is not None:   # the table's L2 (its reading)
+        l2 = float(job["l2"])
+        head = fit(l2)
+    else:   # (04/11, the lighter reading: one curve, 16 + 8 mm) the table's L2 grid, chosen on the val
+        X_val = (feats(split["val"]) - mu) / sd
+        cand = []
+        for l2 in L2_GRID:
+            h = fit(l2)
+            with torch.no_grad():
+                cand.append((score(h(X_val).softmax(-1).cpu().numpy(), y_val), l2, h))
+            print(f"[cls] frozen probe l2 {l2:g}: val {cand[-1][0]:.4f}", flush=True)
+        _, l2, head = max(cand, key=lambda c: c[0])
+        del X_val, cand
     lp = {"feature": job["feature"], "head": job["head"], "l2": l2}
-    print(f"[cls] table head refitted: {lp} ({time.time() - t_start:.0f} s from start)", flush=True)
+    lp["train_ce"] = head.train_ce
+    print(f"[cls] frozen probe head: {lp} ({time.time() - t_start:.0f} s from start)", flush=True)
 
     def logits(it) -> torch.Tensor:
         r = load(it)
@@ -129,7 +151,8 @@ def train(job: dict) -> None:
     warm = int(float(job.get("warm", 0)) * iters)
     opt = torch.optim.AdamW([{"params": other}, {"params": enc_p, "lr": job["lr"] * float(job["enc_lr"])}],
                             lr=job["lr"], weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: (1 - i / iters) ** 0.9)
+    wu = max(1, int(float(job.get("lr_warm", 0.0)) * iters))   # (04/11) linear lr warm-up, then poly decay
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(1.0, (i + 1) / wu) * (1 - i / iters) ** 0.9)
     print(f"[cls] {job['cfg']['model']}: encoder {sum(p.numel() for p in enc_p) / 1e6:.1f}M at lr x{job['enc_lr']}, "
           f"frozen for {warm} of {iters} iterations; train/val/test {[len(v) for v in split.values()]} volumes, k {k}",
           flush=True)
