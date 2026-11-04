@@ -227,3 +227,85 @@ class LiveCache(TokenCache):
         finally:
             enc.patch_embed.patch_mm = keep
             enc.train(mode)
+
+
+class GradCache(TokenCache):
+    """Fine-tuning (04/11, Francesco: P2; no cached tokens, the encoder trains): the 16 / 8 mm tokens of each scan read
+    now by the training encoder, with gradient, the whole scan in one call along one curve (`curve`; ablation C: one
+    curve reads as the mean of three, a third of the cost). A scan's map is read once per training step and shared by
+    its tiles (segrun clears them at each step); at val / test (no grad) the last two scans' maps are kept across the sliding window's tiles. The folder
+    gives only the scans' meta (<id>.json, the table run's token folder); segrun's ensure() hands over each scan's voxels.
+    Same API as TokenCache for fm/hier_dec: meta, tokens, ids, levels, root."""
+
+    def __init__(self, root, net, curve: str = "hilbert"):
+        super().__init__(root)
+        self.net, self.curve, self.vox, self.maps, self.roots, self._was_training = net, curve, {}, {}, {}, True
+
+    def ensure(self, i: str, x: torch.Tensor, ctx: torch.Tensor) -> None:
+        self.vox[i] = (x, ctx[:3].float())   # ponytail: every train / val scan's voxels in RAM (small seg sets)
+
+    def next_batch(self, keep: int = 1) -> None:
+        pass
+
+    def prefetch(self, ctx: torch.Tensor, T) -> None:
+        pass
+
+    def new_step(self, training: bool) -> None:   # each forward (fm/hier_dec): the first eval call after training
+        if not training and self._was_training:  # drops the last step's maps (and their graphs)
+            self.clear()
+        self._was_training = training
+
+    def clear(self) -> None:   # segrun, at each training step: the batch's calls share the maps
+        self.maps, self.roots = {}, {}
+
+    def flush(self) -> None:
+        """segrun, after the step's backward calls: the gradient the tiles left on each map (a detached leaf) through the
+        encoder, one backward per scan and level per step (the chunks of micro_step share one read; exact gradient)."""
+        for key, r in self.roots.items():   # one map at a time: the peak of one scan's recomputed blocks
+            if self.maps[key].grad is not None:
+                r.backward(self.maps[key].grad)
+        self.clear()
+
+    def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
+        if (i, mm) not in self.maps:
+            if not self.net.training:   # eval: keep the last two scans' maps (sliding window over one scan)
+                last = list(dict.fromkeys(a for a, _ in self.maps))[-1:]
+                self.maps = {key: v for key, v in self.maps.items() if key[0] in last}
+            if self.net.training:   # the read with its graph once per step (also inside micro_step's no-grad pass);
+                with torch.enable_grad():   # the tiles get a detached leaf, flush() sends its gradient back
+                    r = self._map(i, mm, k)
+                if r.requires_grad:
+                    self.roots[(i, mm)] = r
+                self.maps[(i, mm)] = r.detach().requires_grad_(r.requires_grad)
+            else:
+                self.maps[(i, mm)] = self._map(i, mm, k)
+        m = self.maps[(i, mm)]
+        c0 = [int(c) // int(kk) for c, kk in zip(corner, k)]
+        crop = m[c0[0]: c0[0] + n[0], c0[1]: c0[1] + n[1], c0[2]: c0[2] + n[2]]
+        crop = torch.nn.functional.pad(crop, (0, 0, *[p for a, b in zip(reversed(n), reversed(crop.shape[:3]))
+                                                       for p in (0, a - b)]))   # zeros past the scan, as _read
+        return crop.reshape(-1, m.shape[-1])
+
+    def _map(self, i: str, mm: float, k) -> torch.Tensor:
+        enc, (x, sp) = self.net.encoder, self.vox[i]
+        return read_grad(enc, x, sp, mm, k, self.curve, self.net.seed).to(torch.bfloat16)   # half the maps' memory
+
+
+def read_grad(enc, x: torch.Tensor, sp: torch.Tensor, mm: float, k, curve: str, seed: int) -> torch.Tensor:
+    """[1, *S] voxels -> [gx, gy, gz, C] tokens of the whole scan at level mm (cells of k voxels) along one curve, with
+    gradient when the encoder trains (fine-tuning: GradCache, fm/clsrun); per-block checkpointing."""
+    from ..curves import grid_coords, keys
+    from ..data.volume import patch_grid, patchify
+    dev = next(enc.parameters()).device
+    x, sp, pe = x.to(dev).float(), sp.to(dev).float(), enc.patch_embed
+    keep, pe.patch_mm = pe.patch_mm, mm
+    try:
+        g = patch_grid(tuple(x.shape[1:]), k).to(dev)
+        t = pe(patchify(x[0], k), pe.weights(sp, k))
+        xyz = grid_coords(g[None], int(g.prod()))[0]
+        o = keys(curve, xyz, g, seed).argsort()
+        cu = torch.tensor([0, len(t)], device=dev, dtype=torch.int32)
+        h = enc.flat(t[o], cu, ckpt=True, pos=xyz[o])[o.argsort()]   # checkpoint per block: one block's activations at a
+    finally:                                                          # time, recomputed in backward
+        pe.patch_mm = keep
+    return h.reshape(*g.tolist(), -1)

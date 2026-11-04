@@ -163,6 +163,25 @@ class NnsslWrapper(Wrapper):
                 getattr(net, "key_to_lpe", None)]
         return net, [k for k in keys if k], tuple(self.patch)
 
+    # ------------------------------------------------------------------ fine-tuned classification (fm/clsrun.py)
+    def cls_input(self, prepared: dict) -> tuple:
+        """The table's volume reading (crop_gap_last, SSL3D's linear probe): one recommended-size crop centred on the
+        nonzero mask."""
+        from datasets.preprocess_3D_data.crop_to_mask import crop_center_with_padding_np, get_mask_center
+        c = get_mask_center(prepared["nonzero"].astype(np.uint8))
+        return torch.from_numpy(crop_center_with_padding_np(prepared["data"][0], c, tuple(self.patch)))[None], None
+
+    def cls_net(self, pretrained: bool = True):
+        """Primus only (04/11, P2): the official build + load_pretrained_weights, read as Primus.forward up to the
+        encoder (down projection, EVA), the tokens averaged (crop_gap_last), with gradient; EVA blocks checkpointed."""
+        assert self.is_primus, "cls_net: Primus (nnFoundation ViT) only"
+        net = self._build(1)
+        net = self._load(net) if pretrained else net
+        # each EVA block checkpointed (non-reentrant): eva.set_grad_checkpointing calls checkpoint(blk, x, rope=...) in
+        # reentrant mode, which takes no keyword arguments ("Unexpected keyword arguments: rope")
+        net.eva.blocks = torch.nn.ModuleList(_Ckpt(b) for b in net.eva.blocks)
+        return PrimusReader(net), ["net.down_projection", "net.eva"]
+
     # ------------------------------------------------------------------ preprocessing (nnssl)
     def preprocess(self, image: Image) -> dict:
         from nnssl.preprocessing.preprocessors.default_preprocessor import preprocess_case
@@ -292,6 +311,33 @@ class NnsslWrapper(Wrapper):
                                        "nnFoundation probe)"),
         }
         return {"features": feats, "canonical": canonical, "meta": plain_meta(meta), "derived": derived}
+
+
+class _Ckpt(torch.nn.Module):
+    def __init__(self, blk):
+        super().__init__()
+        self.blk = blk
+
+    def forward(self, x, **kw):
+        if self.training and torch.is_grad_enabled():
+            from torch.utils.checkpoint import checkpoint
+            return checkpoint(self.blk, x, use_reentrant=False, **kw)
+        return self.blk(x, **kw)
+
+
+class PrimusReader(torch.nn.Module):
+    """[1, *patch] crop -> [C] mean of the EVA tokens (primus.py forward: down projection, tokens, EVA)."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+        self.dim = net.eva.embed_dim if hasattr(net.eva, "embed_dim") else None
+
+    def forward(self, x: torch.Tensor, ctx=None) -> torch.Tensor:
+        h = rearrange(self.net.down_projection(x[None].to(next(self.parameters()).device).float()),
+                      "b c w h d -> b (w h d) c")
+        assert self.net.register_tokens is None, "PrimusReader: register tokens"
+        return self.net.eva(h)[0][0].mean(0)
 
 
 build = NnsslWrapper

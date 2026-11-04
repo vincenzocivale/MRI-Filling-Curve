@@ -336,7 +336,9 @@ def dice_full_res(probs: torch.Tensor, grid_from_gt: np.ndarray, lab: np.ndarray
 
 
 class Patches:
-    """Random training patches from volumes held in RAM; 1/3 centred on a voxel of a random present class."""
+    """Random training patches from volumes held in RAM; 1/3 centred on a voxel of a random present class.
+    SFC_FT_SCANS=n (fine-tuning, 04/11): each batch's tiles from n scans drawn for the batch, so the encoder reads n
+    whole scans per step with gradient (WMH: the planner's 40 small tiles came from ~40 scans, out of memory)."""
 
     def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator, fit: bool = False):
         self.fit = fit
@@ -361,8 +363,10 @@ class Patches:
         """Batches of n patches; tiles of different shapes (cm-sized tiles of scans with different spacings) come as
         lists of [1, ...] tensors."""
         xs, ys, cs = [], [], []
+        m = int(os.environ.get("SFC_FT_SCANS", "0"))
+        pool = self.rng.choice(len(self.vols), min(m, len(self.vols)), replace=False) if m else None
         for _ in range(n):
-            j = self.rng.integers(len(self.vols))
+            j = self.rng.integers(len(self.vols)) if pool is None else int(pool[self.rng.integers(len(pool))])
             x, y, fg = self.vols[j]
             cs.append(self.ctx[j])
             S = np.array(y.shape)
@@ -404,13 +408,13 @@ def batch_sums(logits: torch.Tensor, y: torch.Tensor, k: int) -> tuple:
     return ce, ok.sum(), inter, p.sum((0, 2, 3, 4)), p.new_zeros(k).scatter_add(0, yc.flatten(), ok.flatten())
 
 
-def micro_step(net, x, y, c, k: int, amp, dev) -> torch.Tensor:
+def micro_step(net, x, y, c, k: int, amp, dev, m: int = 1) -> torch.Tensor:
     """The gradient of loss_fn on the whole batch, one scan at a time (volumes of several shapes: whole-volume
     models, patch None; or a wrapper's `seg_microbatch` with many classes). The soft Dice sums over the batch before dividing, so a first
     pass without gradient gives the batch's sums; then each scan backpropagates a loss linear in its own sums with
     the batch's derivatives as coefficients: the same gradient as the batch of 2, one more forward pass."""
     parts = list(zip(x, y, c if c is not None else [None] * len(x))) if isinstance(x, list) else \
-        [(x[i:i + 1], y[i:i + 1], None if c is None else c[i:i + 1]) for i in range(len(x))]
+        [(x[i:i + m], y[i:i + m], None if c is None else c[i:i + m]) for i in range(0, len(x), m)]
     sums = []
     for xi, yi, ci in parts:
         with torch.no_grad(), amp():
@@ -535,6 +539,9 @@ def vox_budget(job: dict, vols: list, patch, k: int, lm: bool = False) -> None:
 
 def train(job: dict) -> None:
     dev = torch.device(job["device"])
+    if gb := os.environ.get("SFC_GPU_GB"):   # (04/11) a smaller GPU's memory, emulated: fine-tuning must fit 12 GB
+        i = dev.index or 0
+        torch.cuda.set_per_process_memory_fraction(float(gb) * 2**30 / torch.cuda.get_device_properties(i).total_memory, i)
     rng = np.random.default_rng(job["seed"])
     k, cache = int(job["k"]), Path(job["cache"])
     w = build(job["cfg"], job["device"])
@@ -551,6 +558,27 @@ def train(job: dict) -> None:
           f"{len(frozen_names - loaded)} frozen but not loaded {sorted(frozen_names - loaded)[:4]}, "
           f"{len(loaded - {n for n in names if is_frozen(n)})} loaded outside the prefixes (frozen too)", flush=True)
     net = (pre if job["init"] == "pretrained" else ref).to(dev)
+    # fine-tuning (04/11, P2): job["finetune"] = {"enc_lr": encoder lr / decoder lr, "warm": fraction of the iterations
+    # with the encoder frozen (decoder warm-up), "init": optional, a frozen run's .best.pt (its decoder)}: nothing frozen, the encoder in its own lr
+    # group; ours: the 16 / 8 mm tokens read now with gradient (token_cache.GradCache), not from the token cache
+    FT = job.get("finetune")
+    enc_names = frozen_names
+    if FT:
+        frozen_names = set()
+        net.finetune = True
+        if hasattr(net, "encoder"):
+            net.encoder.grad_checkpoint = True
+        if hasattr(net, "cache"):
+            from .token_cache import GradCache
+            old = net.cache
+            net.cache = GradCache(old.root, net)
+            net.cache.levels = old.levels
+        if FT.get("init"):
+            st = torch.load(FT["init"], map_location="cpu", weights_only=False)["best"]["state"]
+            bad = set(st) - set(net.state_dict())
+            assert not bad, sorted(bad)[:4]
+            net.load_state_dict(st, strict=False)
+            print(f"[seg] finetune: decoder from {FT['init']} ({len(st)} tensors)", flush=True)
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
     DET = job.get("select") == "det"   # point detection (cmbpts, user 28/10): component centroids matched within DET_MM
@@ -571,7 +599,7 @@ def train(job: dict) -> None:
         p.requires_grad_(n not in frozen_names)
         n_frozen += p.numel() * (not p.requires_grad)
         n_train += p.numel() * p.requires_grad
-    frozen_mods = [m for n, m in net.named_modules() if n and is_frozen(n)]
+    frozen_mods = [] if FT else [m for n, m in net.named_modules() if n and is_frozen(n)]
     print(f"[seg] {job['cfg']['model']} init={job['init']} patch={patch} frozen={n_frozen / 1e6:.1f}M "
           f"trained={n_train / 1e6:.1f}M prefixes={frozen}", flush=True)
     amp = contextlib.nullcontext  # wrappers with `seg_bf16 = False` run fp32 (their repo's precision)
@@ -619,7 +647,8 @@ def train(job: dict) -> None:
         vox_budget(job, [load(it) for it in split["train"][:None if os.environ.get("SFC_PLANNER_THR") else 40]]
                    if tcache is not None or not patch else [], patch, k, LM)
     key = {n: job[n] for n in ("init", "iters", "val_every", "batch", "lr", "seed")} | {"train": len(split["train"])} | \
-        {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS}
+        {"cfg": json.dumps(job["cfg"], sort_keys=True, default=str), "tile_cells": TILE_CELLS} | \
+        ({"finetune": json.dumps(FT, sort_keys=True)} if FT else {})
     saved = torch.load(ckpt, map_location="cpu", weights_only=False) if ckpt.exists() else {}
     iters, every = int(job["iters"]), int(job["val_every"])
 
@@ -646,7 +675,12 @@ def train(job: dict) -> None:
         tr_v = [v for v in train_v if bool(((v["y"] > 0) & (v["y"] < 255)).any())][:TRAIN_EVAL]
         del train_v
         params = [p for p in net.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(params, lr=job["lr"], weight_decay=1e-4)
+        if FT:   # the pretrained part at enc_lr x the decoder's lr (discriminative lr), the same poly decay
+            enc = [p for n, p in net.named_parameters() if n in enc_names]
+            groups = [{"params": [p for n, p in net.named_parameters() if n not in enc_names]},
+                      {"params": enc, "lr": job["lr"] * float(FT.get("enc_lr", 0.1))}]
+            print(f"[seg] finetune: encoder {sum(p.numel() for p in enc) / 1e6:.1f}M at lr x{FT.get('enc_lr', 0.1)}", flush=True)
+        opt = torch.optim.AdamW(groups if FT else params, lr=job["lr"], weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: (1 - i / iters) ** 0.9)
         best, curve, start, t0 = {"val": -1.0}, [], 1, time.time()
         state = torch.load(last, map_location="cpu", weights_only=False) if last.exists() else {}
@@ -696,6 +730,14 @@ def train(job: dict) -> None:
         # the tables to <out>.prof.txt, then the run stops (no val, no test)
         pw, pn = (int(v) for v in os.environ.get("SFC_SEG_PROFILE", "0,0").split(","))
         for it in range(start, iters + 1):
+            if FT and it in (start, int(FT.get("warm", 0) * iters) + 1):   # decoder warm-up: the encoder frozen for the
+                on = it > int(FT.get("warm", 0) * iters)                      # first `warm` of the iterations (asparagus'
+                for n, p in net.named_parameters():                            # recipe; same for every model)
+                    if n in enc_names:
+                        p.requires_grad_(on)
+                print(f"[seg] finetune: encoder {'trained' if on else 'frozen (decoder warm-up)'} from iter {it}", flush=True)
+            if FT and hasattr(net.cache if hasattr(net, "cache") else None, "clear"):   # GradCache: each step reads its
+                net.cache.clear()                                                         # scans anew (every branch below)
             if pn and it in (start + pw, start + pw + pn):
                 torch.cuda.synchronize()
                 if it == start + pw:
@@ -728,6 +770,10 @@ def train(job: dict) -> None:
             if LM:
                 loss = landmark_step(net, x, y, c, amp, dev)
                 logits = torch.zeros(1, device=dev)
+            elif FT and int(os.environ.get("SFC_FT_CHUNK", "0")):   # fine-tuning in little memory (04/11, Francesco: a
+                # 12 GB GPU): the batch's tiles SFC_FT_CHUNK at a time, one backward each, the same gradient (micro_step)
+                loss = micro_step(net, x, y, c, k, amp, dev, int(os.environ["SFC_FT_CHUNK"]))
+                logits = torch.zeros(1, device=dev)
             elif isinstance(x, list) and getattr(net, "any_tile", False):   # tiles of several shapes, grouped by shape
                 loss = group_step(net, x, y, c, k, amp, dev)
                 logits = torch.zeros(1, device=dev)
@@ -742,6 +788,8 @@ def train(job: dict) -> None:
                 loss.backward()
                 with torch.no_grad():   # the batch's soft Dice sums for the running log (as group_step's)
                     group_step.sums = list(batch_sums(logits.detach(), y.to(dev), k)[2:])
+            if FT and hasattr(getattr(net, "cache", None), "flush"):   # GradCache: the maps' gradient through the encoder
+                net.cache.flush()
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
             lsum = [lsum[0] + float(loss), lsum[1] + 1]
             run_l = [run_l[0] + float(loss), run_l[1] + 1]
@@ -751,7 +799,8 @@ def train(job: dict) -> None:
             if it % TRAIN_LOG == 0:
                 td = "" if not run_d else \
                     f" soft Dice {float(((2 * run_d[0][1:] + 1e-5) / (run_d[1][1:] + run_d[2][1:] + 1e-5)).mean()):.4f}"
-                print(f"[seg] it {it} train (last {run_l[1]} batches): loss {run_l[0] / max(run_l[1], 1):.3f}{td}", flush=True)
+                print(f"[seg] it {it} train (last {run_l[1]} batches): loss {run_l[0] / max(run_l[1], 1):.3f}{td} "
+                      f"({(time.time() - t0) / 60:.1f} min, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB)", flush=True)
                 run_l, run_d = [0.0, 0], None
             if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
                 raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "

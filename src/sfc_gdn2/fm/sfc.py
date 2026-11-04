@@ -258,6 +258,18 @@ class SFC(Wrapper):
         raise ValueError("sfc segmentation: args.hier_dec / args.hier_unet (fm/hier_dec.py); Dmix (SegNet) and the dense "
                          "decoders (fm/dense_dec.py) were removed on 02/11 (in git before that date)")
 
+    # ------------------------------------------------------------------ fine-tuned classification (fm/clsrun.py)
+    def cls_input(self, prepared: dict) -> tuple:
+        return self.seg_input(prepared)[0], prepared["spacing"]
+
+    def cls_net(self, pretrained: bool = True):
+        """The encoder + the probes' 16 + 8 mm reading (fm/clsrun, 04/11): the whole scan at each level along one curve
+        (ablation C), each level's foreground tokens averaged (cells with mean voxel > fg_threshold, as multigrain),
+        the two levels concatenated."""
+        enc = self._encoder(pretrained)
+        enc.taps = ()
+        return ClsReader(enc, int(self.run_cfg["seed"]), self.run_cfg["objective"].get("fg_threshold", 0.05)), ["encoder"]
+
     def extractor(self):
         if self._extract is None:
             from ..model import encoder_extractor
@@ -342,3 +354,23 @@ class SFC(Wrapper):
 
 
 build = SFC
+
+
+class ClsReader(torch.nn.Module):
+    """[1, *S] voxels, spacing -> the volume's feature [2 d] (16 and 8 mm foreground means), with gradient."""
+
+    def __init__(self, encoder, seed: int, thr: float, levels=(16.0, 8.0), curve: str = "hilbert"):
+        super().__init__()
+        self.encoder, self.seed, self.thr, self.levels, self.curve = encoder, seed, thr, levels, curve
+        self.dim = encoder.dim * len(levels)
+
+    def forward(self, x: torch.Tensor, sp: torch.Tensor) -> torch.Tensor:
+        from ..data.volume import patch_dims, patchify
+        from .token_cache import read_grad
+        out = []
+        for mm in self.levels:
+            k = patch_dims(sp.tolist(), mm)
+            h = read_grad(self.encoder, x, sp, mm, k, self.curve, self.seed).flatten(0, 2)
+            fg = patchify(x[0].to(h.device).float(), k).mean(1) > self.thr
+            out.append(h[fg if fg.any() else torch.ones_like(fg)].mean(0))
+        return torch.cat(out)

@@ -19,6 +19,7 @@ import os
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .token_cache import TokenCache, fine_ok
 
@@ -27,7 +28,7 @@ W, C = 256, 32           # token width, stem width
 TAU, TAUS = 0.5, (0.5, 0.3, 0.1, 0.0)   # training: read the children of the cells with P(mixed) > TAU; the test's
                                         # threshold chosen on val among TAUS (segrun, one pass: every cell read, masks)
 DROP = 0.1               # dropout on the encoder's 4096-d tokens (as CubeDec: small datasets)
-LIVE_MAX = 1 << 17   # tokens per live encoder call (30/10: 2^19 ran out of memory on tumor_ucsf, a batch's earlier shape
+LIVE_MAX = int(os.environ.get("SFC_LIVE_MAX", str(1 << 17)))   # (SFC_LIVE_MAX: smaller calls, less memory) tokens per live encoder call (30/10: 2^19 ran out of memory on tumor_ucsf, a batch's earlier shape
                      # groups' graphs held until the one backward)
 SNAKE_GAP = 16       # v10 (user 30/10, "il serpente"): live cells read as stretches of the curve; a gap of <= this many unread
                      # cells between open ones read too (context only), a longer one starts a new sequence
@@ -157,6 +158,8 @@ class HierDec(nn.Module):
         return float(160 ** 3 * n_out)
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.cache, "new_step"):   # fine-tuning (fm/token_cache GradCache): this step's encoder reads
+            self.cache.new_step(self.training)
         T = tuple(x.shape[2:])
         ys = None if self.sel_y is None or not self.training else self.sel_y.to(x.device).reshape(len(x), *T)
         rows = ctx.tolist()
@@ -251,7 +254,7 @@ class HierDec(nn.Module):
                 else:
                     INC.append(torch.ones(len(ti), nt, dtype=torch.bool, device=dev))
                 if dense:   # the cached levels' tokens, else the frozen encoder now on the cells chosen
-                    ENC.append(torch.stack([self._cached(ids[b], mm, c0, n, k, dev) for b, c0 in items])[ti, ci])
+                    ENC.append(self._ft_proj(torch.stack([self._cached(ids[b], mm, c0, n, k, dev) for b, c0 in items])[ti, ci]))
                 else:
                     ENC.append(self._read_snake(allp, g, ok, n, torch.tensor(sp, device=dev), list(k), mm))
                 if ys is not None and j in (1, 2):
@@ -263,7 +266,7 @@ class HierDec(nn.Module):
             if not G_:
                 break
             live = [b for gg in G_ for b in gg[0]]
-            e = self.enc(F.dropout(torch.cat(ENC), DROP, self.training))
+            e = torch.cat(ENC) if self._ft() else self.enc(F.dropout(torch.cat(ENC), DROP, self.training))
             inc = torch.cat(INC)
             if j == 0:
                 t = d = e
@@ -326,8 +329,20 @@ class HierDec(nn.Module):
     def _grid(self, n, dev) -> torch.Tensor:
         return self._grid_cpu(tuple(n)).to(dev)
 
+    def _ft(self) -> bool:   # fine-tuning in training (segrun sets `finetune`): the encoder's tokens carry gradient
+        return getattr(self, "finetune", False) and self.training
+
+    def _proj(self, t: torch.Tensor) -> torch.Tensor:
+        return self.enc(F.dropout(t, DROP, self.training))
+
+    def _ft_proj(self, t: torch.Tensor) -> torch.Tensor:
+        """Fine-tuning: each piece projected to W before the concatenation (row-wise: the same as projecting the
+        concatenation), so only W-wide tokens are kept for the backward, not the encoder's 4 d."""
+        return self._proj(t) if self._ft() else t
+
     def _cached(self, i, mm, c0, n, k, dev) -> torch.Tensor:
-        return self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev).float()
+        t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev)
+        return t if getattr(self, "finetune", False) else t.float()   # fine-tuning: bf16 (the linear casts to it anyway)
 
     @torch.no_grad()
     def _read_many(self, pats, qs, ns, sps, mm, ks) -> torch.Tensor:
@@ -355,8 +370,11 @@ class HierDec(nn.Module):
             pe.patch_mm = mm0
         return torch.cat(out)
 
-    @torch.no_grad()
     def _read_snake(self, allp, g, ok, n, sp, k, mm) -> torch.Tensor:
+        with torch.set_grad_enabled(self._ft()):
+            return self._snake(allp, g, ok, n, sp, k, mm)
+
+    def _snake(self, allp, g, ok, n, sp, k, mm) -> torch.Tensor:
         """The frozen encoder at level mm on a group's open cells (ok [G, N]; allp [G, N, P] all cells' patches, g [N, 3]
         their grid coordinates, one geometry), as stretches of the curve LIVE (v10): the open cells and the unread ones in
         gaps of <= SNAKE_GAP between them, one sequence per stretch, packed in calls of <= LIVE_MAX tokens and SEQ_MAX
@@ -390,8 +408,13 @@ class HierDec(nn.Module):
                         # out of memory with the whole group's read cells embedded at once)
                         cu = torch.tensor([0] + grp, device=dev).cumsum(0).to(torch.int32)
                         sl = slice(at, at + tot)
-                        h = self.encoder.flat(pe(allp[gi[sl], cells[sl]], wts), cu, pos=q[sl])
-                        hs.append(h[oe[sl]].float())
+                        if self._ft():   # fine-tuning (04/11): the call checkpointed whole, projected inside: kept
+                            # for the backward only its voxels and the W-wide tokens; recomputed once (dropout's RNG kept)
+                            hs.append(checkpoint(self._live_call, allp[gi[sl], cells[sl]], wts, cu, q[sl], oe[sl],
+                                                 use_reentrant=False))
+                        else:
+                            h = self.encoder.flat(pe(allp[gi[sl], cells[sl]], wts), cu, pos=q[sl])
+                            hs.append(h[oe[sl]].float())
                         at, grp, tot = at + tot, [], 0
                     if i < len(lens):
                         grp.append(lens[i])
@@ -399,6 +422,10 @@ class HierDec(nn.Module):
         finally:
             pe.patch_mm = mm0
         return torch.cat(hs)[(gi[oe] * N + cells[oe]).argsort()]
+
+
+    def _live_call(self, xp, wts, cu, q, keep) -> torch.Tensor:
+        return self._proj(self.encoder.flat(self.encoder.patch_embed(xp, wts), cu, pos=q)[keep])
 
 
 class HierUNet(HierDec):
