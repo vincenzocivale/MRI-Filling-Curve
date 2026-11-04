@@ -288,7 +288,8 @@ class GradCache(TokenCache):
 
     def _map(self, i: str, mm: float, k) -> torch.Tensor:
         enc, (x, sp) = self.net.encoder, self.vox[i]
-        return read_grad(enc, x, sp, mm, k, self.curve, self.net.seed).to(torch.bfloat16)   # half the maps' memory
+        h = read_grad(enc, x, sp, mm, k, self.curve, self.net.seed)
+        return h.bfloat16() if os.environ.get("SFC_TOK_BF16") == "1" else h.float()   # bf16: opt-in, half the memory
 
 
 def read_grad(enc, x: torch.Tensor, sp: torch.Tensor, mm: float, k, curve: str, seed: int) -> torch.Tensor:

@@ -34,6 +34,7 @@ SNAKE_GAP = 16       # v10 (user 30/10, "il serpente"): live cells read as stret
                      # cells between open ones read too (context only), a longer one starts a new sequence
 OPEN_MAX = 1 << 14   # v10: open cells per tile and live level at most (the highest parent P(mixed)): tumor_ucsf ran out of memory
 SEQ_MAX = 4095       # v10: sequences per live call at most (GDN-2 kernels: a grid axis of sequences x 16 heads <= 65535)
+TOK_BF16 = os.environ.get("SFC_TOK_BF16") == "1"   # (04/11, opt-in) the encoder's tokens into the decoder in bf16
 LIVE = "hilbert"         # the 4 / 2 mm cells read live along one curve (29/10: 3 curves were 85 % of the field's forward)
 R_MM, RANK = 1.0, 4      # CK-conv: window radius (mm, centred: 2 mm across), B-splines per axis
 PDROP = float(__import__("os").environ.get("SFC_PDROP", "0.1"))   # default 0.1 (user 31/10, as the tokens' dropout); HierUNet: path dropout per training tile (image off, else field off); v8 0.25, v9-v13 off,
@@ -254,9 +255,10 @@ class HierDec(nn.Module):
                 else:
                     INC.append(torch.ones(len(ti), nt, dtype=torch.bool, device=dev))
                 if dense:   # the cached levels' tokens, else the frozen encoder now on the cells chosen
-                    ENC.append(self._ft_proj(torch.stack([self._cached(ids[b], mm, c0, n, k, dev) for b, c0 in items])[ti, ci]))
+                    ENC.append(self._proj(torch.stack([self._cached(ids[b], mm, c0, n, k, dev) for b, c0 in items])[ti, ci]))
                 else:
-                    ENC.append(self._read_snake(allp, g, ok, n, torch.tensor(sp, device=dev), list(k), mm))
+                    h = self._read_snake(allp, g, ok, n, torch.tensor(sp, device=dev), list(k), mm)
+                    ENC.append(h if self._ft() else self._proj(h))   # fine-tuning: projected inside the checkpoint
                 if ys is not None and j in (1, 2):
                     yl = _patchify_b(F.pad(ys[bs].float(), pads, value=255), k)[ti, ci]
                     okl = yl != 255
@@ -266,7 +268,8 @@ class HierDec(nn.Module):
             if not G_:
                 break
             live = [b for gg in G_ for b in gg[0]]
-            e = torch.cat(ENC) if self._ft() else self.enc(F.dropout(torch.cat(ENC), DROP, self.training))
+            e = torch.cat(ENC)   # each piece projected to W first (04/11, default): row-wise, the same as projecting the
+            # concatenation, without the [cells, 4 d] concatenated copy (WMH's 40 tiles: 7-9 GB)
             inc = torch.cat(INC)
             if j == 0:
                 t = d = e
@@ -335,14 +338,9 @@ class HierDec(nn.Module):
     def _proj(self, t: torch.Tensor) -> torch.Tensor:
         return self.enc(F.dropout(t, DROP, self.training))
 
-    def _ft_proj(self, t: torch.Tensor) -> torch.Tensor:
-        """Fine-tuning: each piece projected to W before the concatenation (row-wise: the same as projecting the
-        concatenation), so only W-wide tokens are kept for the backward, not the encoder's 4 d."""
-        return self._proj(t) if self._ft() else t
-
     def _cached(self, i, mm, c0, n, k, dev) -> torch.Tensor:
         t = self.cache.tokens(i, mm, [a * kk for a, kk in zip(c0, k)], n, k).to(dev)
-        return t if getattr(self, "finetune", False) else t.float()   # fine-tuning: bf16 (the linear casts to it anyway)
+        return t.bfloat16() if TOK_BF16 else t.float()   # SFC_TOK_BF16=1: half the tokens' memory (opt-in)
 
     @torch.no_grad()
     def _read_many(self, pats, qs, ns, sps, mm, ks) -> torch.Tensor:

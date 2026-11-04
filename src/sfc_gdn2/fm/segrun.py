@@ -770,9 +770,9 @@ def train(job: dict) -> None:
             if LM:
                 loss = landmark_step(net, x, y, c, amp, dev)
                 logits = torch.zeros(1, device=dev)
-            elif FT and int(os.environ.get("SFC_FT_CHUNK", "0")):   # fine-tuning in little memory (04/11, Francesco: a
-                # 12 GB GPU): the batch's tiles SFC_FT_CHUNK at a time, one backward each, the same gradient (micro_step)
-                loss = micro_step(net, x, y, c, k, amp, dev, int(os.environ["SFC_FT_CHUNK"]))
+            elif int(os.environ.get("SFC_SEG_CHUNK", "0")):   # (04/11, opt-in, frozen or fine-tuned: e.g. a 12 GB GPU)
+                # the batch's tiles SFC_SEG_CHUNK at a time, one backward each, the same gradient (micro_step)
+                loss = micro_step(net, x, y, c, k, amp, dev, int(os.environ["SFC_SEG_CHUNK"]))
                 logits = torch.zeros(1, device=dev)
             elif isinstance(x, list) and getattr(net, "any_tile", False):   # tiles of several shapes, grouped by shape
                 loss = group_step(net, x, y, c, k, amp, dev)

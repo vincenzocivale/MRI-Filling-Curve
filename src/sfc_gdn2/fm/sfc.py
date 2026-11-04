@@ -250,10 +250,13 @@ class SFC(Wrapper):
         a = self.args
         if a.get("hier_dec") or a.get("hier_unet"):   # fm/hier_dec (29/10): Dmix gerarchico + kernel continuo; hier_unet (30/10)
             from .hier_dec import HierDec, HierUNet
-            net = (HierUNet if a.get("hier_unet") else HierDec)(enc, str(a["token_cache"]), n_out, self.curves,
+            # the 16 / 8 mm tokens read along one curve, hilbert (04/11, default; ablation C: one curve reads as the
+            # mean of three, a third of the cost); args.token_curves for others (the table's runs: the view curves)
+            tc = list(a.get("token_curves") or ["hilbert"])
+            net = (HierUNet if a.get("hier_unet") else HierDec)(enc, str(a["token_cache"]), n_out, tc,
                                                                  int(self.run_cfg["seed"]))
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else f"random{os.environ.get('SFC_ENC_SEED', '')}", "taps": list(enc.taps),
-                             "curves": list(self.curves), "blocks": None}
+                             "curves": tc, "blocks": None}
             return net, ["encoder"], SEG_PATCH
         raise ValueError("sfc segmentation: args.hier_dec / args.hier_unet (fm/hier_dec.py); Dmix (SegNet) and the dense "
                          "decoders (fm/dense_dec.py) were removed on 02/11 (in git before that date)")
