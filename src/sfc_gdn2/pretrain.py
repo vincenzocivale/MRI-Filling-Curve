@@ -49,7 +49,11 @@ def repatch(batch: dict, mm: float, max_patches: int | None = None) -> dict:
                 break
             m *= 1.25
         k.append(kk), grid.append(g), mms.append(m)
-    return batch | {"k": torch.tensor(k), "grid": torch.stack(grid), "patch_mm": torch.tensor(mms)}
+    out = batch | {"k": torch.tensor(k), "grid": torch.stack(grid), "patch_mm": torch.tensor(mms)}
+    if "volume2" in batch:   # (04/11) the resampled copies cut at the same cell size as their scans
+        k2 = [None if v is None else torch.tensor(patch_dims(s2.tolist(), m)) for v, s2, m in zip(batch["volume2"], batch["spacing2"], mms)]
+        out |= {"k2": k2, "grid2": [None if v is None else patch_grid(tuple(v.shape[:3]), q.tolist()) for v, q in zip(batch["volume2"], k2)]}
+    return out
 
 
 def fp32_forward(f):

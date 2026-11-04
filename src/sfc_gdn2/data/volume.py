@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import math
 import os
 import zipfile
 from pathlib import Path
@@ -30,6 +31,22 @@ def respace(x: torch.Tensor, spacing):
         x = F.interpolate(x.float().reshape(1, 1, *x.shape[-3:]), size=size, mode="trilinear",
                           align_corners=False).reshape(*x.shape[:-3], *size)
     return x, [1.0, 1.0, 1.0]
+
+
+def rand_resample(x: torch.Tensor, sp):
+    """(04/11, Francesco; ablation B arm 5) a random acquisition of the same scan: trilinear to a random isotropic
+    0.8-1.5 mm, in a quarter of the draws with one axis at 3-5 mm; at most ~2x the native voxels (memory).
+    -> (x, its true spacing [3])."""
+    sp = [float(z) for z in sp[:3]]
+    t = [float(torch.empty(()).uniform_(0.8, 1.5))] * 3
+    if torch.rand(()) < 0.25:
+        t[int(torch.randint(3, ()))] = float(torch.empty(()).uniform_(3.0, 5.0))
+    n0 = x.shape[-3:]
+    f = math.prod(z / u for z, u in zip(sp, t)) ** (1 / 3)
+    t = [u * max(1.0, f / 2 ** (1 / 3)) for u in t]   # ponytail: finer targets coarsened to <= ~2x the voxels
+    size = [max(1, round(n * z / u)) for n, z, u in zip(n0, sp, t)]
+    x = F.interpolate(x.float().reshape(1, 1, *n0), size=size, mode="trilinear", align_corners=False).reshape(*x.shape[:-3], *size)
+    return x, [z * n / m for z, n, m in zip(sp, n0, size)]
 
 
 def open_image(path: str | Path):

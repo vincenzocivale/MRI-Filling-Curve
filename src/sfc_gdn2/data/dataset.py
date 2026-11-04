@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .pool import n_patch
-from .volume import decode, patch_dims, patch_grid, patchify, respace
+from .volume import decode, patch_dims, patch_grid, patchify, rand_resample, respace
 
 
 class PatchDataset(Dataset):
@@ -20,7 +20,8 @@ class PatchDataset(Dataset):
     A scan that fails to load is logged and replaced by a random scan of at most its patches (`sizes`: the batch
     keeps its budget), so one corrupt file of ~1M does not stop the run."""
 
-    def __init__(self, rows: pd.DataFrame, patch_mm: float, sizes: list[int]):
+    def __init__(self, rows: pd.DataFrame, patch_mm: float, sizes: list[int], view_resample: float = 0.0):
+        self.view_resample = view_resample   # (04/11) probability of a resampled copy (rand_resample) for views B
         self.rows = rows.reset_index(drop=True)
         self.paths = self.rows["path"].tolist()
         self.frames = self.rows["frames"].tolist()
@@ -47,14 +48,21 @@ class PatchDataset(Dataset):
             raise RuntimeError(f"10 unreadable scans in a row, last {self.paths[i]}")
         vol, spacing = respace(torch.from_numpy(np.array(arr)), spacing)   # ablation B: SFC_RESPACE
         k = patch_dims(spacing, self.patch_mm)
-        return {"volume": vol, "grid": patch_grid(vol.shape, k), "k": torch.tensor(k),
+        out = {"volume": vol, "grid": patch_grid(vol.shape, k), "k": torch.tensor(k),
                 "spacing": torch.tensor(spacing, dtype=torch.float32),
                 "affine": torch.tensor(affine, dtype=torch.float64), "index": i}
+        if self.view_resample and torch.rand(()) < self.view_resample:   # LeJEPA's views B read this copy (A: native)
+            v2, s2 = rand_resample(vol, spacing)
+            k2 = patch_dims(s2, self.patch_mm)
+            out |= {"volume2": v2, "spacing2": torch.tensor(s2, dtype=torch.float32), "k2": torch.tensor(k2),
+                    "grid2": patch_grid(v2.shape, k2)}
+        return out
 
 
 def collate(items: list[dict]) -> dict:
     """Volumes stay a list (shapes differ)."""
     out = {k: torch.stack([it[k] for it in items]) for k in ("grid", "k", "spacing", "affine")}
+    out |= {k: [it.get(k) for it in items] for k in ("volume2", "spacing2", "k2", "grid2")}   # None: no copy
     return out | {"volumes": [it["volume"] for it in items], "index": torch.tensor([it["index"] for it in items])}
 
 
@@ -64,7 +72,13 @@ def to_device(batch: dict, device) -> dict:
     patches = []
     for v, (a, c), k in zip(batch["volumes"], batch["affine"].tolist(), batch["k"].tolist()):
         patches.append(patchify(v.to(device, non_blocking=True).float() * a + c, k))
-    return {"patches": patches, **{k: batch[k].to(device) for k in ("grid", "k", "spacing")},
+    nb = len(patches)
+    copies = [None if v is None else {"patches": patchify(v.to(device, non_blocking=True).float() * a + c, k2.tolist()),
+                                      "grid": g2.to(device), "k": k2.tolist(), "spacing": s2.tolist()}
+              for v, (a, c), g2, k2, s2 in zip(batch.get("volume2", [None] * nb), batch["affine"].tolist(),
+                                               batch.get("grid2", [None] * nb), batch.get("k2", [None] * nb),
+                                               batch.get("spacing2", [None] * nb))]   # (04/11) views B's resampled copies
+    return {"patches": patches, "copies": copies, **{k: batch[k].to(device) for k in ("grid", "k", "spacing")},
             **({"patch_mm": batch["patch_mm"].tolist()} if "patch_mm" in batch else {})}   # per scan (repatch)
 
 
@@ -181,7 +195,7 @@ def loader(rows: pd.DataFrame, data: dict, batch_size: int, sessions, seed: int 
         m = torch.from_numpy((rows["dataset"] == name).to_numpy())
         w[m] *= share / (1 - share) * w[~m].sum() / w[m].sum()
         weights = w
-    ds = PatchDataset(rows, data["patch_mm"], sizes)
+    ds = PatchDataset(rows, data["patch_mm"], sizes, float(data.get("view_resample", 0.0)))
     plan = BudgetBatches(sizes, int(data["patches_per_batch"]), batch_size, seed, sessions, weights, rank, world)
     return ScanBatches(ds, plan, **common)
 

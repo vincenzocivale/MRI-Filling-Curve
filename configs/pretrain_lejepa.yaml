@@ -15,6 +15,7 @@ data:
   manifests:                  # pretraining pool = union of each manifest's `pretrain` split
     - /leonardo_work/IscrC_SFMRI/fcorrent/datasets/manifests/pretrain/pool.csv.gz
   splits: [pretrain]
+  view_resample: 0.5          # (04/11, ablation B arm 5) half the scans get a resampled copy (0.8-1.5 mm iso, a quarter with a 3-5 mm axis) that LeJEPA's views B read; A and every reading stay native
   patch_mm: 16.0              # patch = the scan's native voxels, round(16 / spacing) per axis (~16 mm); nothing resampled
   num_workers: 32             # per GPU; each loads single scans (data.dataset.ScanBatches): I/O-bound (Lustre reads +
   prefetch: 4                 # gunzip ~0.5 s per scan), so 4x the GPU's 8 cores (m6: no data wait at 72 scans/GPU);

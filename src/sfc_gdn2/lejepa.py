@@ -293,7 +293,7 @@ class LeJEPA(nn.Module):
             v[s:e] = self.thick(v[s:e], k, a, f)
         return self.encoder.patch_embed(v, w)
 
-    def read(self, vols, ws, fg, n_patch, vol, corner, edge, masked, gen, src=None):
+    def read(self, vols, ws, fg, n_patch, vol, corner, edge, masked, gen, src=None, alt=None):
         """Views [V] (scan `vol`, box) -> their tokens packed view after view, each along its curve (no padding):
         view [T], patch index in its scan [T], patch coords [T,3], foreground [T], mask [T], bi tokens [T,2d]; tokens
         per view [V] and per-view offsets [V] (device) and the tokens per view (host). Masking applies only to
@@ -346,7 +346,22 @@ class LeJEPA(nn.Module):
                 sl = [(max(a, lo) - lo, min(z, hi) - lo, ax, f) for a, z, ax, f in slabs.get(b, []) if a < hi and z > lo]
                 parts.append(checkpoint(self._embed, x, idx[lo:hi], tv[lo:hi], ws[b], aug, k, sl,
                                         seed + b * 1_000_003 + c, use_reentrant=False))
-        t = self.encoder.apply_mask(torch.cat(parts), mask)
+        t = torch.cat(parts)
+        if alt is not None and (alt_h := alt.tolist()) and any(alt_h):   # (04/11, data.view_resample) views B read the
+            rows, embs = [], []   # scan's resampled copy: each patch -> the copy's cell holding its centre (same place)
+            for i, b in enumerate(vol_h):
+                if not alt_h[i]:
+                    continue
+                q, lo, hi = vols["copies"][b], offs[i], offs[i + 1]
+                cell = torch.tensor(vols["k_list"][b], device=dev) * torch.tensor(vols["spacing_list"][b], device=dev)
+                cell2 = torch.tensor(q["k"], device=dev) * torch.tensor(q["spacing"], device=dev)
+                p2 = torch.minimum(((pxyz[lo:hi] + 0.5) * cell / cell2).long().clamp_min(0), q["grid"] - 1)
+                idx2 = (p2[:, 0] * q["grid"][1] + p2[:, 1]) * q["grid"][2] + p2[:, 2]
+                embs.append(checkpoint(self._embed, q["patches"], idx2, tv[lo:hi], q["w"], aug, q["k"], [],
+                                       seed + b * 1_000_003 + 7, use_reentrant=False))
+                rows.append(torch.arange(lo, hi, device=dev))
+            t = t.index_copy(0, torch.cat(rows), torch.cat(embs).to(t.dtype))
+        t = self.encoder.apply_mask(t, mask)
         if self.encoder.pos is not None:   # masked patches too: the mask token learns where it is
             t = t + self.encoder.pos(vpos).to(t.dtype)
         off = n.cumsum(0) - n
@@ -462,8 +477,14 @@ class LeJEPA(nn.Module):
             if (key := (*sp, *k, m)) not in memo:
                 pe.patch_mm = m
                 memo[key] = pe.weights(torch.tensor(sp, device=grid.device), k)
-        pe.patch_mm = mm0
         ws = [memo[(*sp, *k, m)] for sp, k, m in zip(vols["spacing_list"], vols["k_list"], mms)]
+        cp = vols.get("copies") or [None] * b   # (04/11, data.view_resample) per scan a resampled copy or None: its weights
+        for q, m in zip(cp, mms):
+            if q is not None:
+                pe.patch_mm = m
+                q["w"] = pe.weights(torch.tensor(q["spacing"], device=grid.device), q["k"])
+        pe.patch_mm = mm0
+        vols["has_copy"] = torch.tensor([q is not None for q in cp], device=grid.device)
         return vols, grid, n_patch, fg, ws
 
     def forward(self, vols: dict, generator: torch.Generator) -> dict[str, torch.Tensor]:
@@ -529,7 +550,8 @@ class LeJEPA(nn.Module):
             masked = torch.arange(nv, device=dev) % 2 == 0
             sg = same[:, part].reshape(-1)                                                 # per group
             src = torch.arange(nv, device=dev) - (sg.repeat_interleave(2) & ~masked).long()   # tied B -> its A
-            tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(pv, pws, pfg, pn, v, c, e, masked, gen, src)
+            alt = ~masked & pv["has_copy"][v] & ~sg.repeat_interleave(2)   # untied views B of scans with a copy
+            tv, idx, pxyz, fgv, mask, bi, n, off, n_h = self.read(pv, pws, pfg, pn, v, c, e, masked, gen, src, alt)
             if self.meta:
                 self._episodes(pv, v, idx, pxyz, fgv, bi, n_h, gen, meta)
             has = torch.zeros(nv, device=dev).index_add_(0, tv, fgv.float()) > 0
