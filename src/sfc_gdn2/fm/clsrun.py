@@ -113,10 +113,21 @@ def train(job: dict) -> None:
         return p
 
     y_val = np.array([int(it["y"]) for it in split["val"]])
-    best, curve, t0 = {"val": -1.0}, [], time.time()
+    best, curve, t0, start = {"val": -1.0}, [], time.time(), 1
+    # a killed job resumes (chained short jobs): the whole state every SFC_CLS_SAVE_S seconds next to the result
+    last, key = out.with_suffix(".last.pt"), {n: job[n] for n in ("iters", "val_every", "batch", "lr", "enc_lr", "warm",
+                                                                  "seed")}
+    if last.exists() and (st := torch.load(last, map_location="cpu", weights_only=False))["key"] == key:
+        enc.load_state_dict(st["enc"]), head.load_state_dict(st["head"]), opt.load_state_dict(st["opt"])
+        sched.load_state_dict(st["sched"])
+        rng.bit_generator.state = st["rng"]
+        best, curve, start, t0 = st["best"], st["curve"], st["it"] + 1, t0 - st["sec"]
+        print(f"[cls] resumed at iter {st['it']}", flush=True)
+    t_save, save_s = time.time(), float(os.environ.get("SFC_CLS_SAVE_S", "600"))
     enc.train(), head.train()
-    for it in range(1, iters + 1):
-        if it in (1, warm + 1):
+    t1 = time.time()
+    for it in range(start, iters + 1):
+        if it in (start, warm + 1):
             for p in enc_p:
                 p.requires_grad_(it > warm)
             print(f"[cls] encoder {'trained' if it > warm else 'frozen (warm-up)'} from iter {it}", flush=True)
@@ -130,7 +141,7 @@ def train(job: dict) -> None:
         torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], 12)
         opt.step(), opt.zero_grad(set_to_none=True), sched.step()
         if it % 25 == 0 or it <= 5 or it == warm + 1:   # the first iterations one by one: speed and memory early
-            print(f"[cls] iter {it} loss {loss:.4f} {(time.time() - t0) / it:.2f} s/iter "
+            print(f"[cls] iter {it} loss {loss:.4f} {(time.time() - t1) / (it - start + 1):.2f} s/iter "
                   f"mem {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
         if it % every == 0 or it == iters:
             v = score(predict(split["val"]), y_val)
@@ -139,6 +150,12 @@ def train(job: dict) -> None:
             if v > best["val"]:
                 best = {"val": v, "iter": it, "state": [{n: t.detach().cpu().clone() for n, t in m.state_dict().items()}
                                                         for m in (enc, head)]}
+        if time.time() - t_save > save_s and it < iters:
+            torch.save({"key": key, "it": it, "enc": enc.state_dict(), "head": head.state_dict(), "opt": opt.state_dict(),
+                        "sched": sched.state_dict(), "rng": rng.bit_generator.state, "best": best, "curve": curve,
+                        "sec": time.time() - t0}, last.with_suffix(".tmp"))
+            os.replace(last.with_suffix(".tmp"), last)
+            t_save = time.time()
     enc.load_state_dict(best["state"][0]), head.load_state_dict(best["state"][1])
     res = {"model": job["cfg"]["model"], "best_iter": best["iter"], "val": best["val"], "curve": curve,
            "minutes": (time.time() - t0) / 60, "job": {n: job[n] for n in ("iters", "val_every", "batch", "lr", "enc_lr",
