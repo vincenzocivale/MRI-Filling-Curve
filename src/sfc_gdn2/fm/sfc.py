@@ -263,15 +263,17 @@ class SFC(Wrapper):
 
     # ------------------------------------------------------------------ fine-tuned classification (fm/clsrun.py)
     def cls_input(self, prepared: dict) -> tuple:
-        return self.seg_input(prepared)[0], prepared["spacing"]
+        return prepared, None   # the extraction's own input (fm/clsrun stores it as is)
 
-    def cls_net(self, pretrained: bool = True):
-        """The encoder + the probes' 16 + 8 mm reading (fm/clsrun, 04/11): the whole scan at each level along one curve
-        (ablation C), each level's foreground tokens averaged (cells with mean voxel > fg_threshold, as multigrain),
-        the two levels concatenated."""
-        enc = self._encoder(pretrained)
-        enc.taps = ()
-        return ClsReader(enc, int(self.run_cfg["seed"]), self.run_cfg["objective"].get("fg_threshold", 0.05)), ["encoder"]
+    def cls_net(self, pretrained: bool = True, feature: str = "mean"):
+        """The table's probe feature (bench.probe.readings: `mean` or `blocks+std`, multigrain levels concatenated) read
+        by the extraction's own code (features_batch: 3 curves, depth quartiles, adaptive finer levels) with gradient
+        (04/11, P2: the fine-tuning starts from the table's frozen probe)."""
+        assert pretrained, "cls_net: the pretrained encoder"
+        self.extractor()
+        self._extract_enc.requires_grad_(True)
+        self._extract_enc.grad_checkpoint = True
+        return TableReader(self, feature), ["encoder"]
 
     def extractor(self):
         if self._extract is None:
@@ -297,7 +299,11 @@ class SFC(Wrapper):
 
     @torch.no_grad()
     def features_batch(self, preps: list) -> list:
-        """(02/11) several volumes in one encoder call: their 16 mm tokens packed (encoder_extractor, any grid / spacing,
+        return self._features(preps)
+
+    def _features(self, preps: list) -> list:
+        """features_batch without no_grad (04/11: fine-tuning reads the table's features with gradient, cls_net).
+        (02/11) several volumes in one encoder call: their 16 mm tokens packed (encoder_extractor, any grid / spacing,
         no resampling); the same features as one by one. One patch size per call (else one by one)."""
         from ..data.volume import patchify
 
@@ -359,21 +365,25 @@ class SFC(Wrapper):
 build = SFC
 
 
-class ClsReader(torch.nn.Module):
-    """[1, *S] voxels, spacing -> the volume's feature [2 d] (16 and 8 mm foreground means), with gradient."""
+class TableReader(torch.nn.Module):
+    """prepared -> the table probe's feature (bench.probe.readings, one volume), with gradient: the wrapper's extraction."""
 
-    def __init__(self, encoder, seed: int, thr: float, levels=(16.0, 8.0), curve: str = "hilbert"):
+    def __init__(self, w, feature: str):
         super().__init__()
-        self.encoder, self.seed, self.thr, self.levels, self.curve = encoder, seed, thr, levels, curve
-        self.dim = encoder.dim * len(levels)
+        self.w, self.encoder, self.feature = w, w._extract_enc, feature   # the encoder: the trainable part
 
-    def forward(self, x: torch.Tensor, sp: torch.Tensor) -> torch.Tensor:
-        from ..data.volume import patch_dims, patchify
-        from .token_cache import read_grad
-        out = []
-        for mm in self.levels:
-            k = patch_dims(sp.tolist(), mm)
-            h = read_grad(self.encoder, x, sp, mm, k, self.curve, self.seed).flatten(0, 2)
-            fg = patchify(x[0].to(h.device).float(), k).mean(1) > self.thr
-            out.append(h[fg if fg.any() else torch.ones_like(fg)].mean(0))
-        return torch.cat(out)
+    def forward(self, prepared: dict, ctx=None) -> torch.Tensor:
+        from ..bench.probe import _grains
+        f = dict(self.w._features([prepared])[0]["features"])
+        w = f["mean"].shape[-1] // 2
+        if torch.equal(f["mean"][:w], f["mean"][w:]):   # one-stream encoder: bi = h ++ h, keep h (readings)
+            f = {k: v[:w] if k.startswith(("mean", "std")) else v for k, v in f.items()}
+        g = _grains()
+        for k in [k for k in f if f"g8:{k}" in f]:   # each statistic's multigrain levels concatenated (readings)
+            f[k] = torch.cat([f[k] if m == 16 else f[f"g{m}:{k}"] for m in (16, 8, 4, 2) if m in g], -1)
+        if self.feature == "mean":
+            return f["mean"].float()
+        assert self.feature == "blocks+std", self.feature   # (blocks+covsqrt: not needed by P2's chosen heads)
+        inter = sorted((k[4:] for k in f if k.startswith("mean_b")), key=lambda b: int(b[2:]))
+        return torch.cat([*(f["mean" + b] for b in inter), f["mean"], *(f["std" + b] for b in inter), f["std"]],
+                         -1).float()

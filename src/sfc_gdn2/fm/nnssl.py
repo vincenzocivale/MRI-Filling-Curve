@@ -165,22 +165,21 @@ class NnsslWrapper(Wrapper):
 
     # ------------------------------------------------------------------ fine-tuned classification (fm/clsrun.py)
     def cls_input(self, prepared: dict) -> tuple:
-        """The table's volume reading (crop_gap_last, SSL3D's linear probe): one recommended-size crop centred on the
-        nonzero mask."""
+        """The table's crop (_crop_features): the recommended-size crop centred on the nonzero mask, and the mask's crop."""
         from datasets.preprocess_3D_data.crop_to_mask import crop_center_with_padding_np, get_mask_center
-        c = get_mask_center(prepared["nonzero"].astype(np.uint8))
-        return torch.from_numpy(crop_center_with_padding_np(prepared["data"][0], c, tuple(self.patch)))[None], None
+        nz = prepared["nonzero"].astype(np.uint8)
+        c = get_mask_center(nz)
+        crop = lambda a: torch.from_numpy(crop_center_with_padding_np(a, c, tuple(self.patch)))
+        return crop(prepared["data"][0])[None], crop(nz.astype(np.float32))
 
-    def cls_net(self, pretrained: bool = True):
-        """Primus only (04/11, P2): the official build + load_pretrained_weights, read as Primus.forward up to the
-        encoder (down projection, EVA), the tokens averaged (crop_gap_last), with gradient; EVA blocks checkpointed."""
-        assert self.is_primus, "cls_net: Primus (nnFoundation ViT) only"
-        net = self._build(1)
-        net = self._load(net) if pretrained else net
-        # each EVA block checkpointed (non-reentrant): eva.set_grad_checkpointing calls checkpoint(blk, x, rope=...) in
-        # reentrant mode, which takes no keyword arguments ("Unexpected keyword arguments: rope")
-        net.eva.blocks = torch.nn.ModuleList(_Ckpt(b) for b in net.eva.blocks)
-        return PrimusReader(net), ["net.down_projection", "net.eva"]
+    def cls_net(self, pretrained: bool = True, feature: str = "crop_fg_tokens"):
+        """Primus (04/11, P2): the table probe's feature (_crop_features: crop_fg_<level>, the level's tokens averaged
+        over the crop's foreground) from the wrapper's own network and hooks, with gradient; EVA blocks checkpointed."""
+        assert self.is_primus and pretrained and feature.startswith("crop_fg_"), feature
+        net = self.network
+        net.eva.blocks = torch.nn.ModuleList(_Ckpt(b) for b in net.eva.blocks)   # (the tap hooks sit on the inner
+        net.requires_grad_(True)                                                    # blocks: still fired)
+        return CropFgReader(self, feature[len("crop_fg_"):]), ["net.down_projection", "net.eva"]
 
     # ------------------------------------------------------------------ preprocessing (nnssl)
     def preprocess(self, image: Image) -> dict:
@@ -325,19 +324,20 @@ class _Ckpt(torch.nn.Module):
         return self.blk(x, **kw)
 
 
-class PrimusReader(torch.nn.Module):
-    """[1, *patch] crop -> [C] mean of the EVA tokens (primus.py forward: down projection, tokens, EVA)."""
+class CropFgReader(torch.nn.Module):
+    """[1, *patch] crop + its mask -> crop_fg_<level> (_crop_features), with gradient."""
 
-    def __init__(self, net):
+    def __init__(self, w, level: str):
         super().__init__()
-        self.net = net
-        self.dim = net.eva.embed_dim if hasattr(net.eva, "embed_dim") else None
+        self.w, self.net, self.level = w, w.network, level
 
-    def forward(self, x: torch.Tensor, ctx=None) -> torch.Tensor:
-        h = rearrange(self.net.down_projection(x[None].to(next(self.parameters()).device).float()),
-                      "b c w h d -> b (w h d) c")
-        assert self.net.register_tokens is None, "PrimusReader: register tokens"
-        return self.net.eva(h)[0][0].mean(0)
+    def forward(self, x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        dev = next(self.net.parameters()).device
+        v = self.w._encode(x[None].to(dev).float())[self.level][None].float()   # [1, C, h, w, d]
+        st = [p // f for p, f in zip(self.w.patch, v.shape[2:])]
+        wt = (F.avg_pool3d(m[None, None].to(dev).float(), st, st)[0, 0] > 0.5).float()
+        wt = wt if wt.sum() > 0 else torch.ones_like(wt)
+        return (v[0] * wt).flatten(1).sum(1) / wt.sum()
 
 
 build = NnsslWrapper

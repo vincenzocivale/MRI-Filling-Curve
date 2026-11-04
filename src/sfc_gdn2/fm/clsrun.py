@@ -43,7 +43,7 @@ def prep(job: dict) -> None:
                 raise RuntimeError(err)
             xin, ctx = w.cls_input(x)
             dst = cache / f"{it['id']}.pt"
-            torch.save({"x": xin.half(), "ctx": ctx}, dst.with_suffix(".tmp"))
+            torch.save({"x": xin.half() if torch.is_tensor(xin) else xin, "ctx": ctx}, dst.with_suffix(".tmp"))
             os.replace(dst.with_suffix(".tmp"), dst)
         except Exception:  # noqa: BLE001 -- logged per item
             import traceback
@@ -73,25 +73,55 @@ def train(job: dict) -> None:
     print(f"[cls] wrapper built ({time.time() - t_start:.0f} s)", flush=True)
     rng = np.random.default_rng(job["seed"])
     torch.manual_seed(job["seed"])
-    enc, prefixes = w.cls_net(pretrained=True)
+    enc, prefixes = w.cls_net(pretrained=True, feature=job["feature"])
     k = 1 + max(int(it["y"]) for it in job["items"])
-    head = torch.nn.LazyLinear(k)   # on the layer-normed feature (scale-free across models)
-    enc, head = enc.to(dev), head.to(dev)
+    enc = enc.to(dev)
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
     y_tr = np.array([int(it["y"]) for it in split["train"]])
+    y_val = np.array([int(it["y"]) for it in split["val"]])
     wts = torch.tensor(len(y_tr) / (k * np.maximum(np.bincount(y_tr, minlength=k), 1)), dtype=torch.float, device=dev)
     load = lambda it: torch.load(cache / f"{it['id']}.pt", map_location="cpu", weights_only=False)
     amp = (lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if dev.type == "cuda" else contextlib.nullcontext
 
+    inp = lambda r: r["x"].to(dev).float() if torch.is_tensor(r["x"]) else r["x"]   # ours: the extraction's dict
+
+    @torch.no_grad()
+    def feats(items) -> torch.Tensor:   # the frozen encoder's features (eval, the same path as logits)
+        enc.eval()
+        with amp():
+            f = torch.stack([enc(inp(r), r["ctx"]).float() for r in map(load, items)])
+        enc.train()
+        return f
+
+    # LP-FT (04/11, Francesco: the table's head): the table probe's (feature, head, L2) chosen on val, refitted on the
+    # frozen features as bench.probe.fit (train mean / std standardisation, L-BFGS, class-weighted CE, L2 on weight
+    # matrices); the fine-tuning starts from it: at iteration 0 the val / test are the table's frozen probe's
+    F_tr = feats(split["train"])
+    mu, sd = F_tr.mean(0), F_tr.std(0).clamp_min(1e-6)
+    hidden = 256 if job["head"] == "mlp" else 0
+    torch.manual_seed(0)
+    head = torch.nn.Sequential(*([torch.nn.Linear(F_tr.shape[1], hidden), torch.nn.GELU()] if hidden else []),
+                               torch.nn.Linear(hidden or F_tr.shape[1], k)).to(dev)
+    o = torch.optim.LBFGS(head.parameters(), max_iter=500, line_search_fn="strong_wolfe")
+    y_t, X_tr, l2 = torch.tensor(y_tr, device=dev), (F_tr - mu) / sd, float(job["l2"])
+
+    def closure(X=X_tr):
+        o.zero_grad()
+        ls = F.cross_entropy(head(X), y_t, weight=wts) + l2 * sum(p.square().sum() for p in head.parameters()
+                                                                      if p.ndim > 1)
+        ls.backward()
+        return ls
+    o.step(closure)
+    del F_tr, X_tr
+    lp = {"feature": job["feature"], "head": job["head"], "l2": l2}
+    print(f"[cls] table head refitted: {lp} ({time.time() - t_start:.0f} s from start)", flush=True)
+
     def logits(it) -> torch.Tensor:
         r = load(it)
-        f = enc(r["x"].to(dev), r["ctx"]).float()
-        return head(F.layer_norm(f, f.shape[-1:])[None])[0]
+        f = enc(inp(r), r["ctx"]).float()
+        return head(((f - mu) / sd)[None])[0]
 
-    with torch.no_grad(), amp():   # LazyLinear's width from one volume
-        logits(split["train"][0])
-    print(f"[cls] first volume read ({time.time() - t_start:.0f} s from start)", flush=True)
     is_enc = lambda n: any(n == p or n.startswith(p + ".") for p in prefixes)
     enc_p = [p for n, p in enc.named_parameters() if is_enc(n)]
     other = [p for n, p in enc.named_parameters() if not is_enc(n)] + list(head.parameters())
@@ -112,8 +142,12 @@ def train(job: dict) -> None:
         enc.train(), head.train()
         return p
 
-    y_val = np.array([int(it["y"]) for it in split["val"]])
-    best, curve, t0, start = {"val": -1.0}, [], time.time(), 1
+    v0 = score(predict(split["val"]), y_val)   # = the frozen probe's val (same features, same head)
+    print(f"[cls] iter 0 (the table's frozen probe): val {v0:.4f}", flush=True)
+    lp["val"], lp["test_pred"] = v0, predict(split["test"]).tolist()
+    best = {"val": v0, "iter": 0, "state": [{n: t.detach().cpu().clone() for n, t in m.state_dict().items()}
+                                            for m in (enc, head)]}
+    curve, t0, start = [{"iter": 0, "val": v0}], time.time(), 1
     # a killed job resumes (chained short jobs): the whole state every SFC_CLS_SAVE_S seconds next to the result
     last, key = out.with_suffix(".last.pt"), {n: job[n] for n in ("iters", "val_every", "batch", "lr", "enc_lr", "warm",
                                                                   "seed")}
@@ -135,7 +169,9 @@ def train(job: dict) -> None:
         for j in rng.integers(len(split["train"]), size=B):   # one backward per volume: memory of one scan
             with amp():
                 lg = logits(split["train"][j])
-            ls = F.cross_entropy(lg.float()[None], torch.tensor([int(y_tr[j])], device=dev), weight=wts) / B
+            ls = F.cross_entropy(lg.float()[None], torch.tensor([int(y_tr[j])], device=dev), weight=wts,
+                                 label_smoothing=float(job.get("smooth", 0.0))) / B   # (04/11) the table's head is
+            # often perfect on train (CE ~0, no gradient): smoothing keeps a signal; iteration 0 is still the table's
             ls.backward()
             loss += float(ls)
         torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], 12)
@@ -162,6 +198,7 @@ def train(job: dict) -> None:
             t_save = time.time()
     enc.load_state_dict(best["state"][0]), head.load_state_dict(best["state"][1])
     res = {"model": job["cfg"]["model"], "best_iter": best["iter"], "val": best["val"], "curve": curve,
+           "frozen_probe": lp,
            "minutes": (time.time() - t0) / 60, "job": {n: job[n] for n in ("iters", "val_every", "batch", "lr", "enc_lr",
                                                                            "warm", "seed")}}
     for s in ("val", "test"):

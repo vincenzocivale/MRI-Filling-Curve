@@ -790,6 +790,10 @@ def train(job: dict) -> None:
                     group_step.sums = list(batch_sums(logits.detach(), y.to(dev), k)[2:])
             if FT and hasattr(getattr(net, "cache", None), "flush"):   # GradCache: the maps' gradient through the encoder
                 net.cache.flush()
+            if FT and it % TRAIN_LOG == 0:   # the encoder's share of the gradient (fine-tuning: must be > 0 once trained)
+                ge = [p.grad.norm() for n, p in net.named_parameters() if n in enc_names and p.grad is not None]
+                print(f"[seg] it {it} encoder grad norm {float(torch.stack(ge).norm()) if ge else 0.0:.3e} "
+                      f"({len(ge)} tensors)", flush=True)
             gn = torch.nn.utils.clip_grad_norm_(params, 12)
             lsum = [lsum[0] + float(loss), lsum[1] + 1]
             run_l = [run_l[0] + float(loss), run_l[1] + 1]
