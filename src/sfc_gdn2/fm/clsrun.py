@@ -150,6 +150,10 @@ def train(job: dict) -> None:
             if v > best["val"]:
                 best = {"val": v, "iter": it, "state": [{n: t.detach().cpu().clone() for n, t in m.state_dict().items()}
                                                         for m in (enc, head)]}
+            pat = int(job.get("patience") or 0)   # (04/11) stop after `patience` validations without a new best, not
+            if pat and it >= iters // 2 and sum(r["iter"] > best["iter"] for r in curve) >= pat:   # before half the run
+                print(f"[cls] early stop at iter {it}: {pat} validations without a new best", flush=True)   # (noisy val)
+                break
         if time.time() - t_save > save_s and it < iters:
             torch.save({"key": key, "it": it, "enc": enc.state_dict(), "head": head.state_dict(), "opt": opt.state_dict(),
                         "sched": sched.state_dict(), "rng": rng.bit_generator.state, "best": best, "curve": curve,

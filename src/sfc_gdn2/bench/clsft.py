@@ -37,6 +37,7 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--enc-lr", type=float, default=0.1)
     ap.add_argument("--warm", type=float, default=0.2)
+    ap.add_argument("--patience", type=int, default=0, help="validations without a new best before stopping (0: off)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--stage", choices=["all", "prep", "train"], default="all")
     a = ap.parse_args()
@@ -62,7 +63,7 @@ def main() -> None:
         run_in_env(fm["env"], "sfc_gdn2.fm.clsrun",
                    {"stage": "train", "cfg": fm, "cache": cache, "items": items, "device": "cuda", "out": str(out),
                     "iters": a.iters, "val_every": a.val_every, "batch": a.batch, "lr": a.lr, "enc_lr": a.enc_lr,
-                    "warm": a.warm, "seed": a.seed})
+                    "warm": a.warm, "seed": a.seed} | ({"patience": a.patience} if a.patience else {}))
     res = json.loads(out.read_text())
     tp = res["test_pred"]
     test_rows = rows.set_index("id").loc[tp["id"]].reset_index()
