@@ -45,6 +45,7 @@ def main() -> None:
                     "the encoder must adapt, 04/11); -1 = the table's chosen L2")
     ap.add_argument("--enc-lr", type=float, default=1.0)
     ap.add_argument("--smooth", type=float, default=0.0, help="label smoothing of the fine-tuning CE")
+    ap.add_argument("--aug", type=int, default=1, help="training augmentation (flips, intensity scale): 1 on, 0 off")
     ap.add_argument("--light", action="store_true", help="ours: one curve (hilbert, ablation C) and 16 + 8 mm "
                     "(ablation R) instead of the table's reading; the frozen probe then refitted on the L2 grid")
     ap.add_argument("--warm", type=float, default=0.0)
@@ -94,7 +95,7 @@ def main() -> None:
                     "warm": a.warm, "seed": a.seed, "feature": "mean" if a.light else table["feature"],
                     "head": "linear" if a.light or a.l2 >= 0 else table["head"],
                     "l2": a.l2 if a.l2 >= 0 else (None if a.light else table["l2"]), "smooth": a.smooth,
-                    "lr_warm": a.lr_warm} | ({"patience": a.patience} if a.patience else {}))
+                    "lr_warm": a.lr_warm, "aug": a.aug} | ({"patience": a.patience} if a.patience else {}))
     res = json.loads(out.read_text())
     tp = res["test_pred"]
     test_rows = rows.set_index("id").loc[tp["id"]].reset_index()

@@ -139,8 +139,24 @@ def train(job: dict) -> None:
     lp["train_ce"] = head.train_ce
     print(f"[cls] frozen probe head: {lp} ({time.time() - t_start:.0f} s from start)", flush=True)
 
-    def logits(it) -> torch.Tensor:
+    def augment(r: dict) -> dict:
+        """(04/11, training only, the same for every model) a flip of each axis with p 0.5 and the intensities scaled
+        by U(0.9, 1.1). Ours: the extraction's dict (volume [*S], value scale a, c); others: x [1, *S] (+ ctx, the
+        crop's mask, flipped with it)."""
+        dims = [d for d in range(3) if rng.random() < 0.5]
+        sc = float(rng.uniform(0.9, 1.1))
+        if torch.is_tensor(r["x"]):
+            fl = (lambda t: t.flip([d + t.dim() - 3 for d in dims]) if dims else t)
+            return {"x": fl(r["x"]) * sc, "ctx": fl(r["ctx"]) if torch.is_tensor(r["ctx"]) else r["ctx"]}
+        x = dict(r["x"])
+        x["volume"] = x["volume"].flip(dims) if dims else x["volume"]
+        a_, c_ = x["value"]
+        x["value"] = (a_ * sc, c_ * sc)
+        return {"x": x, "ctx": r["ctx"]}
+
+    def logits(it, aug: bool = False) -> torch.Tensor:
         r = load(it)
+        r = augment(r) if aug else r
         f = enc(inp(r), r["ctx"]).float()
         return head(((f - mu) / sd)[None])[0]
 
@@ -191,7 +207,7 @@ def train(job: dict) -> None:
         loss = 0.0
         for j in rng.integers(len(split["train"]), size=B):   # one backward per volume: memory of one scan
             with amp():
-                lg = logits(split["train"][j])
+                lg = logits(split["train"][j], aug=bool(job.get("aug")))
             ls = F.cross_entropy(lg.float()[None], torch.tensor([int(y_tr[j])], device=dev), weight=wts,
                                  label_smoothing=float(job.get("smooth", 0.0))) / B   # (04/11) the table's head is
             # often perfect on train (CE ~0, no gradient): smoothing keeps a signal; iteration 0 is still the table's
