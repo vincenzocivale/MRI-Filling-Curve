@@ -190,7 +190,7 @@ def train(job: dict) -> None:
         """(04/11, training only, the same for every model) a flip of each axis with p 0.5 and the intensities scaled
         by U(0.9, 1.1). Ours: the extraction's dict (volume [*S], value scale a, c); others: x [1, *S] (+ ctx, the
         crop's mask, flipped with it)."""
-        dims = [d for d in range(3) if rng.random() < 0.5]
+        dims = [d for d in range(3) if rng.random() < 0.5] if int(job.get("aug", 1)) == 1 else []   # aug 2: no flips
         sc = float(rng.uniform(0.9, 1.1))
         if torch.is_tensor(r["x"]):
             fl = (lambda t: t.flip([d + t.dim() - 3 for d in dims]) if dims else t)

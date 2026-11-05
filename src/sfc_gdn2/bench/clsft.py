@@ -45,7 +45,7 @@ def main() -> None:
                     "the encoder must adapt, 04/11); -1 = the table's chosen L2")
     ap.add_argument("--enc-lr", type=float, default=1.0)
     ap.add_argument("--smooth", type=float, default=0.0, help="label smoothing of the fine-tuning CE")
-    ap.add_argument("--aug", type=int, default=1, help="training augmentation (flips, intensity scale): 1 on, 0 off")
+    ap.add_argument("--aug", type=int, default=1, help="training augmentation: 1 flips + intensity scale, 2 intensity scale only (05/11: the table head, fit on unflipped volumes, gave CE ~1 on flipped ones at lr ~0 and wrecked the encoder), 0 off")
     ap.add_argument("--light", action="store_true", help="ours: one curve (hilbert, ablation C) and 16 + 8 mm "
                     "(ablation R) instead of the table's reading; the frozen probe then refitted on the L2 grid")
     ap.add_argument("--warm", type=float, default=0.0)

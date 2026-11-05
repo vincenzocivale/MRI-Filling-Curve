@@ -155,6 +155,9 @@ class GrainPlateau:
         self.window, self.gap, self.every = int(g.get("window", 250)), int(g.get("gap", 500)), int(g.get("every", 250))
         self.rate, self.patience = float(g.get("rate", 0.03)), int(g.get("patience", 2))
         self.min_samples = int(g.get("min_samples", 5))   # per window (a smoke's toy windows: 1)
+        # (02/11, W6) after: no check before this step (a fixed lr until then); cut_on_rise false: a rising loss is not a
+        # plateau (a new domain lifts it at first), only a loss that falls by less than `rate`
+        self.after, self.cut_on_rise = int(g.get("after", 0)), bool(g.get("cut_on_rise", True))
         self.factor, self.max_cuts = float(g.get("lr_factor", 0.3)), int(g.get("lr_cuts", 3))
         self.stage, self.cuts, self.start, self.hits, self.done = int(g.get("start_stage", 0)), 0, start, 0, False
         self.rec, self.events = [], []
@@ -185,7 +188,7 @@ class GrainPlateau:
         (next stage, lr cut, done) or None."""
         terms = terms if isinstance(terms, dict) else {"loss": float(terms)}
         self.rec.append((step, mm, terms))
-        if self.done or step % self.every or step - self.start < self.window + self.gap:
+        if self.done or step % self.every or step - self.start < self.window + self.gap or step < self.after:
             return None
         key = self.stages[self.stage].get("watch", "loss") if self.cuts == 0 else "loss"
         # grain stages: the finest grain's steps (a watched term: every step); lr cuts: the whole loss, every step
@@ -198,7 +201,7 @@ class GrainPlateau:
         if now is None or before is None:
             return None
         rate = (before - now) / before * 1000 / self.gap
-        self.hits = self.hits + 1 if rate < self.rate else 0
+        self.hits = self.hits + 1 if rate < self.rate and (self.cut_on_rise or rate >= 0) else 0
         if self.hits < self.patience:
             return None
         self.hits, self.start = 0, step
