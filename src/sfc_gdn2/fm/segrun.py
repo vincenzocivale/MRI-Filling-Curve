@@ -904,20 +904,37 @@ def train(job: dict) -> None:
         load_trained(best["state"])
         net.eval()
         net.full, net.read_taus = True, list(net.TAUS)
-        nt, preds, vs = len(net.read_taus), [[] for _ in net.TAUS], []
-        for it in split["val"]:
+        nt = len(net.read_taus)
+        # (05/11) scored volume by volume and kept in <out>.taus.json: a job killed inside this pass resumes it (TotalSeg:
+        # longer than a 45-min block, redone by every block); the same scores as keeping every prediction
+        fdet = job.get("select") in ("f1", "det")
+        md = ("det" if job["select"] == "det" else True) if fdet else None
+        tf, tk = out_p.with_suffix(".taus.json"), {"best_iter": best["iter"], "taus": [float(t) for t in net.read_taus]}
+        st = json.loads(tf.read_text()) if tf.exists() else {}
+        st = st if st.get("key") == tk else {"key": tk, "ids": [], "per": []}
+        t_th = time.time()
+        for n_, it in enumerate(split["val"]):
+            if it["id"] in st["ids"]:
+                continue
             v = load(it)
             p = sliding(net, v["x"].to(dev).float(), patch, k * nt, amp, v["ctx"])
+            rows = []
             for a in range(nt):
-                preds[a].append(p[a * k:(a + 1) * k].argmax(0).to(torch.uint8).cpu())
-            vs.append({n: v[n] for n in ("y", "sp", "pts") if n in v})
+                q = p[a * k:(a + 1) * k].argmax(0).to(torch.uint8).cpu()
+                rows.append([[float(x) for x in _score((q == c).numpy(), (v["y"] == c).numpy(), md, sp=v.get("sp"),
+                                                       pts=v.get("pts"))] for c in range(1, k)] if fdet
+                            else dice_on(q, v["y"], k))
+            st["ids"].append(it["id"])
+            st["per"].append(rows)
+            tf.write_text(json.dumps(st))
+            print(f"[seg] read threshold: val {len(st['ids'])}/{len(split['val'])} ({(time.time() - t_th) / 60:.1f} min)",
+                  flush=True)
             del v, p
-        if job.get("select") in ("f1", "det"):
-            md = "det" if job["select"] == "det" else True
-            by = [float(np.nanmean([_metric([_score((q == c).numpy(), (v["y"] == c).numpy(), md, sp=v.get("sp"), pts=v.get("pts"))
-                                             for q, v in zip(pa, vs)], True) for c in range(1, k)])) for pa in preds]
+        per = st["per"]
+        if fdet:
+            by = [float(np.nanmean([_metric([tuple(r[a][c - 1]) for r in per], True) for c in range(1, k)])) for a in range(nt)]
         else:
-            by = [float(np.nanmean([dice_on(q, v["y"], k) for q, v in zip(pa, vs)])) for pa in preds]
+            by = [float(np.nanmean([r[a] for r in per])) for a in range(nt)]
         # 30/10: reading every cell is not the training read (the encoder reads the chosen cells as one sequence, so
         # their tokens change): the training read (None) is a candidate too, its val score the selection's own
         by_t = {str(t): d for t, d in zip(net.read_taus, by)} | {"train": float(best.get("score", best["val"]))}
@@ -925,7 +942,6 @@ def train(job: dict) -> None:
         best |= {"read_tau": None if b_ == "train" else float(b_), "val_by_tau": by_t}
         print(f"[seg] read threshold {best['read_tau']} (val {job.get('select') or 'dice'} per threshold "
               f"{best['val_by_tau']})", flush=True)
-        del preds, vs
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
     if best.get("read_tau") is not None:   # the test reads every cell, its threshold a mask (as chosen)
         net.full, net.read_taus = True, [best["read_tau"]]
