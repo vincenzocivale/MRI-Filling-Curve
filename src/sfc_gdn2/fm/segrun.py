@@ -989,25 +989,32 @@ def train(job: dict) -> None:
             continue
         t1 = time.time()
         v = load(it)
+        t2 = time.time()
         probs = sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])
+        torch.cuda.synchronize() if dev.type == "cuda" else None
+        t3 = time.time()   # (05/11) where a test volume's time goes: load, sliding window, the rest below
         lab, _, _ = gt_labels(it["seg"], it.get("classes"), it.get("ignore"))
         pl = None
         if rule:   # the val-chosen post-processing, then scored as the argmax of its one-hot
             q = (probs.float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy() if k <= 8 else None
             pl = postproc(probs.argmax(0).to(torch.uint8).cpu().numpy(), q, rule)
             probs_s = F.one_hot(torch.from_numpy(pl).long(), k).permute(3, 0, 1, 2).half()
+        t4 = time.time()
         d, per = dice_full_res(probs_s if rule else probs, v["grid_from_gt"], lab, k, dev)
+        t5 = time.time()
         if DET:   # detection sums (tp, points, false detections) per class on the model grid, as the val selection
             pm = pl if pl is not None else probs.argmax(0).cpu().numpy()
             yy = (v["y"][0] if v["y"].dim() == 4 else v["y"]).numpy()
             res.setdefault("det", []).append([_score(pm == c, yy == c, "det", sp=v["sp"], pts=v["pts"]) for c in range(1, k)])
         save_pred(out_p.with_suffix(".pred"), it["id"], probs, v["grid_from_gt"], lab=pl)
+        t6 = time.time()
         res["per_volume"].append(d)
         res["per_class"].append(per)
         res["test_ids"].append(it["id"])
         part.write_text(json.dumps({"key": tkey, "res": res}))
         print(f"[seg] test {len(res['test_ids'])}/{len(split['test'])} {it['id']}: dice {d:.4f} grid "
-              f"{tuple(v['x'].shape[1:])} {time.time() - t1:.0f}s, peak RSS "
+              f"{tuple(v['x'].shape[1:])} {time.time() - t1:.0f}s (load {t2 - t1:.0f}, sliding {t3 - t2:.0f}, labels + post {t4 - t3:.0f}, "
+              f"dice {t5 - t4:.0f}, save {t6 - t5:.0f}), peak RSS "
               f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.0f} GB", flush=True)
         del v, probs, lab
     out = {"model": job["cfg"]["model"], "init": job["init"], "lr": job["lr"], "iters": iters, "patch": patch,
