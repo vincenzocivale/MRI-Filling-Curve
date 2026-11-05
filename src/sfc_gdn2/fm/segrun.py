@@ -685,6 +685,7 @@ def train(job: dict) -> None:
         opt = torch.optim.AdamW(groups if FT else params, lr=job["lr"], weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: (1 - i / iters) ** 0.9)
         best, curve, start, t0 = {"val": -1.0}, [], 1, time.time()
+        vp = False
         state = torch.load(last, map_location="cpu", weights_only=False) if last.exists() else {}
         if state.get("key") == key:
             load_trained(state["net"])
@@ -695,14 +696,16 @@ def train(job: dict) -> None:
             if state["cuda_rng"] is not None and dev.type == "cuda":
                 torch.cuda.set_rng_state(state["cuda_rng"])
             best, curve, start, t0 = state["best"], state["curve"], state["it"] + 1, t0 - state["min"] * 60
+            vp = bool(state.get("val_pending"))   # (05/11) killed inside the validation of `it`: redo only it
+            start -= vp
             print(f"[seg] resumed from {last} at iter {state['it']} ({state['min']:.1f} min done)", flush=True)
         t_save = time.time()
 
-        def save_last(it: int) -> None:
+        def save_last(it: int, val_pending: bool = False) -> None:
             torch.save({"key": key, "it": it, "net": trained(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                         "rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
                         "cuda_rng": torch.cuda.get_rng_state() if dev.type == "cuda" else None,
-                        "best": best, "curve": curve, "min": (time.time() - t0) / 60}, last.with_suffix(".tmp"))
+                        "best": best, "curve": curve, "min": (time.time() - t0) / 60, "val_pending": val_pending}, last.with_suffix(".tmp"))
             os.replace(last.with_suffix(".tmp"), last)
 
         def set_mode():
@@ -738,86 +741,93 @@ def train(job: dict) -> None:
                     if n in enc_names:
                         p.requires_grad_(on)
                 print(f"[seg] finetune: encoder {'trained' if on else 'frozen (decoder warm-up)'} from iter {it}", flush=True)
-            if FT and hasattr(net.cache if hasattr(net, "cache") else None, "clear"):   # GradCache: each step reads its
-                net.cache.clear()                                                         # scans anew (every branch below)
-            if pn and it in (start + pw, start + pw + pn):
-                torch.cuda.synchronize()
-                if it == start + pw:
-                    import cProfile
-                    prof = (cProfile.Profile(), torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                                                  torch.profiler.ProfilerActivity.CUDA]), time.time())
-                    prof[1].__enter__()
-                    prof[0].enable()
-                else:
-                    import io
-                    import pstats
-                    prof[0].disable()
-                    prof[1].__exit__(None, None, None)
-                    wall = (time.time() - prof[2]) / pn
-                    ev = prof[1].key_averages()
-                    gpu = sum(e.self_device_time_total for e in ev) / 1e6 / pn
-                    buf = io.StringIO()
-                    pstats.Stats(prof[0], stream=buf).sort_stats("cumulative").print_stats(80)
-                    head = f"batch {job['batch']}: {wall:.3f} s per iteration, GPU kernels {gpu:.3f} s ({100 * gpu / wall:.0f} %)"
-                    out_p.with_suffix(".prof.txt").write_text(head + "\n\n" + ev.table(sort_by="self_device_time_total", row_limit=40)
-                                                              + "\n\n" + buf.getvalue())
-                    print(f"[seg] profile: {head} -> {out_p.with_suffix('.prof.txt')}", flush=True)
-                    return
-            ta = time.time()
-            x, y, c = queue.pop(0).result()
-            if it + len(queue) < iters:
-                queue.append(drawer.submit(draw))
-            tb = time.time()
-            opt.zero_grad(set_to_none=True)
-            if LM:
-                loss = landmark_step(net, x, y, c, amp, dev)
-                logits = torch.zeros(1, device=dev)
-            elif int(os.environ.get("SFC_SEG_CHUNK", "0")):   # (04/11, opt-in, frozen or fine-tuned: e.g. a 12 GB GPU)
-                # the batch's tiles SFC_SEG_CHUNK at a time, one backward each, the same gradient (micro_step)
-                loss = micro_step(net, x, y, c, k, amp, dev, int(os.environ["SFC_SEG_CHUNK"]))
-                logits = torch.zeros(1, device=dev)
-            elif isinstance(x, list) and getattr(net, "any_tile", False):   # tiles of several shapes, grouped by shape
-                loss = group_step(net, x, y, c, k, amp, dev)
-                logits = torch.zeros(1, device=dev)
-            elif isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
-                loss = micro_step(net, x, y, c, k, amp, dev)
-                logits = torch.zeros(1, device=dev)
+            if vp:   # resumed at a pending validation: its step was done and saved before the kill
+                vp, tc = False, time.time()
             else:
-                sel_target(net, y)
-                with amp():
-                    logits = call(net, x.to(dev, non_blocking=True).float(), c)
-                loss = loss_fn(logits, y.to(dev), k) + pop_aux(net)
-                loss.backward()
-                with torch.no_grad():   # the batch's soft Dice sums for the running log (as group_step's)
-                    group_step.sums = list(batch_sums(logits.detach(), y.to(dev), k)[2:])
-            if FT and hasattr(getattr(net, "cache", None), "flush"):   # GradCache: the maps' gradient through the encoder
-                net.cache.flush()
-            if FT and it % TRAIN_LOG == 0:   # the encoder's share of the gradient (fine-tuning: must be > 0 once trained)
-                ge = [p.grad.norm() for n, p in net.named_parameters() if n in enc_names and p.grad is not None]
-                print(f"[seg] it {it} encoder grad norm {float(torch.stack(ge).norm()) if ge else 0.0:.3e} "
-                      f"({len(ge)} tensors)", flush=True)
-            gn = torch.nn.utils.clip_grad_norm_(params, 12)
-            lsum = [lsum[0] + float(loss), lsum[1] + 1]
-            run_l = [run_l[0] + float(loss), run_l[1] + 1]
-            if getattr(group_step, "sums", None) is not None:   # user 31/10: the training batches' Dice as it goes
-                run_d = [a + b for a, b in zip(run_d, group_step.sums)] if run_d else list(group_step.sums)
-                group_step.sums = None
-            if it % TRAIN_LOG == 0:
-                td = "" if not run_d else \
-                    f" soft Dice {float(((2 * run_d[0][1:] + 1e-5) / (run_d[1][1:] + run_d[2][1:] + 1e-5)).mean()):.4f}"
-                print(f"[seg] it {it} train (last {run_l[1]} batches): loss {run_l[0] / max(run_l[1], 1):.3f}{td} "
-                      f"({(time.time() - t0) / 60:.1f} min, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB)", flush=True)
-                run_l, run_d = [0.0, 0], None
-            if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
-                raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "
-                                         f"{bool(torch.isfinite(logits).all())}, input finite "
-                                         f"{all(bool(torch.isfinite(t).all()) for t in (x if isinstance(x, list) else [x]))}, "
-                                         f"context {None if c is None else [t.tolist() for t in c]}")
-            opt.step()
-            sched.step()
-            tc = time.time()
-            tm["data"], tm["step"] = tm["data"] + tb - ta, tm["step"] + tc - tb
+                if FT and hasattr(net.cache if hasattr(net, "cache") else None, "clear"):   # GradCache: each step reads its
+                    net.cache.clear()                                                         # scans anew (every branch below)
+                if pn and it in (start + pw, start + pw + pn):
+                    torch.cuda.synchronize()
+                    if it == start + pw:
+                        import cProfile
+                        prof = (cProfile.Profile(), torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                                                      torch.profiler.ProfilerActivity.CUDA]), time.time())
+                        prof[1].__enter__()
+                        prof[0].enable()
+                    else:
+                        import io
+                        import pstats
+                        prof[0].disable()
+                        prof[1].__exit__(None, None, None)
+                        wall = (time.time() - prof[2]) / pn
+                        ev = prof[1].key_averages()
+                        gpu = sum(e.self_device_time_total for e in ev) / 1e6 / pn
+                        buf = io.StringIO()
+                        pstats.Stats(prof[0], stream=buf).sort_stats("cumulative").print_stats(80)
+                        head = f"batch {job['batch']}: {wall:.3f} s per iteration, GPU kernels {gpu:.3f} s ({100 * gpu / wall:.0f} %)"
+                        out_p.with_suffix(".prof.txt").write_text(head + "\n\n" + ev.table(sort_by="self_device_time_total", row_limit=40)
+                                                                  + "\n\n" + buf.getvalue())
+                        print(f"[seg] profile: {head} -> {out_p.with_suffix('.prof.txt')}", flush=True)
+                        return
+                ta = time.time()
+                x, y, c = queue.pop(0).result()
+                if it + len(queue) < iters:
+                    queue.append(drawer.submit(draw))
+                tb = time.time()
+                opt.zero_grad(set_to_none=True)
+                if LM:
+                    loss = landmark_step(net, x, y, c, amp, dev)
+                    logits = torch.zeros(1, device=dev)
+                elif int(os.environ.get("SFC_SEG_CHUNK", "0")):   # (04/11, opt-in, frozen or fine-tuned: e.g. a 12 GB GPU)
+                    # the batch's tiles SFC_SEG_CHUNK at a time, one backward each, the same gradient (micro_step)
+                    loss = micro_step(net, x, y, c, k, amp, dev, int(os.environ["SFC_SEG_CHUNK"]))
+                    logits = torch.zeros(1, device=dev)
+                elif isinstance(x, list) and getattr(net, "any_tile", False):   # tiles of several shapes, grouped by shape
+                    loss = group_step(net, x, y, c, k, amp, dev)
+                    logits = torch.zeros(1, device=dev)
+                elif isinstance(x, list) or (getattr(w, "seg_microbatch", False) and k > 10):   # lists: tiles of several shapes
+                    loss = micro_step(net, x, y, c, k, amp, dev)
+                    logits = torch.zeros(1, device=dev)
+                else:
+                    sel_target(net, y)
+                    with amp():
+                        logits = call(net, x.to(dev, non_blocking=True).float(), c)
+                    loss = loss_fn(logits, y.to(dev), k) + pop_aux(net)
+                    loss.backward()
+                    with torch.no_grad():   # the batch's soft Dice sums for the running log (as group_step's)
+                        group_step.sums = list(batch_sums(logits.detach(), y.to(dev), k)[2:])
+                if FT and hasattr(getattr(net, "cache", None), "flush"):   # GradCache: the maps' gradient through the encoder
+                    net.cache.flush()
+                if FT and it % TRAIN_LOG == 0:   # the encoder's share of the gradient (fine-tuning: must be > 0 once trained)
+                    ge = [p.grad.norm() for n, p in net.named_parameters() if n in enc_names and p.grad is not None]
+                    print(f"[seg] it {it} encoder grad norm {float(torch.stack(ge).norm()) if ge else 0.0:.3e} "
+                          f"({len(ge)} tensors)", flush=True)
+                gn = torch.nn.utils.clip_grad_norm_(params, 12)
+                lsum = [lsum[0] + float(loss), lsum[1] + 1]
+                run_l = [run_l[0] + float(loss), run_l[1] + 1]
+                if getattr(group_step, "sums", None) is not None:   # user 31/10: the training batches' Dice as it goes
+                    run_d = [a + b for a, b in zip(run_d, group_step.sums)] if run_d else list(group_step.sums)
+                    group_step.sums = None
+                if it % TRAIN_LOG == 0:
+                    td = "" if not run_d else \
+                        f" soft Dice {float(((2 * run_d[0][1:] + 1e-5) / (run_d[1][1:] + run_d[2][1:] + 1e-5)).mean()):.4f}"
+                    print(f"[seg] it {it} train (last {run_l[1]} batches): loss {run_l[0] / max(run_l[1], 1):.3f}{td} "
+                          f"({(time.time() - t0) / 60:.1f} min, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB)", flush=True)
+                    run_l, run_d = [0.0, 0], None
+                if not torch.isfinite(gn):   # a cause to fix, never a step to skip (user, 18/10): stop and say which batch
+                    raise FloatingPointError(f"iter {it}: loss {float(loss)}, grad norm {float(gn)}, logits finite "
+                                             f"{bool(torch.isfinite(logits).all())}, input finite "
+                                             f"{all(bool(torch.isfinite(t).all()) for t in (x if isinstance(x, list) else [x]))}, "
+                                             f"context {None if c is None else [t.tolist() for t in c]}")
+                opt.step()
+                sched.step()
+                tc = time.time()
+                tm["data"], tm["step"] = tm["data"] + tb - ta, tm["step"] + tc - tb
             if it % every == 0 or it == iters:
+                # (05/11, Francesco) the state saved before every validation: a job killed inside it resumes here, at
+                # this validation (TotalSeg in 30-min blocks redid 9889 -> 10000 and a 13-min val four times)
+                save_last(it, val_pending=True)
+                t_save = time.time()
                 net.eval()
                 # probabilities kept for the landmark tasks (a point per landmark from each class's map); labels: argmax
                 # scan by scan, only the labels kept (31/10: TotalSeg's ~50-class whole-body probabilities of every val
