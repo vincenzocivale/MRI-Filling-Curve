@@ -99,45 +99,59 @@ def train(job: dict) -> None:
     # LP-FT (04/11, Francesco: the table's head): the table probe's (feature, head, L2) chosen on val, refitted on the
     # frozen features as bench.probe.fit (train mean / std standardisation, L-BFGS, class-weighted CE, L2 on weight
     # matrices); the fine-tuning starts from it: at iteration 0 the val / test are the table's frozen probe's
-    F_tr = feats(split["train"])
-    mu, sd = F_tr.mean(0), F_tr.std(0).clamp_min(1e-6)
+    # the frozen probe saved once (05/11: chained 30-min blocks recomputed ~1200 volumes' features each time and never
+    # reached the fine-tuning); a later block loads it
     hidden = 256 if job["head"] == "mlp" else 0
-    y_t, X_tr = torch.tensor(y_tr, device=dev), (F_tr - mu) / sd
+    lpf, lpkey = out.with_suffix(".lp.pt"), {n: job.get(n) for n in ("feature", "head", "l2")}
+    if lpf.exists() and (c := torch.load(lpf, map_location="cpu", weights_only=False))["key"] == lpkey:
+        mu, sd, lp = c["mu"].to(dev), c["sd"].to(dev), c["lp"]
+        D = mu.numel()
+        head = torch.nn.Sequential(*([torch.nn.Linear(D, hidden), torch.nn.GELU()] if hidden else []),
+                                   torch.nn.Linear(hidden or D, k)).to(dev)
+        head.load_state_dict(c["head"])
+        print(f"[cls] frozen probe loaded from {lpf}: {lp}", flush=True)
+    else:
+        F_tr = feats(split["train"])
+        mu, sd = F_tr.mean(0), F_tr.std(0).clamp_min(1e-6)
+        y_t, X_tr = torch.tensor(y_tr, device=dev), (F_tr - mu) / sd
 
-    def fit(l2: float, X=None):
-        X = X_tr if X is None else X
-        torch.manual_seed(0)
-        h = torch.nn.Sequential(*([torch.nn.Linear(X.shape[1], hidden), torch.nn.GELU()] if hidden else []),
-                                torch.nn.Linear(hidden or X.shape[1], k)).to(dev)
-        o = torch.optim.LBFGS(h.parameters(), max_iter=500, line_search_fn="strong_wolfe")
+        def fit(l2: float, X=None):
+            X = X_tr if X is None else X
+            torch.manual_seed(0)
+            h = torch.nn.Sequential(*([torch.nn.Linear(X.shape[1], hidden), torch.nn.GELU()] if hidden else []),
+                                    torch.nn.Linear(hidden or X.shape[1], k)).to(dev)
+            o = torch.optim.LBFGS(h.parameters(), max_iter=500, line_search_fn="strong_wolfe")
 
-        def closure():
-            o.zero_grad()
-            ls = F.cross_entropy(h(X), y_t, weight=wts) + l2 * sum(p.square().sum() for p in h.parameters()
-                                                                       if p.ndim > 1)
-            ls.backward()
-            return ls
-        o.step(closure)
-        with torch.no_grad():
-            h.train_ce = float(F.cross_entropy(h(X), y_t, weight=wts))   # the fine-tuning's first loss must match it
-        return h
-
-    if job.get("l2") is not None:   # the table's L2 (its reading)
-        l2 = float(job["l2"])
-        head = fit(l2)
-    else:   # (04/11, the lighter reading: one curve, 16 + 8 mm) the table's L2 grid, chosen on the val
-        X_val = (feats(split["val"]) - mu) / sd
-        cand = []
-        for l2 in L2_GRID:
-            h = fit(l2)
+            def closure():
+                o.zero_grad()
+                ls = F.cross_entropy(h(X), y_t, weight=wts) + l2 * sum(p.square().sum() for p in h.parameters()
+                                                                           if p.ndim > 1)
+                ls.backward()
+                return ls
+            o.step(closure)
             with torch.no_grad():
-                cand.append((score(h(X_val).softmax(-1).cpu().numpy(), y_val), l2, h))
-            print(f"[cls] frozen probe l2 {l2:g}: val {cand[-1][0]:.4f}", flush=True)
-        _, l2, head = max(cand, key=lambda c: c[0])
-        del X_val, cand
-    lp = {"feature": job["feature"], "head": job["head"], "l2": l2}
-    lp["train_ce"] = head.train_ce
-    print(f"[cls] frozen probe head: {lp} ({time.time() - t_start:.0f} s from start)", flush=True)
+                h.train_ce = float(F.cross_entropy(h(X), y_t, weight=wts))   # the fine-tuning's first loss must match it
+            return h
+
+        if job.get("l2") is not None:   # the table's L2 (its reading)
+            l2 = float(job["l2"])
+            head = fit(l2)
+        else:   # (04/11, the lighter reading: one curve, 16 + 8 mm) the table's L2 grid, chosen on the val
+            X_val = (feats(split["val"]) - mu) / sd
+            cand = []
+            for l2 in L2_GRID:
+                h = fit(l2)
+                with torch.no_grad():
+                    cand.append((score(h(X_val).softmax(-1).cpu().numpy(), y_val), l2, h))
+                print(f"[cls] frozen probe l2 {l2:g}: val {cand[-1][0]:.4f}", flush=True)
+            _, l2, head = max(cand, key=lambda c: c[0])
+            del X_val, cand
+        lp = {"feature": job["feature"], "head": job["head"], "l2": l2}
+        lp["train_ce"] = head.train_ce
+        print(f"[cls] frozen probe head: {lp} ({time.time() - t_start:.0f} s from start)", flush=True)
+    lp_state = {"key": lpkey, "mu": mu.cpu(), "sd": sd.cpu(), "head": {n: t.cpu() for n, t in head.state_dict().items()}}
+    if not lpf.exists():
+        torch.save(lp_state | {"lp": lp}, lpf)
 
     def augment(r: dict) -> dict:
         """(04/11, training only, the same for every model) a flip of each axis with p 0.5 and the intensities scaled
@@ -181,9 +195,12 @@ def train(job: dict) -> None:
         enc.train(), head.train()
         return p
 
-    v0 = score(predict(split["val"]), y_val)   # = the frozen probe's val (same features, same head)
-    print(f"[cls] iter 0 (the table's frozen probe): val {v0:.4f}", flush=True)
-    lp["val"], lp["test_pred"] = v0, predict(split["test"]).tolist()
+    if "val" not in lp:   # iteration 0 = the frozen probe: its val and test predictions, once (kept in the .lp.pt)
+        lp["val"] = score(predict(split["val"]), y_val)
+        lp["test_pred"] = predict(split["test"]).tolist()
+        torch.save(lp_state | {"lp": lp}, lpf)
+    v0 = lp["val"]
+    print(f"[cls] iter 0 (the frozen probe): val {v0:.4f}", flush=True)
     best = {"val": v0, "iter": 0, "state": [{n: t.detach().cpu().clone() for n, t in m.state_dict().items()}
                                             for m in (enc, head)]}
     curve, t0, start = [{"iter": 0, "val": v0}], time.time(), 1
