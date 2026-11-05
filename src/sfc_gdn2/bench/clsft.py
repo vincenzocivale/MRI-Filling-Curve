@@ -52,6 +52,8 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=6, help="validations without a new best before stopping (0: off)")
     ap.add_argument("--subset", type=int, default=0, help="pilot: the first n train volumes, n // 2 val and test")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--feat-dir", default="/leonardo_scratch/large/userexternal/fcorrent/sfc_runs/fm_bench",
+                    help="the table's extractions (an external's +covsqrt basis)")
     ap.add_argument("--stage", choices=["all", "prep", "train"], default="all")
     ap.add_argument("--probe-json", required=True, help="the table's probe result of this model, task, split: its "
                     "head chosen on val (linear / mlp, the better val) gives feature, head and L2")
@@ -85,11 +87,27 @@ def main() -> None:
         return
     pj = json.loads(Path(a.probe_json).read_text())
     pj = pj.get(a.task, pj)
-    var = max(("linear", "mlp"), key=lambda v: pj[v]["val"][pj["metric"]])
+    var = max(("linear", "mlp"), key=lambda v: (pj[v]["val"][pj["metric"]],   # ties (ours autism, 0.689 both): the
+                                                 "blocks+covsqrt" not in pj[v]["feature"]))   # reading TableReader has
     table = {"head": var, "feature": pj[var]["feature"], "l2": pj[var]["l2"], "val": pj[var]["val"][pj["metric"]],
              "test": pj[var]["test"][pj["metric"]]}
     print(f"[clsft] the table's probe (split {a.seed}): {table}", flush=True)
     assert cfg["type"] in ("class", "ordinal"), cfg["type"]
+    basis = None
+    if table["feature"].endswith("+covsqrt") and not a.model.startswith("sfc_gdn2") and not a.light and a.l2 < 0:
+        # (05/11) an external's covariance reading: the table's basis (probe.ext_basis: the same tune volumes, seed)
+        from .probe import ext_basis, tune_subjects
+        basis = out.with_suffix(".basis.pt")
+        if not basis.exists():
+            key = table["feature"][: -len("+covsqrt")]
+            d = Path(a.feat_dir) / a.model
+            ids = sorted(p.stem for p in d.glob("*.pt") if not p.name.startswith("_"))
+            mv1 = Path(a.manifests).with_name("bench")   # the table's probes: the v1 manifest's tune subjects
+            v1, s1 = pd.read_csv(mv1 / "volumes.csv", low_memory=False, dtype={"session": str}), pd.read_csv(mv1 / "splits.csv")
+            fit = set(v1.loc[v1["subject"].isin(tune_subjects(s1)), "id"])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(ext_basis(d, ids, [key], fit=fit)[key], basis)
+            print(f"[clsft] basis of {key} from {d} ({len(fit & set(ids))} tune volumes)", flush=True)
     if not out.exists():
         run_in_env(fm["env"], "sfc_gdn2.fm.clsrun",
                    {"stage": "train", "cfg": fm, "cache": cache, "items": items, "device": "cuda", "out": str(out),
@@ -97,7 +115,7 @@ def main() -> None:
                     "warm": a.warm, "seed": a.seed, "feature": "mean" if a.light else table["feature"],
                     "head": "linear" if a.light or a.l2 >= 0 else table["head"],
                     "l2": a.l2 if a.l2 >= 0 else (None if a.light else table["l2"]), "smooth": a.smooth,
-                    "lr_warm": a.lr_warm, "aug": a.aug, "kind": cfg["type"]} | ({"patience": a.patience} if a.patience else {}))
+                    "lr_warm": a.lr_warm, "aug": a.aug, "kind": cfg["type"]} | ({"basis": str(basis)} if basis else {}) | ({"patience": a.patience} if a.patience else {}))
     res = json.loads(out.read_text())
     tp = res["test_pred"]
     test_rows = rows.set_index("id").loc[tp["id"]].reset_index()

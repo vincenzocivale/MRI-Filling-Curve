@@ -622,14 +622,10 @@ def _ext_one(path: Path) -> dict:
     return out
 
 
-def second_order_ext(d: Path, ids: list[str], keys: list[str], dim: int = 64, sample: int = 400,
-                     fit: set | None = None) -> dict:
-    """Another model's second-order readings, as second_order for ours (user, 21/10: the same readings for every
-    model): for each stored map, the per-channel std of its tokens and the covariance square root on the first `dim`
-    principal directions (fit on `sample` tune volumes, 200 tokens each). One pass; cached in <d>/_second_order_ext.pt."""
-    cache = d / "_second_order_ext.pt"
-    if cache.exists() and (c := torch.load(cache))["ids"] == ids:
-        return c["feats"]
+def ext_basis(d: Path, ids: list[str], keys: list[str], dim: int = 64, sample: int = 400,
+              fit: set | None = None) -> dict:
+    """second_order_ext's basis: per map, (token mean, its `dim` principal directions) from `sample` tune volumes,
+    200 tokens each (seed 0); also the fine-tuning's frozen basis (bench/clsft, 05/11)."""
     g = torch.Generator().manual_seed(0)
     pool: dict[str, list] = {}
     cand = [i for i in ids if fit is None or i in fit]
@@ -643,6 +639,18 @@ def second_order_ext(d: Path, ids: list[str], keys: list[str], dim: int = 64, sa
         x = torch.cat(ts)
         mu = x.mean(0)
         basis[key] = mu, torch.linalg.eigh((x - mu).T @ (x - mu) / len(x))[1][:, -min(dim, x.shape[1]):]
+    return basis
+
+
+def second_order_ext(d: Path, ids: list[str], keys: list[str], dim: int = 64, sample: int = 400,
+                     fit: set | None = None) -> dict:
+    """Another model's second-order readings, as second_order for ours (user, 21/10: the same readings for every
+    model): for each stored map, the per-channel std of its tokens and the covariance square root on the first `dim`
+    principal directions (fit on `sample` tune volumes, 200 tokens each). One pass; cached in <d>/_second_order_ext.pt."""
+    cache = d / "_second_order_ext.pt"
+    if cache.exists() and (c := torch.load(cache))["ids"] == ids:
+        return c["feats"]
+    basis = ext_basis(d, ids, keys, dim, sample, fit)
     out: dict[str, list] = {}
     for n, r in enumerate(_pmap(_ext_one, [d / f"{i}.pt" for i in ids], (basis, dim))):
         for name, c in r.items():

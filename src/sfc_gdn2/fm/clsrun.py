@@ -99,7 +99,8 @@ def train(job: dict) -> None:
     print(f"[cls] wrapper built ({time.time() - t_start:.0f} s)", flush=True)
     rng = np.random.default_rng(job["seed"])
     torch.manual_seed(job["seed"])
-    enc, prefixes = w.cls_net(pretrained=True, feature=job["feature"])
+    kw = {"basis": torch.load(job["basis"])} if job.get("basis") else {}   # (05/11) +covsqrt's frozen basis
+    enc, prefixes = w.cls_net(pretrained=True, feature=job["feature"], **kw)
     k = 1 + max(int(it["y"]) for it in job["items"])
     ORD = job.get("kind") == "ordinal"   # (05/11) CORAL as the table's ordinal probes (LCA)
 

@@ -165,17 +165,15 @@ class NnsslWrapper(Wrapper):
 
     # ------------------------------------------------------------------ fine-tuned classification (fm/clsrun.py)
     def cls_input(self, prepared: dict) -> tuple:
-        """The table's crop (_crop_features): the recommended-size crop centred on the nonzero mask, and the mask's crop."""
-        from datasets.preprocess_3D_data.crop_to_mask import crop_center_with_padding_np, get_mask_center
-        nz = prepared["nonzero"].astype(np.uint8)
-        c = get_mask_center(nz)
-        crop = lambda a: torch.from_numpy(crop_center_with_padding_np(a, c, tuple(self.patch)))
-        return crop(prepared["data"][0])[None], crop(nz.astype(np.float32))
+        """(05/11) the whole preprocessed volume and its nonzero mask: the readers crop (crop_fg_*, the table's
+        _crop_features) or slide (stitched_*, features) themselves, after the augmentation's flips."""
+        return torch.from_numpy(prepared["data"][:1]), torch.from_numpy(prepared["nonzero"].astype(bool))
 
-    def cls_net(self, pretrained: bool = True, feature: str = "crop_fg_tokens"):
-        """Primus (04/11, P2): the table probe's feature (_crop_features: crop_fg_<level>, the level's tokens averaged
-        over the crop's foreground) from the wrapper's own network and hooks, with gradient; EVA blocks checkpointed."""
-        assert self.is_primus and pretrained and feature.startswith("crop_fg_"), feature
+    def cls_net(self, pretrained: bool = True, feature: str = "crop_fg_tokens", basis=None):
+        """Primus (04/11, P2): the table probe's feature from the wrapper's own network and hooks, with gradient
+        (crop_fg_<level>: CropFgReader; stitched_<level>[_pool<f>][+std|+covsqrt]: StitchReader); EVA blocks
+        checkpointed. basis: (mu, P) of +covsqrt (bench.probe.ext_basis of the table's extraction)."""
+        assert self.is_primus and pretrained and feature.startswith(("crop_fg_", "stitched_")), feature
         net = self.network
         # no stochastic layers when fine-tuning (04/11): the plan keeps the pretraining's patch_drop_rate 0.8 (80 % of the
         # tokens dropped in train mode: the features unlike the frozen probe's) and drop_path 0.2
@@ -186,7 +184,9 @@ class NnsslWrapper(Wrapper):
                     setattr(b, nm, torch.nn.Identity())
         net.eva.blocks = torch.nn.ModuleList(_Ckpt(b) for b in net.eva.blocks)   # (the tap hooks sit on the inner
         net.requires_grad_(True)                                                    # blocks: still fired)
-        return CropFgReader(self, feature[len("crop_fg_"):]), ["net.down_projection", "net.eva"]
+        r = CropFgReader(self, feature[len("crop_fg_"):]) if feature.startswith("crop_fg_") else \
+            StitchReader(self, feature, basis)
+        return r, ["net.down_projection", "net.eva"]
 
     # ------------------------------------------------------------------ preprocessing (nnssl)
     def preprocess(self, image: Image) -> dict:
@@ -332,19 +332,75 @@ class _Ckpt(torch.nn.Module):
 
 
 class CropFgReader(torch.nn.Module):
-    """[1, *patch] crop + its mask -> crop_fg_<level> (_crop_features), with gradient."""
+    """[1, *S] volume + its nonzero mask -> crop_fg_<level> (_crop_features: the recommended-size crop centred on the
+    mask), with gradient."""
 
     def __init__(self, w, level: str):
         super().__init__()
         self.w, self.net, self.level = w, w.network, level
 
     def forward(self, x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        from datasets.preprocess_3D_data.crop_to_mask import crop_center_with_padding_np, get_mask_center
         dev = next(self.net.parameters()).device
-        v = self.w._encode(x[None].to(dev).float())[self.level][None].float()   # [1, C, h, w, d]
+        nz = m.cpu().numpy().astype(np.uint8)
+        c = get_mask_center(nz)
+        crop = lambda a: torch.from_numpy(crop_center_with_padding_np(a, c, tuple(self.w.patch)))
+        xc, mc = crop(x[0].float().cpu().numpy()), crop(nz.astype(np.float32))
+        v = self.w._encode(xc[None, None].to(dev))[self.level][None].float()   # [1, C, h, w, d]
         st = [p // f for p, f in zip(self.w.patch, v.shape[2:])]
-        wt = (F.avg_pool3d(m[None, None].to(dev).float(), st, st)[0, 0] > 0.5).float()
+        wt = (F.avg_pool3d(mc[None, None].to(dev), st, st)[0, 0] > 0.5).float()
         wt = wt if wt.sum() > 0 else torch.ones_like(wt)
         return (v[0] * wt).flatten(1).sum(1) / wt.sum()
+
+
+class StitchReader(torch.nn.Module):
+    """[1, *S] volume -> the table reading of a stitched map (features: nnU-Net sliding window, Gaussian-weighted
+    stitching; bench.yaml pool: fm/worker's avg pool; bench.probe: the map's mean, ++ per-channel std (+std) or the covariance
+    square root on the basis's directions (+covsqrt, probe._ext_one)), with gradient through every tile."""
+
+    def __init__(self, w, feature: str, basis=None):
+        super().__init__()
+        self.w, self.net = w, w.network
+        key, _, self.stat = feature.partition("+")
+        self.level, _, f = key[len("stitched_"):].partition("_pool")
+        self.pool = int(f) if f else 1
+        assert self.stat in ("", "std", "covsqrt") and (self.stat != "covsqrt" or basis is not None), feature
+        self.basis = basis
+
+    def forward(self, x: torch.Tensor, m=None) -> torch.Tensor:
+        from acvl_utils.cropping_and_padding.padding import pad_nd_image
+        from nnunetv2.inference.sliding_window_prediction import compute_gaussian
+        dev = next(self.net.parameters()).device
+        padded, _ = pad_nd_image(x.float(), self.w.patch, "constant", {"value": 0}, True, None)
+        acc = wsum = g = None
+        for sl in self.w.predictor._internal_get_sliding_window_slicers(padded.shape[1:]):
+            t = self.w._encode(padded[sl][None].to(dev))[self.level].float()   # [C, h, w, d]
+            if acc is None:
+                st = [p // f for p, f in zip(self.w.patch, t.shape[1:])]
+                grid = [-(-s // a) for s, a in zip(padded.shape[1:], st)]
+                acc, wsum = t.new_zeros(t.shape[0], *grid), t.new_zeros(grid)
+                g = compute_gaussian(tuple(t.shape[1:]), sigma_scale=1. / 8, value_scaling_factor=10,
+                                     dtype=torch.float32, device=dev)
+            o = [round(s.start * (n - f) / (v - p)) if v > p else 0
+                 for s, n, f, v, p in zip(sl[1:], grid, t.shape[1:], padded.shape[1:], self.w.patch)]
+            pad = [q for a, f, n in reversed(list(zip(o, t.shape[1:], grid))) for q in (a, n - a - f)]   # window
+            acc, wsum = acc + F.pad(t * g, pad), wsum + F.pad(g, pad)   # (out of place: autograd through every tile)
+        mp = acc / wsum
+        if self.pool > 1:
+            mp = F.avg_pool3d(mp[None], self.pool, self.pool, ceil_mode=True)[0]   # fm/worker pool
+        tok = mp.flatten(1).T   # [N, C]
+        mean = tok.mean(0)
+        if not self.stat:
+            return mean
+        if self.stat == "std":
+            return torch.cat([mean, tok.std(0) if len(tok) > 1 else torch.zeros_like(mean)])
+        mu, p = (b.to(dev) for b in self.basis)
+        z = (tok - mu) @ p
+        z = (z - z.mean(0)).double()
+        dk = p.shape[1]
+        e, v = torch.linalg.eigh(z.T @ z / max(len(z) - 1, 1) + 1e-6 * torch.eye(dk, device=dev, dtype=z.dtype))
+        iu = torch.triu_indices(dk, dk, device=dev)
+        return torch.cat([mean, ((v * e.clamp(min=0).sqrt()) @ v.T)[iu[0], iu[1]].float()])
 
 
 build = NnsslWrapper
