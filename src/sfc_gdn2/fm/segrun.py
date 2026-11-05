@@ -57,6 +57,10 @@ LES_MM = 0.0   # tile_rule: half the p95 foreground extent; a lesion-centred til
 AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
 SLIDE_BATCH = int(os.environ.get("SFC_SLIDE_BATCH", "4"))   # sliding: tiles per forward (halved on OOM)
+# (05/11, Francesco: SOOP tests took ~6 h) tiles whose input is all zero (air around skull-stripped scans) are not run;
+# voxels no run tile covers are background. nnU-Net's crop to the nonzero box, with the tiles where they were (the
+# token caches' corners unchanged). SFC_SKIP_EMPTY=0: every tile, as before.
+SKIP_EMPTY = os.environ.get("SFC_SKIP_EMPTY", "1") == "1"
 SAVE_S = float(os.environ.get("SFC_SEG_SAVE_S", "600"))  # training state to disk every SAVE_S seconds
 
 
@@ -184,6 +188,11 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device if fits else "cpu")
     wsum = torch.zeros(P, device=x.device)
     tiles, i, bs = list(product(*starts)), 0, SLIDE_BATCH   # tiles in batches (28/10), halved on OOM
+    if SKIP_EMPTY:
+        nz = (xp != 0).any(0)
+        keep = [t for t in tiles if bool(nz[t[0]:t[0] + patch[0], t[1]:t[1] + patch[1], t[2]:t[2] + patch[2]].any())]
+        tiles = keep or tiles   # (an all-zero volume: every tile, as before)
+        del nz
     corner = ctx is not None and getattr(net, "tile_corner", False)
     while i < len(tiles):
         part = tiles[i: i + bs]
@@ -206,6 +215,10 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     wsum = wsum.to(out.device)
     for c in range(n_out):  # one class at a time: dividing the whole fp16 accumulator by an fp32 tensor made an fp32
         out[c].div_(wsum)   # copy of it (whole-body nnF grids: 60 GB accumulator, RAM OOM at 240 GB)
+    if SKIP_EMPTY and bool((wsum == 0).any()):   # no tile covered them: background (heatmaps: 0)
+        empty = wsum == 0
+        for c in range(n_out):
+            out[c][empty] = 1.0 if c == 0 and not lm else 0.0
     return out[(slice(None),) + tuple(slice(0, s) for s in S)]
 
 
@@ -1207,10 +1220,11 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
 def save_pred(d: Path, i: str, probs: torch.Tensor, grid_from_gt, lab=None) -> None:
     """Prediction of one volume on the model grid (user, 23/10: always kept, val and test, to choose thresholds and
     filters after the run): argmax, class probabilities as uint8 (p * 255; all classes up to 8, else the argmax's
-    probability only) and the GT mapping (LFC landmark error, CMB lesion F1)."""
+    probability only) and the GT mapping (LFC landmark error, CMB lesion F1). Uncompressed (05/11: compressing
+    ~500 MB SOOP grids took seconds per volume; scratch has room)."""
     d.mkdir(parents=True, exist_ok=True)
     q = (probs.float().clamp(0, 1) * 255).round().to(torch.uint8)
-    np.savez_compressed(d / f"{i}.npz", pred=(probs.argmax(0).to(torch.uint8).cpu().numpy() if lab is None else lab),
+    np.savez(d / f"{i}.npz", pred=(probs.argmax(0).to(torch.uint8).cpu().numpy() if lab is None else lab),
                         prob=(q if len(q) <= 8 else q.max(0).values[None]).cpu().numpy(),
                         grid_from_gt=np.asarray(grid_from_gt))
 
