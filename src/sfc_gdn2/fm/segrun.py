@@ -941,9 +941,18 @@ def train(job: dict) -> None:
     net.eval()
     rule, f1 = {}, "det" if DET else job.get("select") == "f1"
     pv = out_p.with_suffix(".pred_val")
-    if not LM:   # val predictions of the best state -> the post-processing rule (chosen on val only)
-        vals = []
-        for it in split["val"]:
+    # (05/11) the chosen rule kept on disk: a job killed after choosing it does not choose it again (SOOP stroke,
+    # 45-min blocks: ~50 silent minutes of val loading + search, redone by every block)
+    rf, rkey = out_p.with_suffix(".postproc.json"), {"best_iter": best["iter"], "read_tau": best.get("read_tau")}
+    if not LM and rf.exists() and (rr := json.loads(rf.read_text()))["key"] == rkey:
+        rule = {int(c): r for c, r in rr["rule"]}
+        print(f"[seg] post-processing rule from {rf}", flush=True)
+    elif not LM:   # val predictions of the best state -> the post-processing rule (chosen on val only)
+        vals, t_pp = [], time.time()
+        print(f"[seg] post-processing: {len(split['val'])} val predictions", flush=True)
+        for n_, it in enumerate(split["val"]):
+            if n_ % 10 == 0:
+                print(f"[seg] post-processing: val {n_}/{len(split['val'])} ({(time.time() - t_pp) / 60:.1f} min)", flush=True)
             f = pv / f"{it['id']}.npz"
             if not f.exists():
                 v = load(it)
@@ -965,7 +974,9 @@ def train(job: dict) -> None:
                 if n:
                     sizes.setdefault(c, []).extend(np.bincount(cc.ravel())[1:].tolist())
         sizes = {c: [int(np.percentile(v, 1)), int(np.percentile(v, 5))] for c, v in sizes.items()}
+        print(f"[seg] post-processing: choosing the rule ({(time.time() - t_pp) / 60:.1f} min)", flush=True)
         rule = choose_postproc(vals, k, sizes, f1)
+        rf.write_text(json.dumps({"key": rkey, "rule": [[c, r] for c, r in rule.items()]}))
         del vals
     tkey = key | {"best_iter": best["iter"], "postproc": {str(c): r for c, r in rule.items()}} | \
         ({"read_tau": best["read_tau"]} if "read_tau" in best else {})   # (only when chosen: other runs' partial tests resume)
