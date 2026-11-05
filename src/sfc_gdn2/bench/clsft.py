@@ -51,6 +51,10 @@ def main() -> None:
     ap.add_argument("--warm", type=float, default=0.0)
     ap.add_argument("--patience", type=int, default=6, help="validations without a new best before stopping (0: off)")
     ap.add_argument("--subset", type=int, default=0, help="pilot: the first n train volumes, n // 2 val and test")
+    ap.add_argument("--fresh-head", action="store_true", help="(05/11, arm a) a new linear head, randomly initialised, "
+                    "no LP-FT; the frozen reference: a linear probe with the L2 chosen on val")
+    ap.add_argument("--norm", choices=["std", "p99"], default="std", help="feature normalisation: train mean / std (the "
+                    "table's probes) or each feature / its train |p99| (Francesco 05/11: never z-score)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--feat-dir", default="/leonardo_scratch/large/userexternal/fcorrent/sfc_runs/fm_bench",
                     help="the table's extractions (an external's +covsqrt basis)")
@@ -113,8 +117,9 @@ def main() -> None:
                    {"stage": "train", "cfg": fm, "cache": cache, "items": items, "device": "cuda", "out": str(out),
                     "iters": a.iters, "val_every": a.val_every, "batch": a.batch, "lr": a.lr, "enc_lr": a.enc_lr,
                     "warm": a.warm, "seed": a.seed, "feature": "mean" if a.light else table["feature"],
-                    "head": "linear" if a.light or a.l2 >= 0 else table["head"],
-                    "l2": a.l2 if a.l2 >= 0 else (None if a.light else table["l2"]), "smooth": a.smooth,
+                    "head": "linear" if a.light or a.fresh_head or a.l2 >= 0 else table["head"],
+                    "l2": None if a.fresh_head else a.l2 if a.l2 >= 0 else (None if a.light else table["l2"]),
+                    "smooth": a.smooth, "fresh_head": a.fresh_head, "norm": a.norm,
                     "lr_warm": a.lr_warm, "aug": a.aug, "kind": cfg["type"]} | ({"basis": str(basis)} if basis else {}) | ({"patience": a.patience} if a.patience else {}))
     res = json.loads(out.read_text())
     tp = res["test_pred"]

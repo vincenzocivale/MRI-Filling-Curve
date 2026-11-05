@@ -134,7 +134,7 @@ def train(job: dict) -> None:
     # the frozen probe saved once (05/11: chained 30-min blocks recomputed ~1200 volumes' features each time and never
     # reached the fine-tuning); a later block loads it
     hidden = 256 if job["head"] == "mlp" else 0
-    lpf, lpkey = out.with_suffix(".lp.pt"), {n: job.get(n) for n in ("feature", "head", "l2")}
+    lpf, lpkey = out.with_suffix(".lp.pt"), {n: job.get(n) for n in ("feature", "head", "l2", "norm")}
     if lpf.exists() and (c := torch.load(lpf, map_location="cpu", weights_only=False))["key"] == lpkey:
         mu, sd, lp = c["mu"].to(dev), c["sd"].to(dev), c["lp"]
         D = mu.numel()
@@ -144,7 +144,10 @@ def train(job: dict) -> None:
         print(f"[cls] frozen probe loaded from {lpf}: {lp}", flush=True)
     else:
         F_tr = feats(split["train"])
-        mu, sd = F_tr.mean(0), F_tr.std(0).clamp_min(1e-6)
+        if job.get("norm") == "p99":   # (05/11, Francesco: never z-score) each feature / its train |p99|, not centred
+            mu, sd = torch.zeros_like(F_tr[0]), F_tr.abs().float().quantile(0.99, dim=0).clamp_min(1e-6)
+        else:
+            mu, sd = F_tr.mean(0), F_tr.std(0).clamp_min(1e-6)
         y_t, X_tr = torch.tensor(y_tr, device=dev), (F_tr - mu) / sd
 
         def fit(l2: float, X=None):
@@ -236,6 +239,13 @@ def train(job: dict) -> None:
     print(f"[cls] iter 0 (the frozen probe): val {v0:.4f}", flush=True)
     best = {"val": v0, "iter": 0, "state": [{n: t.detach().cpu().clone() for n, t in m.state_dict().items()}
                                             for m in (enc, head)]}
+    if job.get("fresh_head"):   # (05/11, arm a) a new head, randomly initialised: no LP-FT; the frozen probe stays as the
+        torch.manual_seed(int(job["seed"]))   # reference (iteration 0) but is not a candidate of the val selection
+        for m in head.modules():
+            if isinstance(m, torch.nn.Linear):
+                m.reset_parameters()
+        best["val"] = -float("inf")
+        print("[cls] fresh head: randomly initialised, the frozen probe only as reference", flush=True)
     curve, t0, start = [{"iter": 0, "val": v0}], time.time(), 1
     # a killed job resumes (chained short jobs): the whole state every SFC_CLS_SAVE_S seconds next to the result
     last, key = out.with_suffix(".last.pt"), {n: job[n] for n in ("iters", "val_every", "batch", "lr", "enc_lr", "warm",
