@@ -83,6 +83,8 @@ def train(bench: dict, model: str, task: str, items: list[dict], seed: int, init
              "save_pred": bool(items[0].get("save_pred")), "select": items[0].get("select"),
              "patience": 2 if s.get("screen") else int(s.get("patience") or 0)}
             | ({"finetune": dict(s["finetune"])} if s.get("finetune") else {}))   # P2: segdec.finetune.{enc_lr,init}
+    if os.environ.get("SFC_TEST_SHARD"):   # (05/11) a test shard (fm/segrun): its volumes in its own file, no result yet
+        return {}
     res = json.loads(out.read_text())
     if val_only:
         print(f"[segdec] {task} s{seed} {model} {init}: best val dice {res['val_dice']:.3f}", flush=True)

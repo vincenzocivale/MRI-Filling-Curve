@@ -993,12 +993,34 @@ def train(job: dict) -> None:
         del vals
     tkey = key | {"best_iter": best["iter"], "postproc": {str(c): r for c, r in rule.items()}} | \
         ({"read_tau": best["read_tau"]} if "read_tau" in best else {})   # (only when chosen: other runs' partial tests resume)
+    # (05/11, SOOP: 556 test volumes, ~6 h on one GPU) SFC_TEST_SHARD=i/n: this job tests every n-th volume from the
+    # i-th into its own <out>.test.s<i>of<n>.json and stops; a job without it merges the shards' volumes first, then
+    # tests the rest and writes the result as before
+    shard = os.environ.get("SFC_TEST_SHARD")
+    si, sn = (int(a) for a in shard.split("/")) if shard else (0, 1)
+    skip = set()
+    if shard:   # the volumes the unsharded test already did are not done again
+        mp = json.loads(part.read_text()) if part.exists() else {}
+        skip = set(mp["res"]["test_ids"]) if mp.get("key") == tkey else set()
+        part = out_p.with_suffix(f".test.s{si}of{sn}.json")
     done = json.loads(part.read_text()) if part.exists() else {}
     res = done["res"] if done.get("key") == tkey else {"per_volume": [], "per_class": [], "test_ids": []}
     if res["test_ids"]:
         print(f"[seg] test resumed from {part}: {len(res['test_ids'])} volumes done", flush=True)
-    for it in split["test"]:
-        if it["id"] in res["test_ids"]:
+    if not shard:
+        for sp_ in sorted(out_p.parent.glob(out_p.stem + ".test.s*of*.json")):
+            sd = json.loads(sp_.read_text())
+            if sd.get("key") != tkey:
+                continue
+            have, n0 = set(res["test_ids"]), len(res["test_ids"])
+            for j_, i_ in enumerate(sd["res"]["test_ids"]):
+                if i_ not in have:
+                    for f_ in ("per_volume", "per_class", "test_ids") + (("det",) if "det" in sd["res"] else ()):
+                        res.setdefault(f_, []).append(sd["res"][f_][j_])
+            print(f"[seg] test: {len(res['test_ids']) - n0} volumes from {sp_.name}", flush=True)
+        part.write_text(json.dumps({"key": tkey, "res": res}))
+    for it in split["test"][si::sn]:
+        if it["id"] in res["test_ids"] or it["id"] in skip:
             continue
         t1 = time.time()
         v = load(it)
@@ -1030,6 +1052,9 @@ def train(job: dict) -> None:
               f"dice {t5 - t4:.0f}, save {t6 - t5:.0f}), peak RSS "
               f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.0f} GB", flush=True)
         del v, probs, lab
+    if shard:
+        print(f"[seg] test shard {shard}: {len(res['test_ids'])} volumes -> {part}", flush=True)
+        return
     out = {"model": job["cfg"]["model"], "init": job["init"], "lr": job["lr"], "iters": iters, "patch": patch,
            "frozen_prefixes": frozen, "params_frozen": n_frozen, "params_trained": n_train, "best": best,
            "curve": curve, "n": {s: len(v) for s, v in split.items()},
