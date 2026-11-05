@@ -52,8 +52,32 @@ def prep(job: dict) -> None:
             fail(cache, it["id"], err or traceback.format_exc())
 
 
-def score(p: np.ndarray, y: np.ndarray) -> float:
-    """AUROC (binary, Mann-Whitney with ties) or balanced accuracy."""
+class OrdHead(torch.nn.Module):
+    """bench.probe.Head(ordinal=True): body -> one score + k-1 learned thresholds (CORAL)."""
+
+    def __init__(self, d: int, k: int, hidden: int):
+        super().__init__()
+        self.body = torch.nn.Sequential(torch.nn.Linear(d, hidden), torch.nn.GELU()) if hidden else torch.nn.Identity()
+        self.out = torch.nn.Linear(hidden or d, 1)
+        self.th = torch.nn.Parameter(torch.zeros(k - 1))
+
+    def forward(self, x):
+        return self.out(self.body(x)) + self.th
+
+
+def qwk(pred: np.ndarray, y: np.ndarray, k: int) -> float:   # bench.probe.qwk
+    o = np.zeros((k, k))
+    np.add.at(o, (y, np.clip(pred, 0, k - 1)), 1)
+    e = o.sum(1, keepdims=True) @ o.sum(0, keepdims=True) / o.sum()
+    i = np.arange(k)
+    w = (i[:, None] - i[None]) ** 2 / max((k - 1) ** 2, 1)
+    return float(1 - (w * o).sum() / max((w * e).sum(), 1e-12))
+
+
+def score(p: np.ndarray, y: np.ndarray, ordinal: bool = False) -> float:
+    """AUROC (binary), balanced accuracy (multi-class), or QWK (ordinal: p = the k-1 threshold logits)."""
+    if ordinal:
+        return qwk((p > 0).sum(1), y, p.shape[1] + 1)
     if p.shape[1] == 2:
         s = p[:, 1]
         r = np.argsort(np.argsort(s, kind="stable"), kind="stable").astype(float)
@@ -77,6 +101,13 @@ def train(job: dict) -> None:
     torch.manual_seed(job["seed"])
     enc, prefixes = w.cls_net(pretrained=True, feature=job["feature"])
     k = 1 + max(int(it["y"]) for it in job["items"])
+    ORD = job.get("kind") == "ordinal"   # (05/11) CORAL as the table's ordinal probes (LCA)
+
+    def lossf(o, y):   # the table's losses: class-weighted CE, or CORAL's BCE on y > j
+        if ORD:
+            return F.binary_cross_entropy_with_logits(o, (y[:, None] > torch.arange(k - 1, device=o.device)).float())
+        return F.cross_entropy(o, y, weight=wts, label_smoothing=float(job.get("smooth", 0.0)))
+    post = (lambda o: o) if ORD else (lambda o: o.softmax(-1))   # what predictions store (ordinal: threshold logits)
     enc = enc.to(dev)
     split = {s: [it for it in job["items"] if it["split"] == s and (cache / f"{it['id']}.pt").exists()]
              for s in ("train", "val", "test")}
@@ -106,8 +137,8 @@ def train(job: dict) -> None:
     if lpf.exists() and (c := torch.load(lpf, map_location="cpu", weights_only=False))["key"] == lpkey:
         mu, sd, lp = c["mu"].to(dev), c["sd"].to(dev), c["lp"]
         D = mu.numel()
-        head = torch.nn.Sequential(*([torch.nn.Linear(D, hidden), torch.nn.GELU()] if hidden else []),
-                                   torch.nn.Linear(hidden or D, k)).to(dev)
+        head = (OrdHead(D, k, hidden) if ORD else torch.nn.Sequential(
+            *([torch.nn.Linear(D, hidden), torch.nn.GELU()] if hidden else []), torch.nn.Linear(hidden or D, k))).to(dev)
         head.load_state_dict(c["head"])
         print(f"[cls] frozen probe loaded from {lpf}: {lp}", flush=True)
     else:
@@ -118,19 +149,20 @@ def train(job: dict) -> None:
         def fit(l2: float, X=None):
             X = X_tr if X is None else X
             torch.manual_seed(0)
-            h = torch.nn.Sequential(*([torch.nn.Linear(X.shape[1], hidden), torch.nn.GELU()] if hidden else []),
-                                    torch.nn.Linear(hidden or X.shape[1], k)).to(dev)
+            h = (OrdHead(X.shape[1], k, hidden) if ORD else torch.nn.Sequential(
+                *([torch.nn.Linear(X.shape[1], hidden), torch.nn.GELU()] if hidden else []),
+                torch.nn.Linear(hidden or X.shape[1], k))).to(dev)
             o = torch.optim.LBFGS(h.parameters(), max_iter=500, line_search_fn="strong_wolfe")
 
             def closure():
                 o.zero_grad()
-                ls = F.cross_entropy(h(X), y_t, weight=wts) + l2 * sum(p.square().sum() for p in h.parameters()
+                ls = lossf(h(X), y_t) + l2 * sum(p.square().sum() for p in h.parameters()
                                                                            if p.ndim > 1)
                 ls.backward()
                 return ls
             o.step(closure)
             with torch.no_grad():
-                h.train_ce = float(F.cross_entropy(h(X), y_t, weight=wts))   # the fine-tuning's first loss must match it
+                h.train_ce = float(lossf(h(X), y_t))   # the fine-tuning's first loss must match it
             return h
 
         if job.get("l2") is not None:   # the table's L2 (its reading)
@@ -142,7 +174,7 @@ def train(job: dict) -> None:
             for l2 in L2_GRID:
                 h = fit(l2)
                 with torch.no_grad():
-                    cand.append((score(h(X_val).softmax(-1).cpu().numpy(), y_val), l2, h))
+                    cand.append((score(post(h(X_val)).cpu().numpy(), y_val, ORD), l2, h))
                 print(f"[cls] frozen probe l2 {l2:g}: val {cand[-1][0]:.4f}", flush=True)
             _, l2, head = max(cand, key=lambda c: c[0])
             del X_val, cand
@@ -191,12 +223,12 @@ def train(job: dict) -> None:
     def predict(items) -> np.ndarray:
         enc.eval(), head.eval()
         with amp():
-            p = np.stack([logits(it).float().softmax(-1).cpu().numpy() for it in items])
+            p = np.stack([post(logits(it).float()[None])[0].cpu().numpy() for it in items])
         enc.train(), head.train()
         return p
 
     if "val" not in lp:   # iteration 0 = the frozen probe: its val and test predictions, once (kept in the .lp.pt)
-        lp["val"] = score(predict(split["val"]), y_val)
+        lp["val"] = score(predict(split["val"]), y_val, ORD)
         lp["test_pred"] = predict(split["test"]).tolist()
         torch.save(lp_state | {"lp": lp}, lpf)
     v0 = lp["val"]
@@ -225,8 +257,7 @@ def train(job: dict) -> None:
         for j in rng.integers(len(split["train"]), size=B):   # one backward per volume: memory of one scan
             with amp():
                 lg = logits(split["train"][j], aug=bool(job.get("aug")))
-            ls = F.cross_entropy(lg.float()[None], torch.tensor([int(y_tr[j])], device=dev), weight=wts,
-                                 label_smoothing=float(job.get("smooth", 0.0))) / B   # (04/11) the table's head is
+            ls = lossf(lg.float()[None], torch.tensor([int(y_tr[j])], device=dev)) / B   # (04/11) the table's head is
             # often perfect on train (CE ~0, no gradient): smoothing keeps a signal; iteration 0 is still the table's
             ls.backward()
             loss += float(ls)
@@ -236,7 +267,7 @@ def train(job: dict) -> None:
             print(f"[cls] iter {it} loss {loss:.4f} {(time.time() - t1) / (it - start + 1):.2f} s/iter "
                   f"mem {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
         if it % every == 0 or it == iters:
-            v = score(predict(split["val"]), y_val)
+            v = score(predict(split["val"]), y_val, ORD)
             curve.append({"iter": it, "val": v})
             print(f"[cls] iter {it}: val {v:.4f} (best {max(v, best['val']):.4f})", flush=True)
             if v > best["val"]:

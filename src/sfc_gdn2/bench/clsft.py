@@ -79,7 +79,8 @@ def main() -> None:
     print(f"[clsft] {a.model} {a.task}: {len(items)} volumes, classes {classes}", flush=True)
     if a.stage in ("all", "prep"):
         run_in_env(fm["env"], "sfc_gdn2.fm.clsrun", {"stage": "prep", "cfg": fm, "cache": cache, "items": items,
-                                                     "device": "cuda", "workers": a.workers})
+                                                     "device": "cuda" if torch.cuda.is_available() else "cpu",   # serial nodes: cpu
+                                                     "workers": a.workers})
     if a.stage == "prep":
         return
     pj = json.loads(Path(a.probe_json).read_text())
@@ -88,6 +89,7 @@ def main() -> None:
     table = {"head": var, "feature": pj[var]["feature"], "l2": pj[var]["l2"], "val": pj[var]["val"][pj["metric"]],
              "test": pj[var]["test"][pj["metric"]]}
     print(f"[clsft] the table's probe (split {a.seed}): {table}", flush=True)
+    assert cfg["type"] in ("class", "ordinal"), cfg["type"]
     if not out.exists():
         run_in_env(fm["env"], "sfc_gdn2.fm.clsrun",
                    {"stage": "train", "cfg": fm, "cache": cache, "items": items, "device": "cuda", "out": str(out),
@@ -95,16 +97,17 @@ def main() -> None:
                     "warm": a.warm, "seed": a.seed, "feature": "mean" if a.light else table["feature"],
                     "head": "linear" if a.light or a.l2 >= 0 else table["head"],
                     "l2": a.l2 if a.l2 >= 0 else (None if a.light else table["l2"]), "smooth": a.smooth,
-                    "lr_warm": a.lr_warm, "aug": a.aug} | ({"patience": a.patience} if a.patience else {}))
+                    "lr_warm": a.lr_warm, "aug": a.aug, "kind": cfg["type"]} | ({"patience": a.patience} if a.patience else {}))
     res = json.loads(out.read_text())
     tp = res["test_pred"]
     test_rows = rows.set_index("id").loc[tp["id"]].reset_index()
     ymap = dict(zip(rows["id"], y.tolist()))
     yt = torch.tensor([ymap[i] for i in tp["id"]], dtype=torch.float32)
     kind = KINDS[cfg["type"]](cfg, y[(rows["split"] == "train").to_numpy()])
-    pred = torch.tensor(np.asarray(tp["prob"]), dtype=torch.float32)
+    ordp = (lambda t: (t > 0).sum(1).float()) if cfg["type"] == "ordinal" else (lambda t: t)   # CORAL: thresholds passed
+    pred = ordp(torch.tensor(np.asarray(tp["prob"]), dtype=torch.float32))
     fp = res["frozen_probe"]   # the table's head refitted here, encoder frozen: its test must match the table's
-    pf = torch.tensor(np.asarray(fp["test_pred"]), dtype=torch.float32)
+    pf = ordp(torch.tensor(np.asarray(fp["test_pred"]), dtype=torch.float32))
     m = {"task": a.task, "model": a.model, "val": res["val"], "best_iter": res["best_iter"], "table": table,
          "frozen_here": {"val": fp["val"], "test": kind_metrics(cfg, y, rows, pf, yt, test_rows)},
          "test": kind.metrics(pred, yt, test_rows), "test_ci95": bootstrap(kind, pred, yt, test_rows),
