@@ -1137,7 +1137,19 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
     nnU-Net-style post-processing chosen on val, the same for every task)."""
     rule = {}
     boxes = None
-    if f1 != "det" and vals and vals[0][1] is None:   # argmax only (many classes): each class on the bounding box of its
+    if f1 != "det" and vals and vals[0][1] is not None:   # (05/11) with probabilities (k <= 8: SOOP stroke, prostate):
+        # each class on the box of its argmax, true and q >= min(TAUS) voxels, which holds every candidate mask and its
+        # components: the same scores (outside it no mask or label of the class) on a box instead of 512 x 512 x 370
+        # volumes (stroke: ~50 min for 100 val volumes, every candidate labelled on the whole grid)
+        from scipy import ndimage
+        tmin, boxes = round(min(TAUS) * 255), []
+        for lab, q, y, *_ in vals:
+            bx = []
+            for c in range(1, k):
+                fo = ndimage.find_objects(((lab == c) | (y == c) | (q[c] >= tmin)).astype(np.int8))
+                bx.append(fo[0] if fo else None)
+            boxes.append(bx)
+    elif f1 != "det" and vals and vals[0][1] is None:   # argmax only (many classes): each class on the bounding box of its
         # predicted and true voxels, found for all classes in one pass per volume; same masks and scores, the components
         # and filters on the box only (01/11: TotalSeg's ~50 classes on whole-body volumes took hours)
         from scipy import ndimage
@@ -1152,10 +1164,12 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
             vals_c = []
             for (lab, q, y, *rest), bx in zip(vals, boxes):
                 s = bx[c - 1] if c - 1 < len(bx) and bx[c - 1] is not None else tuple(slice(0, 1) for _ in lab.shape)
+                qs = None if q is None else q[(slice(None), *s)]   # (probabilities: cropped with the class's box)
                 if c - 1 >= len(bx) or bx[c - 1] is None:
-                    vals_c.append((np.zeros((1,) * lab.ndim, lab.dtype), q, np.zeros((1,) * lab.ndim, y.dtype), *rest))
+                    vals_c.append((np.zeros((1,) * lab.ndim, lab.dtype), None if q is None else
+                                   np.zeros((q.shape[0],) + (1,) * lab.ndim, q.dtype), np.zeros((1,) * lab.ndim, y.dtype), *rest))
                 else:
-                    vals_c.append((lab[s], q, y[s], *rest))
+                    vals_c.append((lab[s], qs, y[s], *rest))
         else:
             vals_c = vals
         t = [(y == c) for _, _, y, *_ in vals_c]
