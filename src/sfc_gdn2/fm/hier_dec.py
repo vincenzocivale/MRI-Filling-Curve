@@ -414,8 +414,12 @@ class HierDec(nn.Module):
                         sl = slice(at, at + tot)
                         if self._ftf():   # fine-tuning (04/11): the call checkpointed whole, projected inside: kept
                             # for the backward only its voxels and the W-wide tokens; recomputed once (dropout's RNG kept)
+                            # (06/11) SFC_FT_FINE_CKPT: 2 (default) this checkpoint around the encoder's own per-block
+                            # ones (three forwards in all), 1 the per-block ones only, 0 none (activations kept)
+                            ck = os.environ.get("SFC_FT_FINE_CKPT", "2")
                             hs.append(checkpoint(self._live_call, allp[gi[sl], cells[sl]], wts, cu, q[sl], oe[sl],
-                                                 use_reentrant=False))
+                                                 use_reentrant=False) if ck == "2" else
+                                      self._live_call(allp[gi[sl], cells[sl]], wts, cu, q[sl], oe[sl], ck == "1"))
                         else:
                             h = self.encoder.flat(pe(allp[gi[sl], cells[sl]], wts), cu, pos=q[sl])
                             hs.append(h[oe[sl]].float())
@@ -428,8 +432,8 @@ class HierDec(nn.Module):
         return torch.cat(hs)[(gi[oe] * N + cells[oe]).argsort()]
 
 
-    def _live_call(self, xp, wts, cu, q, keep) -> torch.Tensor:
-        return self._proj(self.encoder.flat(self.encoder.patch_embed(xp, wts), cu, pos=q)[keep])
+    def _live_call(self, xp, wts, cu, q, keep, ckpt=None) -> torch.Tensor:
+        return self._proj(self.encoder.flat(self.encoder.patch_embed(xp, wts), cu, ckpt=ckpt, pos=q)[keep])
 
 
 class HierUNet(HierDec):
