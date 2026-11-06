@@ -78,6 +78,17 @@ def _torch_load_on_cpu():
     return mock.patch.object(torch, "load", functools.partial(torch.load, map_location="cpu"))
 
 
+def _no_drop(eva) -> None:
+    """No stochastic layers when the encoder trains (04/11 classification, 06/11 segmentation: LoRA): the plan keeps
+    the pretraining's patch_drop_rate 0.8 (80 % of the tokens dropped in train mode: the features unlike the frozen
+    ones) and drop_path 0.2; the frozen runs (encoder in eval mode) never used them."""
+    eva.patch_drop = None
+    for b in eva.blocks:
+        for nm in ("drop_path", "drop_path1", "drop_path2"):
+            if hasattr(b, nm):
+                setattr(b, nm, torch.nn.Identity())
+
+
 class NnsslWrapper(Wrapper):
     """args: nnunet_repo, ssl3d_repo, stages (ResEnc levels kept, default [3,4,5]), keep_tiles (default true)."""
 
@@ -159,6 +170,8 @@ class NnsslWrapper(Wrapper):
         net = self._build(n_out)
         if pretrained:
             net = self._load(net)
+        if self.is_primus:   # (06/11) segrun fine-tuning / LoRA train the encoder in train mode
+            _no_drop(net.eva)
         keys = [net.key_to_encoder, getattr(net, "key_to_stem", None), *(getattr(net, "keys_to_in_proj", None) or ()),
                 getattr(net, "key_to_lpe", None)]
         return net, [k for k in keys if k], tuple(self.patch)
@@ -175,13 +188,7 @@ class NnsslWrapper(Wrapper):
         checkpointed. basis: (mu, P) of +covsqrt (bench.probe.ext_basis of the table's extraction)."""
         assert self.is_primus and pretrained and feature.startswith(("crop_fg_", "stitched_")), feature
         net = self.network
-        # no stochastic layers when fine-tuning (04/11): the plan keeps the pretraining's patch_drop_rate 0.8 (80 % of the
-        # tokens dropped in train mode: the features unlike the frozen probe's) and drop_path 0.2
-        net.eva.patch_drop = None
-        for b in net.eva.blocks:
-            for nm in ("drop_path", "drop_path1", "drop_path2"):
-                if hasattr(b, nm):
-                    setattr(b, nm, torch.nn.Identity())
+        _no_drop(net.eva)
         net.eva.blocks = torch.nn.ModuleList(_Ckpt(b) for b in net.eva.blocks)   # (the tap hooks sit on the inner
         net.requires_grad_(True)                                                    # blocks: still fired)
         r = CropFgReader(self, feature[len("crop_fg_"):]) if feature.startswith("crop_fg_") else \
