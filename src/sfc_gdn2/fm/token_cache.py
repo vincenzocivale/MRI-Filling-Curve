@@ -245,15 +245,21 @@ class GradCache(TokenCache):
         super().__init__(root)
         self.net, self.vox, self.maps, self.roots, self._was_training = net, {}, {}, {}, True
         self.crop = int(os.environ.get("SFC_FT_CROP", str(NMAX)))
+        self.margin = int(os.environ.get("SFC_FT_MARGIN", str(MARGIN)))   # (06/11) cells around a cropped tile
 
     def ensure(self, i: str, x: torch.Tensor, ctx: torch.Tensor) -> None:
         self.vox[i] = (x, ctx[:3].float())   # ponytail: every train / val scan's voxels in RAM (small seg sets)
 
+    def frozen(self) -> bool:   # (06/11) nothing of the encoder trains yet (decoder warm-up): the folder's tokens, the
+        return not any(p.requires_grad for p in self.net.encoder.parameters())   # table's, prefetched as TokenCache
+
     def next_batch(self, keep: int = 1) -> None:
-        pass
+        if self.frozen():
+            super().next_batch(keep)
 
     def prefetch(self, ctx: torch.Tensor, T) -> None:
-        pass
+        if self.frozen():
+            super().prefetch(ctx, T)
 
     def new_step(self, training: bool) -> None:   # each forward (fm/hier_dec): the first eval call after training
         if not training and self._was_training:  # drops the last step's maps (and their graphs)
@@ -273,13 +279,15 @@ class GradCache(TokenCache):
 
     def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
         from ..data.volume import patch_grid
+        if self.frozen():
+            return super().tokens(i, mm, corner, n, k)
         c0 = [int(c) // int(kk) for c, kk in zip(corner, k)]
         lo = hi = None
-        if self.net.training:   # a grid past `crop` cells: the tile's cells + MARGIN, its own map
+        if self.net.training:   # a grid past `crop` cells: the tile's cells + margin, its own map
             G = patch_grid(tuple(self.vox[i][0].shape[1:]), k).tolist()
             if int(np.prod(G)) > self.crop:   # ponytail: the table's tokens there came from 64-cell windows + MARGIN;
-                lo = [max(0, c - MARGIN) for c in c0]   # exact would read the windows the tile touches (~8 x 373k cells)
-                hi = [min(g, c + m + MARGIN) for c, m, g in zip(c0, n, G)]
+                lo = [max(0, c - self.margin) for c in c0]   # exact would read the windows the tile touches
+                hi = [min(g, c + m + self.margin) for c, m, g in zip(c0, n, G)]
         key = (i, mm, None if lo is None else (*lo, *hi))
         if key not in self.maps:
             if not self.net.training:   # eval: keep the last two scans' maps (sliding window over one scan)
