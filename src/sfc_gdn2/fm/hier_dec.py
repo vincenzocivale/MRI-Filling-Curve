@@ -152,9 +152,9 @@ class HierDec(nn.Module):
         if lo := os.environ.get("SFC_LEVELS_OFF"):   # (01/11, user) the decoder's knock-out at test: e.g. "2" or "4,2" mm
             self.off = {LV.index(float(x)) for x in lo.split(",")}
         # the CK-convs' shapes depend on the spacing (a few per task): cuDNN's autotuning pays (29/10: 7.5 -> 6.5 s per step)
-        # (06/11) SFC_CUDNN_BENCH=0: off. Tiles in cells of each scan's own voxels have one shape per scan (spine: ~300),
-        # each autotuned anew, and again in every chained block
-        torch.backends.cudnn.benchmark = os.environ.get("SFC_CUDNN_BENCH", "1") == "1"
+        # (06/11, default off; SFC_CUDNN_BENCH=1: on) tiles in cells of each scan's own voxels have one shape per scan
+        # (spine: ~300), each autotuned anew and again in every chained block: spine GPU per step 3.1 s on, 0.84 s off
+        torch.backends.cudnn.benchmark = os.environ.get("SFC_CUDNN_BENCH", "0") == "1"
 
     @staticmethod
     def tile_max(n_out: int) -> float:
