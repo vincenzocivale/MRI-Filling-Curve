@@ -552,6 +552,41 @@ def vox_budget(job: dict, vols: list, patch, k: int, lm: bool = False) -> None:
     job["batch"] = b
 
 
+class LoRA(torch.nn.Module):
+    """A weight's parametrization W -> W + 2 B A (LoRA, Hu et al. 2022; alpha = 2r, Biderman et al. 2024), B = 0: the
+    pretrained net exactly at the start. A conv kernel is an [out, in k^3] matrix (loralib's ConvLoRA, Aleem et al.
+    2024 on nnU-Net-style CNNs). A parametrization, not a wrapper: code reading `.weight` itself (timm's Eva:
+    F.linear(x, self.qkv.weight)) gets the adapted weight too."""
+
+    def __init__(self, w: torch.Tensor, r: int):
+        super().__init__()
+        n = w[0].numel()
+        self.A = torch.nn.Parameter(torch.empty(r, n, device=w.device).uniform_(-n ** -0.5, n ** -0.5))  # loralib's init
+        self.B = torch.nn.Parameter(torch.zeros(w.shape[0], r, device=w.device))
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        return w + (2 * self.B @ self.A).view_as(w).to(w.dtype)
+
+
+def peft(net, pre: set, r: int, full: tuple, where: tuple) -> tuple[set, set]:
+    """PEFT of the pretrained part (06/11, Francesco: LoRA after P2's fine-tuning; notes/LORA.md), `pre` its parameter
+    names: LoRA of rank r (0: none) on every Linear / Conv2d / Conv3d weight (groups 1) under a `where` prefix; trained
+    whole: the 1-D parameters (norms, biases: BitFit) and everything under a `full` prefix (ours: the patch embedding,
+    surgical fine-tuning for an input-level shift, Lee et al. 2023); the rest frozen, GDN-2's decays (A_log, dt_bias)
+    too (LoRA fails on SSM modules, Galim et al. 2025). -> (trained, frozen) names of the pretrained part."""
+    from torch.nn.utils import parametrize
+    for name, m in list(net.named_modules()):
+        if (r and isinstance(m, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.Conv3d)) and getattr(m, "groups", 1) == 1
+                and f"{name}.weight" in pre and name.startswith(where) and not name.startswith(full)):
+            parametrize.register_parametrization(m, "weight", LoRA(m.weight, r))
+    p = dict(net.named_parameters())
+    keep = {n for n in pre & p.keys()
+            if n.startswith(full) or p[n].ndim <= 1 and n.rsplit(".", 1)[-1] not in ("A_log", "dt_bias")}
+    lora = {n for n in p if ".parametrizations.weight.0." in n}
+    orig = {n for n in p if n.endswith(".parametrizations.weight.original")}
+    return lora | keep, orig | (pre & p.keys()) - keep
+
+
 def train(job: dict) -> None:
     dev = torch.device(job["device"])
     if gb := os.environ.get("SFC_GPU_GB"):   # (04/11) a smaller GPU's memory, emulated: fine-tuning must fit 12 GB
@@ -594,6 +629,11 @@ def train(job: dict) -> None:
             assert not bad, sorted(bad)[:4]
             net.load_state_dict(st, strict=False)
             print(f"[seg] finetune: decoder from {FT['init']} ({len(st)} tensors)", flush=True)
+        if "lora" in FT:   # (06/11) PEFT: FT["lora"] rank (0: norms + FT["full"] only), FT["full"] / FT["lora_in"] prefixes
+            tup = lambda v: (v,) if isinstance(v, str) else tuple(v)   # a YAML string or list of prefixes
+            enc_names, frozen_names = peft(net, enc_names, int(FT["lora"]), tup(FT.get("full", ())), tup(FT.get("lora_in", "")))
+            print(f"[seg] finetune: LoRA r {FT['lora']} on {sum('.original' in n for n in frozen_names)} weights, "
+                  f"{len(enc_names)} pretrained tensors trained, {len(frozen_names)} frozen", flush=True)
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
     DET = job.get("select") == "det"   # point detection (cmbpts, user 28/10): component centroids matched within DET_MM
@@ -690,13 +730,25 @@ def train(job: dict) -> None:
         tr_v = [v for v in train_v if bool(((v["y"] > 0) & (v["y"] < 255)).any())][:TRAIN_EVAL]
         del train_v
         params = [p for p in net.parameters() if p.requires_grad]
-        if FT:   # the pretrained part at enc_lr x the decoder's lr (discriminative lr), the same poly decay
-            enc = [p for n, p in net.named_parameters() if n in enc_names]
-            groups = [{"params": [p for n, p in net.named_parameters() if n not in enc_names]},
-                      {"params": enc, "lr": job["lr"] * float(FT.get("enc_lr", 0.1))}]
-            print(f"[seg] finetune: encoder {sum(p.numel() for p in enc) / 1e6:.1f}M at lr x{FT.get('enc_lr', 0.1)}", flush=True)
+        if FT:   # the pretrained part at enc_lr x the decoder's lr (discriminative lr), LoRA's factors at lora_lr x
+            # (LoRA's best lr ~10x full fine-tuning's, Biderman et al. 2024), the same poly decay
+            side = lambda n: 0 if n not in enc_names else 2 if ".parametrizations." in n else 1
+            mult = (1.0, float(FT.get("enc_lr", 0.1)), float(FT.get("lora_lr", 1.0)))
+            groups = [{"params": [p for n, p in net.named_parameters() if n not in frozen_names and side(n) == g],
+                       "lr": job["lr"] * mult[g], "side": g} for g in range(3)]
+            groups = [g for g in groups if g["params"]]
+            for g in groups[1:]:
+                print(f"[seg] finetune: {('', 'encoder', 'LoRA')[g['side']]} {sum(p.numel() for p in g['params']) / 1e6:.2f}M "
+                      f"at lr x{mult[g['side']]}", flush=True)
         opt = torch.optim.AdamW(groups if FT else params, lr=job["lr"], weight_decay=1e-4)
-        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: (1 - i / iters) ** 0.9)
+        # (06/11) FT["ramp"]: each group's lr ramps up over that fraction of the iterations from the iteration it starts
+        # training (the decoder 1, the encoder after the warm-up): Adam's first steps are ~lr whatever the gradient, and
+        # P2's warm-started decoders and its encoder took them at full lr
+        R = max(1, int(float(FT.get("ramp", 0)) * iters)) if FT else 1
+        w0 = int(float(FT.get("warm", 0)) * iters) if FT else 0
+        starts = [w0 if g.get("side") else 0 for g in opt.param_groups]
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, [
+            lambda i, s=s: (1 - i / iters) ** 0.9 * min(1.0, max(0.0, (i + 1 - s) / R)) for s in starts])
         best, curve, start, t0 = {"val": -1.0}, [], 1, time.time()
         vp = False
         state = torch.load(last, map_location="cpu", weights_only=False) if last.exists() else {}

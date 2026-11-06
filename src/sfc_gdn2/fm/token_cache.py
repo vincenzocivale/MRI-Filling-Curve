@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 LEVELS = ((16.0, 4), (8.0, 2), (4.0, 1))   # (mm, cells of 4 mm per axis)
+NMAX, BLOCK, MARGIN = 200_000, 64, 8   # a grid past NMAX tokens is read in windows of BLOCK cells + MARGIN (write_volume)
 
 
 def fine_ok(k) -> bool:
@@ -180,7 +181,7 @@ def read(encoder, curves, seed, x, sp, k, mm, nmax, block, margin, taps: bool, w
 
 
 def write_volume(enc, curves, seed, x, ctx, out: Path, i: str, cv: dict, min_mm: float = 4.0,
-                 nmax: int = 200_000, block: int = 64, margin: int = 8) -> list:
+                 nmax: int = NMAX, block: int = BLOCK, margin: int = MARGIN) -> list:
     """Volume i's levels >= min_mm (cv: {mm: curves}, else the mean) and <out>/<i>.json, written last (the volume's
     done marker); each file through a temporary name, so a reader never opens half of one -> k4."""
     from ..data.volume import patch_dims
@@ -231,15 +232,19 @@ class LiveCache(TokenCache):
 
 class GradCache(TokenCache):
     """Fine-tuning (04/11, Francesco: P2; no cached tokens, the encoder trains): the 16 / 8 mm tokens of each scan read
-    now by the training encoder, with gradient, the whole scan in one call along one curve (`curve`; ablation C: one
-    curve reads as the mean of three, a third of the cost). A scan's map is read once per training step and shared by
-    its tiles (segrun clears them at each step); at val / test (no grad) the last two scans' maps are kept across the sliding window's tiles. The folder
-    gives only the scans' meta (<id>.json, the table run's token folder); segrun's ensure() hands over each scan's voxels.
-    Same API as TokenCache for fm/hier_dec: meta, tokens, ids, levels, root."""
+    now by the training encoder, with gradient, the whole scan in one call along the run's curves (net.enc_curves, the
+    mean: what the table's token folder holds; 06/11, P2 read one curve on decoders trained on three). A scan's map is
+    read once per training step and shared by its tiles (segrun clears them at each step). (06/11) A grid past `crop`
+    cells (SFC_FT_CROP, default NMAX; TotalSeg at 8 mm: up to 1.3M) is read in training only around each tile, its
+    cells + MARGIN; at val / test (no grad) every scan as the table's cache was written (read(): windows past NMAX), so
+    with the pretrained weights the tokens are the table's; the last two scans' maps are kept across the sliding
+    window's tiles. The folder gives only the scans' meta (<id>.json, the table run's token folder); segrun's ensure()
+    hands over each scan's voxels. Same API as TokenCache for fm/hier_dec: meta, tokens, ids, levels, root."""
 
-    def __init__(self, root, net, curve: str = "hilbert"):
+    def __init__(self, root, net):
         super().__init__(root)
-        self.net, self.curve, self.vox, self.maps, self.roots, self._was_training = net, curve, {}, {}, {}, True
+        self.net, self.vox, self.maps, self.roots, self._was_training = net, {}, {}, {}, True
+        self.crop = int(os.environ.get("SFC_FT_CROP", str(NMAX)))
 
     def ensure(self, i: str, x: torch.Tensor, ctx: torch.Tensor) -> None:
         self.vox[i] = (x, ctx[:3].float())   # ponytail: every train / val scan's voxels in RAM (small seg sets)
@@ -267,28 +272,44 @@ class GradCache(TokenCache):
         self.clear()
 
     def tokens(self, i: str, mm: float, corner, n, k) -> torch.Tensor:
-        if (i, mm) not in self.maps:
-            if not self.net.training:   # eval: keep the last two scans' maps (sliding window over one scan)
-                last = list(dict.fromkeys(a for a, _ in self.maps))[-1:]
-                self.maps = {key: v for key, v in self.maps.items() if key[0] in last}
-            if self.net.training:   # the read with its graph once per step (also inside micro_step's no-grad pass);
-                with torch.enable_grad():   # the tiles get a detached leaf, flush() sends its gradient back
-                    r = self._map(i, mm, k)
-                if r.requires_grad:
-                    self.roots[(i, mm)] = r
-                self.maps[(i, mm)] = r.detach().requires_grad_(r.requires_grad)
-            else:
-                self.maps[(i, mm)] = self._map(i, mm, k)
-        m = self.maps[(i, mm)]
+        from ..data.volume import patch_grid
         c0 = [int(c) // int(kk) for c, kk in zip(corner, k)]
+        lo = hi = None
+        if self.net.training:   # a grid past `crop` cells: the tile's cells + MARGIN, its own map
+            G = patch_grid(tuple(self.vox[i][0].shape[1:]), k).tolist()
+            if int(np.prod(G)) > self.crop:   # ponytail: the table's tokens there came from 64-cell windows + MARGIN;
+                lo = [max(0, c - MARGIN) for c in c0]   # exact would read the windows the tile touches (~8 x 373k cells)
+                hi = [min(g, c + m + MARGIN) for c, m, g in zip(c0, n, G)]
+        key = (i, mm, None if lo is None else (*lo, *hi))
+        if key not in self.maps:
+            if not self.net.training:   # eval: keep the last two scans' maps (sliding window over one scan)
+                last = list(dict.fromkeys(a for a, *_ in self.maps))[-1:]
+                self.maps = {kk: v for kk, v in self.maps.items() if kk[0] in last}
+                self.maps[key] = self._map(i, mm, k)
+            else:   # the read with its graph once per step (also inside micro_step's no-grad pass);
+                with torch.enable_grad():   # the tiles get a detached leaf, flush() sends its gradient back
+                    r = self._map(i, mm, k, lo, hi)
+                if r.requires_grad:
+                    self.roots[key] = r
+                self.maps[key] = r.detach().requires_grad_(r.requires_grad)
+        m = self.maps[key]
+        c0 = [a - b for a, b in zip(c0, lo or (0, 0, 0))]
         crop = m[c0[0]: c0[0] + n[0], c0[1]: c0[1] + n[1], c0[2]: c0[2] + n[2]]
         crop = torch.nn.functional.pad(crop, (0, 0, *[p for a, b in zip(reversed(n), reversed(crop.shape[:3]))
                                                        for p in (0, a - b)]))   # zeros past the scan, as _read
         return crop.reshape(-1, m.shape[-1])
 
-    def _map(self, i: str, mm: float, k) -> torch.Tensor:
-        enc, (x, sp) = self.net.encoder, self.vox[i]
-        h = read_grad(enc, x, sp, mm, k, self.curve, self.net.seed)
+    def _map(self, i: str, mm: float, k, lo=None, hi=None) -> torch.Tensor:
+        enc, (x, sp), cs, seed = self.net.encoder, self.vox[i], list(self.net.enc_curves), self.net.seed
+        if not self.net.training:   # the table's read (fp16 on the host, as its folder)
+            dev, keep = next(enc.parameters()).device, enc.patch_embed.patch_mm
+            try:
+                return torch.from_numpy(read(enc, cs, seed, x.to(dev), sp.to(dev), k, mm, NMAX, BLOCK, MARGIN, taps=True))
+            finally:
+                enc.patch_embed.patch_mm = keep
+        if lo is not None:   # the voxels of cells lo..hi (patch_grid of the box: hi - lo cells, the scan's end too)
+            x = x[(slice(None), *(slice(a * kk, b * kk) for a, b, kk in zip(lo, hi, k)))]
+        h = sum(read_grad(enc, x, sp, mm, k, c, seed) for c in cs) / len(cs)
         return h.bfloat16() if os.environ.get("SFC_TOK_BF16") == "1" else h.float()   # bf16: opt-in, half the memory
 
 
