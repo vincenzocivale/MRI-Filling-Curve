@@ -308,7 +308,9 @@ class GradCache(TokenCache):
         return crop.reshape(-1, m.shape[-1])
 
     def _map(self, i: str, mm: float, k, lo=None, hi=None) -> torch.Tensor:
-        enc, (x, sp), cs, seed = self.net.encoder, self.vox[i], list(self.net.enc_curves), self.net.seed
+        enc, (x, sp), seed = self.net.encoder, self.vox[i], self.net.seed
+        # (06/11) SFC_FT_CURVES=a,b: the curves read (default the run's, net.enc_curves); not in the run's key
+        cs = [c for c in os.environ.get("SFC_FT_CURVES", "").split(",") if c] or list(self.net.enc_curves)
         if not self.net.training:   # the table's read (fp16 on the host, as its folder)
             dev, keep = next(enc.parameters()).device, enc.patch_embed.patch_mm
             try:

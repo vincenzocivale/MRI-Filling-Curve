@@ -260,7 +260,7 @@ class HierDec(nn.Module):
                     ENC.append(self._proj(torch.stack([self._cached(ids[b], mm, c0, n, k, dev) for b, c0 in items])[ti, ci]))
                 else:
                     h = self._read_snake(allp, g, ok, n, torch.tensor(sp, device=dev), list(k), mm)
-                    ENC.append(h if self._ft() else self._proj(h))   # fine-tuning: projected inside the checkpoint
+                    ENC.append(h if self._ftf() else self._proj(h))   # fine-tuning: projected inside the checkpoint
                 if ys is not None and j in (1, 2):
                     yl = _patchify_b(F.pad(ys[bs].float(), pads, value=255), k)[ti, ci]
                     okl = yl != 255
@@ -338,6 +338,9 @@ class HierDec(nn.Module):
         # (06/11) not while the encoder is frozen (decoder warm-up): the table's reads, no checkpoint recomputation
         return getattr(self, "finetune", False) and self.training and not getattr(self.cache, "frozen", bool)()
 
+    def _ftf(self) -> bool:   # (06/11) the fine live reads (4 / 2 mm) with gradient; SFC_FT_FINE_GRAD=0: forward only (the
+        return self._ft() and os.environ.get("SFC_FT_FINE_GRAD", "1") == "1"   # adapted encoder, no backward / recompute)
+
     def _proj(self, t: torch.Tensor) -> torch.Tensor:
         return self.enc(F.dropout(t, DROP, self.training))
 
@@ -372,7 +375,7 @@ class HierDec(nn.Module):
         return torch.cat(out)
 
     def _read_snake(self, allp, g, ok, n, sp, k, mm) -> torch.Tensor:
-        with torch.set_grad_enabled(self._ft()):
+        with torch.set_grad_enabled(self._ftf()):
             return self._snake(allp, g, ok, n, sp, k, mm)
 
     def _snake(self, allp, g, ok, n, sp, k, mm) -> torch.Tensor:
@@ -409,7 +412,7 @@ class HierDec(nn.Module):
                         # out of memory with the whole group's read cells embedded at once)
                         cu = torch.tensor([0] + grp, device=dev).cumsum(0).to(torch.int32)
                         sl = slice(at, at + tot)
-                        if self._ft():   # fine-tuning (04/11): the call checkpointed whole, projected inside: kept
+                        if self._ftf():   # fine-tuning (04/11): the call checkpointed whole, projected inside: kept
                             # for the backward only its voxels and the W-wide tokens; recomputed once (dropout's RNG kept)
                             hs.append(checkpoint(self._live_call, allp[gi[sl], cells[sl]], wts, cu, q[sl], oe[sl],
                                                  use_reentrant=False))
