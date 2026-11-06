@@ -651,6 +651,10 @@ def train(job: dict) -> None:
     if tcache is not None:
         tcache.ids = [it["id"] for it in job["items"]]
     del ref, pre, ref_p
+    if os.environ.get("SFC_CL3D") == "1":   # (06/11) 3D conv weights NDHWC: cuDNN's bf16 kernels without layout
+        for m in net.modules():              # conversions (~18 % of the GPU time of the TotalSeg fine-tuning profile)
+            if isinstance(m, (torch.nn.Conv3d, torch.nn.ConvTranspose3d)) and "weight" in m._parameters:
+                m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last_3d)
     n_frozen = n_train = 0
     for n, p in net.named_parameters():
         p.requires_grad_(n not in frozen_names)
@@ -744,11 +748,12 @@ def train(job: dict) -> None:
                       f"at lr x{mult[g['side']]}", flush=True)
         opt = torch.optim.AdamW(groups if FT else params, lr=job["lr"], weight_decay=1e-4)
         # (06/11) FT["ramp"]: each group's lr ramps up over that fraction of the iterations from the iteration it starts
-        # training (the decoder 1, the encoder after the warm-up): Adam's first steps are ~lr whatever the gradient, and
-        # P2's warm-started decoders and its encoder took them at full lr
+        # training (a warm-started decoder 1, the encoder after the warm-up): Adam's first steps are ~lr whatever the
+        # gradient, and P2's warm-started decoders and its encoder took them at full lr; a decoder from scratch keeps
+        # the table's schedule (start -R: no ramp)
         R = max(1, int(float(FT.get("ramp", 0)) * iters)) if FT else 1
         w0 = int(float(FT.get("warm", 0)) * iters) if FT else 0
-        starts = [w0 if g.get("side") else 0 for g in opt.param_groups]
+        starts = [w0 if g.get("side") else 0 if (FT or {}).get("init") else -R for g in opt.param_groups]
         sched = torch.optim.lr_scheduler.LambdaLR(opt, [
             lambda i, s=s: (1 - i / iters) ** 0.9 * min(1.0, max(0.0, (i + 1 - s) / R)) for s in starts])
         best, curve, start, t0 = {"val": -1.0}, [], 1, time.time()
