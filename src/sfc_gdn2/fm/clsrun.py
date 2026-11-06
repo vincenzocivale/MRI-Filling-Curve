@@ -272,6 +272,10 @@ def train(job: dict) -> None:
             # often perfect on train (CE ~0, no gradient): smoothing keeps a signal; iteration 0 is still the table's
             ls.backward()
             loss += float(ls)
+        if it % 25 == 0 or it <= 5:   # (05/11) is the gradient reaching the encoder (its reading) and the head?
+            gn = lambda ps: float(torch.stack([p.grad.norm() for p in ps if p.grad is not None]).norm()) \
+                if any(p.grad is not None for p in ps) else 0.0
+            print(f"[cls] iter {it} grad norm encoder {gn(enc_p):.3e} head {gn(list(head.parameters())):.3e}", flush=True)
         torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], 12)
         opt.step(), opt.zero_grad(set_to_none=True), sched.step()
         if it % 25 == 0 or it <= 5 or it == warm + 1:   # the first iterations one by one: speed and memory early
