@@ -414,9 +414,9 @@ class HierDec(nn.Module):
                         sl = slice(at, at + tot)
                         if self._ftf():   # fine-tuning (04/11): the call checkpointed whole, projected inside: kept
                             # for the backward only its voxels and the W-wide tokens; recomputed once (dropout's RNG kept)
-                            # (06/11) SFC_FT_FINE_CKPT: 2 (default) this checkpoint around the encoder's own per-block
-                            # ones (three forwards in all), 1 the per-block ones only, 0 none (activations kept)
-                            ck = os.environ.get("SFC_FT_FINE_CKPT", "2")
+                            # (06/11) SFC_FT_FINE_CKPT: 2 this checkpoint around the encoder's own per-block
+                            # ones (three forwards in all), 1 (default) the per-block ones only, 0 none (activations kept)
+                            ck = os.environ.get("SFC_FT_FINE_CKPT", "1")
                             hs.append(checkpoint(self._live_call, allp[gi[sl], cells[sl]], wts, cu, q[sl], oe[sl],
                                                  use_reentrant=False) if ck == "2" else
                                       self._live_call(allp[gi[sl], cells[sl]], wts, cu, q[sl], oe[sl], ck == "1"))
