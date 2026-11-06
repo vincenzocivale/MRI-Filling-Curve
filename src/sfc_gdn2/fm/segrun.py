@@ -568,10 +568,10 @@ class LoRA(torch.nn.Module):
         return w + (2 * self.B @ self.A).view_as(w).to(w.dtype)
 
 
-def peft(net, pre: set, r: int, full: tuple, where: tuple) -> tuple[set, set]:
+def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True) -> tuple[set, set]:
     """PEFT of the pretrained part (06/11, Francesco: LoRA after P2's fine-tuning; notes/LORA.md), `pre` its parameter
     names: LoRA of rank r (0: none) on every Linear / Conv2d / Conv3d weight (groups 1) under a `where` prefix; trained
-    whole: the 1-D parameters (norms, biases: BitFit) and everything under a `full` prefix (ours: the patch embedding,
+    whole: the 1-D parameters (norms, biases: BitFit; not with norms False) and everything under a `full` prefix (ours: the patch embedding,
     surgical fine-tuning for an input-level shift, Lee et al. 2023); the rest frozen, GDN-2's decays (A_log, dt_bias)
     too (LoRA fails on SSM modules, Galim et al. 2025). -> (trained, frozen) names of the pretrained part."""
     from torch.nn.utils import parametrize
@@ -581,7 +581,7 @@ def peft(net, pre: set, r: int, full: tuple, where: tuple) -> tuple[set, set]:
             parametrize.register_parametrization(m, "weight", LoRA(m.weight, r))
     p = dict(net.named_parameters())
     keep = {n for n in pre & p.keys()
-            if n.startswith(full) or p[n].ndim <= 1 and n.rsplit(".", 1)[-1] not in ("A_log", "dt_bias")}
+            if n.startswith(full) or norms and p[n].ndim <= 1 and n.rsplit(".", 1)[-1] not in ("A_log", "dt_bias")}
     lora = {n for n in p if ".parametrizations.weight.0." in n}
     orig = {n for n in p if n.endswith(".parametrizations.weight.original")}
     return lora | keep, orig | (pre & p.keys()) - keep
@@ -615,14 +615,6 @@ def train(job: dict) -> None:
     enc_names = frozen_names
     if FT:
         frozen_names = set()
-        net.finetune = True
-        if hasattr(net, "encoder"):
-            net.encoder.grad_checkpoint = True
-        if hasattr(net, "cache"):
-            from .token_cache import GradCache
-            old = net.cache
-            net.cache = GradCache(old.root, net)
-            net.cache.levels = old.levels
         if FT.get("init"):
             st = torch.load(FT["init"], map_location="cpu", weights_only=False)["best"]["state"]
             bad = set(st) - set(net.state_dict())
@@ -631,9 +623,19 @@ def train(job: dict) -> None:
             print(f"[seg] finetune: decoder from {FT['init']} ({len(st)} tensors)", flush=True)
         if "lora" in FT:   # (06/11) PEFT: FT["lora"] rank (0: norms + FT["full"] only), FT["full"] / FT["lora_in"] prefixes
             tup = lambda v: (v,) if isinstance(v, str) else tuple(v)   # a YAML string or list of prefixes
-            enc_names, frozen_names = peft(net, enc_names, int(FT["lora"]), tup(FT.get("full", ())), tup(FT.get("lora_in", "")))
+            enc_names, frozen_names = peft(net, enc_names, int(FT["lora"]), tup(FT.get("full", ())),
+                                           tup(FT.get("lora_in", "")), bool(FT.get("norms", 1)))
             print(f"[seg] finetune: LoRA r {FT['lora']} on {sum('.original' in n for n in frozen_names)} weights, "
                   f"{len(enc_names)} pretrained tensors trained, {len(frozen_names)} frozen", flush=True)
+        if enc_names:   # (06/11) none (lora 0, norms 0, no full): the control, the decoder alone from `init` on the
+            net.finetune = True   # cached tokens, the frozen part in eval mode as in the table's run
+            if hasattr(net, "encoder"):
+                net.encoder.grad_checkpoint = True
+            if hasattr(net, "cache"):
+                from .token_cache import GradCache
+                old = net.cache
+                net.cache = GradCache(old.root, net)
+                net.cache.levels = old.levels
     LM = job.get("select") == "mre"   # landmark task: heatmap regression (landmark_step, sigmoid maps, MRE selection)
     net.landmark = LM
     DET = job.get("select") == "det"   # point detection (cmbpts, user 28/10): component centroids matched within DET_MM
@@ -654,7 +656,7 @@ def train(job: dict) -> None:
         p.requires_grad_(n not in frozen_names)
         n_frozen += p.numel() * (not p.requires_grad)
         n_train += p.numel() * p.requires_grad
-    frozen_mods = [] if FT else [m for n, m in net.named_modules() if n and is_frozen(n)]
+    frozen_mods = [] if FT and enc_names else [m for n, m in net.named_modules() if n and is_frozen(n)]
     print(f"[seg] {job['cfg']['model']} init={job['init']} patch={patch} frozen={n_frozen / 1e6:.1f}M "
           f"trained={n_train / 1e6:.1f}M prefixes={frozen}", flush=True)
     amp = contextlib.nullcontext  # wrappers with `seg_bf16 = False` run fp32 (their repo's precision)
