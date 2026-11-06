@@ -823,7 +823,7 @@ def train(job: dict) -> None:
                     if it == start + pw:
                         import cProfile
                         prof = (cProfile.Profile(), torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                                                      torch.profiler.ProfilerActivity.CUDA]), time.time())
+                                                                                      torch.profiler.ProfilerActivity.CUDA], record_shapes=True), time.time())
                         prof[1].__enter__()
                         prof[0].enable()
                     else:
@@ -838,6 +838,8 @@ def train(job: dict) -> None:
                         pstats.Stats(prof[0], stream=buf).sort_stats("cumulative").print_stats(80)
                         head = f"batch {job['batch']}: {wall:.3f} s per iteration, GPU kernels {gpu:.3f} s ({100 * gpu / wall:.0f} %)"
                         out_p.with_suffix(".prof.txt").write_text(head + "\n\n" + ev.table(sort_by="self_device_time_total", row_limit=40)
+                                                                  + "\n\nby input shape (06/11):\n" + prof[1].key_averages(group_by_input_shape=True).table(
+                                                                      sort_by="self_device_time_total", row_limit=40, max_shapes_column_width=120)
                                                                   + "\n\n" + buf.getvalue())
                         print(f"[seg] profile: {head} -> {out_p.with_suffix('.prof.txt')}", flush=True)
                         return
