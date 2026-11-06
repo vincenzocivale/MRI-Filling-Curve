@@ -332,8 +332,9 @@ class HierDec(nn.Module):
     def _grid(self, n, dev) -> torch.Tensor:
         return self._grid_cpu(tuple(n)).to(dev)
 
-    def _ft(self) -> bool:   # fine-tuning in training (segrun sets `finetune`): the encoder's tokens carry gradient
-        return getattr(self, "finetune", False) and self.training
+    def _ft(self) -> bool:   # fine-tuning in training (segrun sets `finetune`): the encoder's tokens carry gradient;
+        # (06/11) not while the encoder is frozen (decoder warm-up): the table's reads, no checkpoint recomputation
+        return getattr(self, "finetune", False) and self.training and not getattr(self.cache, "frozen", bool)()
 
     def _proj(self, t: torch.Tensor) -> torch.Tensor:
         return self.enc(F.dropout(t, DROP, self.training))
