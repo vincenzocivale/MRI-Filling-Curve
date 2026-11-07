@@ -184,7 +184,11 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     g = gaussian(patch, x.device)
     # fp16 accumulator on the device if it takes <= 1/4 of the free memory, else on the CPU (nnU-Net's predictor does
     # both; "fits at all" left the tiles' forward no room: nnF CNN OOM on whole-body TotalSeg grids)
-    fits = x.is_cuda and n_out * math.prod(P) * 2 <= torch.cuda.mem_get_info(x.device)[0] / 4
+    # (07/11) free = the device's + what PyTorch's allocator holds unused (reserved, not allocated): a larger tile batch
+    # left more of it reserved and the accumulator went to the CPU (TotalSeg val ~2-3x slower at SFC_SLIDE_BATCH 8-16)
+    free = torch.cuda.mem_get_info(x.device)[0] + torch.cuda.memory_reserved(x.device) - torch.cuda.memory_allocated(x.device) \
+        if x.is_cuda else 0
+    fits = x.is_cuda and n_out * math.prod(P) * 2 <= free / 4
     out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device if fits else "cpu")
     wsum = torch.zeros(P, device=x.device)
     tiles, i, bs = list(product(*starts)), 0, SLIDE_BATCH   # tiles in batches (28/10), halved on OOM
