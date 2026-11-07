@@ -56,7 +56,7 @@ TILE_CELLS = 10
 LES_MM = 0.0   # tile_rule: half the p95 foreground extent; a lesion-centred tile holds it whole (Patches.sample)
 AHEAD = 6   # batches whose cached tokens are read in advance
 TILE_MAX = 1e9   # voxels x classes of one tile
-SLIDE_BATCH = int(os.environ.get("SFC_SLIDE_BATCH", "4"))   # sliding: tiles per forward (halved on OOM)
+SLIDE = [int(os.environ.get("SFC_SLIDE_BATCH", "4"))]   # sliding: tiles per forward (halved on OOM, kept halved)
 # (05/11, Francesco: SOOP tests took ~6 h) tiles whose input is all zero (air around skull-stripped scans) are not run;
 # voxels no run tile covers are background. nnU-Net's crop to the nonzero box, with the tiles where they were (the
 # token caches' corners unchanged). SFC_SKIP_EMPTY=0: every tile, as before.
@@ -191,7 +191,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     fits = x.is_cuda and n_out * math.prod(P) * 2 <= free / 4
     out = torch.zeros(n_out, *P, dtype=torch.half, device=x.device if fits else "cpu")
     wsum = torch.zeros(P, device=x.device)
-    tiles, i, bs = list(product(*starts)), 0, SLIDE_BATCH   # tiles in batches (28/10), halved on OOM
+    tiles, i, bs = list(product(*starts)), 0, SLIDE[0]   # tiles in batches (28/10), halved on OOM
     if SKIP_EMPTY:
         nz = (xp != 0).any(0)
         keep = [t for t in tiles if bool(nz[t[0]:t[0] + patch[0], t[1]:t[1] + patch[1], t[2]:t[2] + patch[2]].any())]
@@ -210,6 +210,8 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
             if bs == 1:
                 raise
             bs //= 2
+            SLIDE[0] = bs   # (07/11) kept for the next volumes: each started again at 16 and failed twice (TotalSeg
+            # val ~25 s per scan against ~6 at 4)
             torch.cuda.empty_cache()
             continue
         for sl, lt in zip(sls, lg):
