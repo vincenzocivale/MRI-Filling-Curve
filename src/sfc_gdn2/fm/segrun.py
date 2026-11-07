@@ -1354,10 +1354,12 @@ def save_pred(d: Path, i: str, probs: torch.Tensor, grid_from_gt, lab=None) -> N
     probability only) and the GT mapping (LFC landmark error, CMB lesion F1). Uncompressed (05/11: compressing
     ~500 MB SOOP grids took seconds per volume; scratch has room)."""
     d.mkdir(parents=True, exist_ok=True)
-    q = (probs.float().clamp(0, 1) * 255).round().to(torch.uint8)
+    # (07/11) the max over classes before the fp32 copy (the same uint8: rounding is monotonic): 51 classes on a
+    # whole-body grid in fp32 asked 26 GB of the GPU (ResEnc-L TotalSeg, accumulator on the device since 44c68e5)
+    p = probs if len(probs) <= 8 else probs.max(0).values[None]
+    q = (p.float().clamp(0, 1) * 255).round().to(torch.uint8)
     np.savez(d / f"{i}.npz", pred=(probs.argmax(0).to(torch.uint8).cpu().numpy() if lab is None else lab),
-                        prob=(q if len(q) <= 8 else q.max(0).values[None]).cpu().numpy(),
-                        grid_from_gt=np.asarray(grid_from_gt))
+                        prob=q.cpu().numpy(), grid_from_gt=np.asarray(grid_from_gt))
 
 
 def provenance(job: dict, split: dict, out_p: Path, ckpt: Path, extra: dict) -> None:
