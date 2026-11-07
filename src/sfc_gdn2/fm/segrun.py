@@ -929,27 +929,27 @@ def train(job: dict) -> None:
                 # (07/11, Francesco: validations left hanging) scan by scan into <out>.valpart.pt: a job killed inside a
                 # validation resumes at the scan it reached (TotalSeg's 100 val scans outlasted a 45-min block, ResEnc-L
                 # redid the validation of 1250 nine times)
-                part_p = out_p.with_suffix(".valpart.pt")
-                part = torch.load(part_p, map_location="cpu", weights_only=False) if part_p.exists() else {}
-                if part.get("it") != it or part.get("key") != key:
-                    part = {"it": it, "key": key, "val": {}, "train": {}}
-                elif part["val"]:
-                    print(f"[seg] validation of {it} resumed: {len(part['val'])} / {len(val_v)} val scans done", flush=True)
+                vpart_p = out_p.with_suffix(".valpart.pt")
+                vpart = torch.load(vpart_p, map_location="cpu", weights_only=False) if vpart_p.exists() else {}
+                if vpart.get("it") != it or vpart.get("key") != key:
+                    vpart = {"it": it, "key": key, "val": {}, "train": {}}
+                elif vpart["val"]:
+                    print(f"[seg] validation of {it} resumed: {len(vpart['val'])} / {len(val_v)} val scans done", flush=True)
                 for side, vols in (("val", val_v), ("train", [] if LM else tr_v)):
                     for n, v in enumerate(vols):
-                        if n in part[side]:
+                        if n in vpart[side]:
                             continue
-                        part[side][n] = scores(v, side == "val")
-                        torch.save(part, part_p.with_suffix(".tmp"))
-                        os.replace(part_p.with_suffix(".tmp"), part_p)
+                        vpart[side][n] = scores(v, side == "val")
+                        torch.save(vpart, vpart_p.with_suffix(".tmp"))
+                        os.replace(vpart_p.with_suffix(".tmp"), vpart_p)
                         if side == "val" and (n + 1) % 20 == 0:
                             print(f"[seg] validation of {it}: {n + 1} / {len(vols)} val scans", flush=True)
-                vr = [part["val"][n] for n in range(len(val_v))]
+                vr = [vpart["val"][n] for n in range(len(val_v))]
                 val = float(np.nanmean([r["dice"] for r in vr]))
                 rec = {"iter": it, "loss": lsum[0] / max(lsum[1], 1), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
                 if not LM:   # user 30/10: the Dice on a few training scans too (overfit)
-                    tr = [part["train"][n] for n in range(len(tr_v))]
+                    tr = [vpart["train"][n] for n in range(len(tr_v))]
                     rec["train_dice"] = float(np.nanmean([r["dice"] for r in tr]))
                     msg = f"train dice {rec['train_dice']:.4f} " + msg
                     if f1s:   # the lesion-wise F1 on them too (user 31/10: microbleeds)
