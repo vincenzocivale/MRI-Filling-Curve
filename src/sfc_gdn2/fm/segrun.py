@@ -907,33 +907,54 @@ def train(job: dict) -> None:
                 # scan by scan, only the labels kept (31/10: TotalSeg's ~50-class whole-body probabilities of every val
                 # scan held at once, on the GPU when they fit, ran out of memory)
                 lab = (lambda p: p.to(dev)) if job.get("select") == "mre" else (lambda p: p.argmax(0).to(dev))
-                preds = [lab(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])) for v in val_v]
-                ds = [dice_on(p.argmax(0) if p.dim() == 4 else p, v["y"].to(dev), k) for p, v in zip(preds, val_v)]
-                val = float(np.nanmean(ds))
+                md = "det" if job.get("select") == "det" else True   # det: detection F1 (centroids within DET_MM)
+                f1s = job.get("select") in ("f1", "det")
+
+                def scores(v, val_scan: bool, lab=lab, md=md, f1s=f1s) -> dict:   # one scan's Dice (+ MRE, + F1 sums)
+                    p = lab(sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"])) if val_scan else \
+                        sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).argmax(0).to(dev)
+                    r = {"dice": dice_on(p.argmax(0) if p.dim() == 4 else p, v["y"].to(dev), k)}
+                    if val_scan and LM:
+                        r["mre"] = mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k)
+                    if f1s:
+                        r["f1"] = [_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), md, sp=v.get("sp"), pts=v.get("pts"))
+                                   for c in range(1, k)]
+                    return r
+                # (07/11, Francesco: validations left hanging) scan by scan into <out>.valpart.pt: a job killed inside a
+                # validation resumes at the scan it reached (TotalSeg's 100 val scans outlasted a 45-min block, ResEnc-L
+                # redid the validation of 1250 nine times)
+                part_p = out_p.with_suffix(".valpart.pt")
+                part = torch.load(part_p, map_location="cpu", weights_only=False) if part_p.exists() else {}
+                if part.get("it") != it or part.get("key") != key:
+                    part = {"it": it, "key": key, "val": {}, "train": {}}
+                elif part["val"]:
+                    print(f"[seg] validation of {it} resumed: {len(part['val'])} / {len(val_v)} val scans done", flush=True)
+                for side, vols in (("val", val_v), ("train", [] if LM else tr_v)):
+                    for n, v in enumerate(vols):
+                        if n in part[side]:
+                            continue
+                        part[side][n] = scores(v, side == "val")
+                        torch.save(part, part_p.with_suffix(".tmp"))
+                        os.replace(part_p.with_suffix(".tmp"), part_p)
+                        if side == "val" and (n + 1) % 20 == 0:
+                            print(f"[seg] validation of {it}: {n + 1} / {len(vols)} val scans", flush=True)
+                vr = [part["val"][n] for n in range(len(val_v))]
+                val = float(np.nanmean([r["dice"] for r in vr]))
                 rec = {"iter": it, "loss": lsum[0] / max(lsum[1], 1), "val_dice": val, "min": (time.time() - t0) / 60}
                 score, msg = val, f"val dice {val:.4f}"
                 if not LM:   # user 30/10: the Dice on a few training scans too (overfit)
-                    trp = [sliding(net, v["x"].to(dev).float(), patch, k, amp, v["ctx"]).argmax(0).to(dev) for v in tr_v]
-                    rec["train_dice"] = float(np.nanmean([dice_on(p, v["y"].to(dev), k) for p, v in zip(trp, tr_v)]))
+                    tr = [part["train"][n] for n in range(len(tr_v))]
+                    rec["train_dice"] = float(np.nanmean([r["dice"] for r in tr]))
                     msg = f"train dice {rec['train_dice']:.4f} " + msg
-                    if job.get("select") in ("f1", "det"):   # the lesion-wise F1 on them too (user 31/10: microbleeds)
-                        md = "det" if job["select"] == "det" else True
-                        rec["train_f1"] = float(np.nanmean([_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), md,
-                                                                            sp=v.get("sp"), pts=v.get("pts")) for p, v in zip(trp, tr_v)],
-                                                                    True) for c in range(1, k)]))
+                    if f1s:   # the lesion-wise F1 on them too (user 31/10: microbleeds)
+                        rec["train_f1"] = float(np.nanmean([_metric([r["f1"][c] for r in tr], True) for c in range(k - 1)]))
                         msg = f"train F1 {rec['train_f1']:.3f} " + msg
-                    del trp
-                if job.get("select") == "mre":   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
-                    mre = float(np.mean([mre_on(p, v["y"].to(dev), v["sp"] if "sp" in v else v["ctx"][:3], k) for p, v in zip(preds, val_v)]))
+                if LM:   # landmarks (user, 22/10): chosen on the val radial error, not the Dice
+                    mre = float(np.mean([r["mre"] for r in vr]))
                     rec["val_mre"], score, msg = mre, -mre, msg + f" val MRE {mre:.2f} mm"
-                if job.get("select") in ("f1", "det"):   # small lesions (CMB, user 23/10): chosen on the val lesion-wise F1
-                    md = "det" if job["select"] == "det" else True   # det: detection F1 (centroids within DET_MM)
-                    f1v = float(np.nanmean([_metric([_score((p == c).cpu().numpy(), (v["y"] == c).numpy(), md,
-                                                            sp=v.get("sp"), pts=v.get("pts")) for p, v in zip(preds, val_v)],
-                                                    True)
-                                            for c in range(1, k)]))
+                if f1s:   # small lesions (CMB, user 23/10): chosen on the val lesion-wise F1
+                    f1v = float(np.nanmean([_metric([r["f1"][c] for r in vr], True) for c in range(k - 1)]))
                     rec["val_f1"], score, msg = f1v, f1v, msg + f" val F1 {f1v:.3f}"
-                del preds
                 curve.append(rec)
                 tm["val"] = time.time() - tc
                 print(f"[seg] it {it} loss {rec['loss']:.3f} {msg} ({(time.time() - t0) / 60:.1f} min; s: data {tm['data']:.0f}"
@@ -943,6 +964,8 @@ def train(job: dict) -> None:
                     best = {"val": val, "iter": it, "score": score, "state": trained()} | \
                         ({"val_mre": rec["val_mre"]} if "val_mre" in rec else {}) | \
                         ({"val_f1": rec["val_f1"]} if "val_f1" in rec else {})
+                save_last(it)   # (07/11) the validation done: a kill now resumes after it, not inside it
+                t_save = time.time()
                 set_mode()
                 pat = int(job.get("patience") or 0)   # screening: once learning (> 0), no new best for `pat` validations,
                 # never before 60 % of the budget (CMB p20 d4 Dmix, 24/10: F1 .018 / .024 then 0, learns after 7500)
