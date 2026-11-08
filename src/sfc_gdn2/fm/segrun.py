@@ -1282,6 +1282,45 @@ def _metric(sums, f1: bool) -> float:
     return 2 * p * r / max(p + r, 1e-9)
 
 
+_PP = None   # choose_postproc's (vals, boxes, sizes, f1) for its forked workers
+
+
+def _pp_one(c: int) -> tuple:
+    """One class of choose_postproc (a forked worker): (c, rule or None, base, best); (c, None, None, None) if absent."""
+    vals, boxes, sizes, f1 = _PP
+    if boxes is not None:   # this class's view of the val volumes (an empty 1-voxel box where it is absent)
+        vals_c = []
+        for (lab, q, y, *rest), bx in zip(vals, boxes):
+            s = bx[c - 1] if c - 1 < len(bx) and bx[c - 1] is not None else tuple(slice(0, 1) for _ in lab.shape)
+            qs = None if q is None else q[(slice(None), *s)]   # (probabilities: cropped with the class's box)
+            if c - 1 >= len(bx) or bx[c - 1] is None:
+                vals_c.append((np.zeros((1,) * lab.ndim, lab.dtype), None if q is None else
+                               np.zeros((q.shape[0],) + (1,) * lab.ndim, q.dtype), np.zeros((1,) * lab.ndim, y.dtype), *rest))
+            else:
+                vals_c.append((lab[s], qs, y[s], *rest))
+    else:
+        vals_c = vals
+    t = [(y == c) for _, _, y, *_ in vals_c]
+    if not any(x.any() for x in t):
+        return c, None, None, None
+    gts = [_components(tt) if f1 else None for tt in t]
+    base = _metric([_score(lab == c, tt, f1, g, sp=sp, pts=pp) for (lab, _, _, sp, pp), tt, g in zip(vals_c, t, gts)], f1)
+    best, br = base, None
+    taus = (None,) + (TAUS if vals_c[0][1] is not None else ())
+    for tau in taus:   # the thresholded masks' components once per tau, the filters on top of them
+        comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, *_ in vals_c]
+        for smin in sorted({0, *sizes.get(c, ())}) if f1 != "det" else (0,):   # det: the threshold only
+            for largest in (False, True) if f1 != "det" else (False,):
+                if tau is None and not smin and not largest:
+                    continue
+                sc = _metric([_score(_pp_class(lab, q, c, tau, smin, largest, cp), tt, f1, g,
+                                     cp if f1 == "det" else None, sp, pp)
+                              for (lab, q, _, sp, pp), tt, g, cp in zip(vals_c, t, gts, comps)], f1)
+                if sc > best + 1e-4:
+                    best, br = sc, (tau, int(smin), largest)
+    return c, br, base, best
+
+
 def choose_postproc(vals: list, k: int, sizes: dict, f1: bool, part: Path | None = None, pkey=None) -> dict:
     """Per foreground class, on the val volumes [(argmax, uint8 probs or None, labels)], the rule (tau, min size,
     largest only) that improves the task's metric (Dice, or lesion F1); no rule if nothing does (user, 23/10:
@@ -1321,47 +1360,27 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool, part: Path | None
             boxes.append([None if sa is None and sb is None else tuple(
                 slice(min(x.start for x in (u, v) if x is not None), max(x.stop for x in (u, v) if x is not None))
                 for u, v in zip(sa or (None,) * lab.ndim, sb or (None,) * lab.ndim)) for sa, sb in zip(a, b)])
-    for c in range(1, k):
-        if c in done:
-            if done[c] is not None:
-                rule[c] = tuple(done[c])
-            continue
-        if boxes is not None:   # this class's view of the val volumes (an empty 1-voxel box where it is absent)
-            vals_c = []
-            for (lab, q, y, *rest), bx in zip(vals, boxes):
-                s = bx[c - 1] if c - 1 < len(bx) and bx[c - 1] is not None else tuple(slice(0, 1) for _ in lab.shape)
-                qs = None if q is None else q[(slice(None), *s)]   # (probabilities: cropped with the class's box)
-                if c - 1 >= len(bx) or bx[c - 1] is None:
-                    vals_c.append((np.zeros((1,) * lab.ndim, lab.dtype), None if q is None else
-                                   np.zeros((q.shape[0],) + (1,) * lab.ndim, q.dtype), np.zeros((1,) * lab.ndim, y.dtype), *rest))
-                else:
-                    vals_c.append((lab[s], qs, y[s], *rest))
-        else:
-            vals_c = vals
-        t = [(y == c) for _, _, y, *_ in vals_c]
-        if not any(x.any() for x in t):
-            mark(c, None)
-            continue
-        gts = [_components(tt) if f1 else None for tt in t]
-        base = _metric([_score(lab == c, tt, f1, g, sp=sp, pts=pp) for (lab, _, _, sp, pp), tt, g in zip(vals_c, t, gts)], f1)
-        best, br = base, None
-        taus = (None,) + (TAUS if vals_c[0][1] is not None else ())
-        for tau in taus:   # the thresholded masks' components once per tau, the filters on top of them
-            comps = [_components((q[c] >= round(tau * 255)) if tau is not None else lab == c) for lab, q, *_ in vals_c]
-            for smin in sorted({0, *sizes.get(c, ())}) if f1 != "det" else (0,):   # det: the threshold only
-                for largest in (False, True) if f1 != "det" else (False,):
-                    if tau is None and not smin and not largest:
-                        continue
-                    sc = _metric([_score(_pp_class(lab, q, c, tau, smin, largest, cp), tt, f1, g,
-                                         cp if f1 == "det" else None, sp, pp)
-                                  for (lab, q, _, sp, pp), tt, g, cp in zip(vals_c, t, gts, comps)], f1)
-                    if sc > best + 1e-4:
-                        best, br = sc, (tau, int(smin), largest)
-        if br is not None:
-            rule[c] = br
-            print(f"[seg] post-processing class {c}: tau {br[0]}, min {br[1]} voxels, largest {br[2]}: val "
-                  f"{base:.4f} -> {best:.4f}", flush=True)
-        mark(c, br)
+    for c, r in done.items():
+        if r is not None:
+            rule[c] = tuple(r)
+    # (08/11) the classes in parallel, one process each (fork: the val arrays shared, not copied; numpy / scipy only):
+    # ~100 s per class on one core (ResEnc-L TotalSeg, 51 classes), the job holds 8
+    global _PP
+    _PP = (vals, boxes, sizes, f1)
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    todo = [c for c in range(1, k) if c not in done]
+    try:
+        with ProcessPoolExecutor(max(1, min(len(todo), len(os.sched_getaffinity(0)))), mp_context=mp.get_context("fork")) as ex:
+            for f in as_completed([ex.submit(_pp_one, c) for c in todo]):
+                c, br, base, best = f.result()
+                if br is not None:
+                    rule[c] = br
+                    print(f"[seg] post-processing class {c}: tau {br[0]}, min {br[1]} voxels, largest {br[2]}: val "
+                          f"{base:.4f} -> {best:.4f}", flush=True)
+                mark(c, br)
+    finally:
+        _PP = None
     return rule
 
 
