@@ -801,17 +801,18 @@ def train(job: dict) -> None:
         params = [p for p in net.parameters() if p.requires_grad]
         if FT:   # the pretrained part at enc_lr x the decoder's lr (discriminative lr), LoRA's factors at lora_lr x
             # (LoRA's best lr ~10x full fine-tuning's, Biderman et al. 2024), the same poly decay
-            # (08/11) side 3: the per-scale offsets (gates, decay) at off_lr x (default 10 x LoRA's: ~12 logits to travel)
+            # (08/11) side 3: the per-scale offsets (gates, decay) at the absolute lr SFC_FT_OFF_LR (default 5e-3: AdamW
+            # moves a bias ~lr per step, LoRA's erase bias reached ~12 logits), no weight decay, init 0
             side = lambda n: (0 if n not in enc_names else 3 if ".offset." in n or n.endswith(".0.d")
                               else 2 if ".parametrizations." in n else 1)
             mult = (1.0, float(FT.get("enc_lr", 0.1)), float(FT.get("lora_lr", 1.0)),
-                    float(FT.get("off_lr", 10 * float(FT.get("lora_lr", 1.0)))))
+                    float(os.environ.get("SFC_FT_OFF_LR", "5e-3")) / job["lr"])
             groups = [{"params": [p for n, p in net.named_parameters() if n not in frozen_names and side(n) == g],
-                       "lr": job["lr"] * mult[g], "side": g} for g in range(4)]
+                       "lr": job["lr"] * mult[g], "side": g, **({"weight_decay": 0.0} if g == 3 else {})} for g in range(4)]
             groups = [g for g in groups if g["params"]]
             for g in groups[1:]:
                 print(f"[seg] finetune: {('', 'encoder', 'LoRA', 'offsets')[g['side']]} {sum(p.numel() for p in g['params']) / 1e6:.2f}M "
-                      f"at lr x{mult[g['side']]}", flush=True)
+                      f"at lr x{mult[g['side']]:g} ({g['lr']:.1e}, weight decay {g.get('weight_decay', 1e-4):g})", flush=True)
         opt = torch.optim.AdamW(groups if FT else params, lr=job["lr"], weight_decay=1e-4)
         # (06/11) FT["ramp"]: each group's lr ramps up over that fraction of the iterations from the iteration it starts
         # training (a warm-started decoder 1, the encoder after the warm-up): Adam's first steps are ~lr whatever the
