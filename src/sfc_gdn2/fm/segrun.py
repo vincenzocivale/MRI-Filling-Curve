@@ -186,7 +186,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
               for s, p in zip(P, patch)]
     if snap:   # the last start s - p is on the grid (both multiples): coverage kept
-        starts = [np.unique(st // b * b) for st, b in zip(starts, snap)]
+        starts = [np.unique(np.asarray(st) // b * b) for st, b in zip(starts, snap)]   # (an axis shorter than the tile: [0])
     g = gaussian(patch, x.device)
     # fp16 accumulator on the device if it takes <= 1/4 of the free memory, else on the CPU (nnU-Net's predictor does
     # both; "fits at all" left the tiles' forward no room: nnF CNN OOM on whole-body TotalSeg grids)
