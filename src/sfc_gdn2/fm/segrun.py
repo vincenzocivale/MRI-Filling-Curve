@@ -180,7 +180,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
         else tuple(patch)
     snap = getattr(net, "snap", None)   # fm/hier_dec AlignUNet: tiles, corners and the padded volume on its bottleneck grid
     if getattr(net, "fixed_patch", None):   # nnU-Net's patch (cut to the scan, on the grid)
-        patch = tuple(min(p, -(-s // b) * b) for p, s, b in zip(net.fixed_patch, S, snap))
+        patch = tuple(min(p, max(-(-s // b) * b, 2 * b)) for p, s, b in zip(net.fixed_patch, S, snap))
     elif snap:
         patch = tuple(max(b, round(p / b) * b) for p, b in zip(patch, snap))
     xp, _ = pad_to(x, None, [-(-max(s, p) // b) * b for s, p, b in zip(S, patch, snap)] if snap else patch)
@@ -375,7 +375,8 @@ class Patches:
             self.lm.append(v.get("lm"))
             pv = tile_of(patch, v.get("align"), k)
             if fixed:
-                pv = [min(p, -(-z // b) * b) for p, z, b in zip(fixed, v["x"].shape[1:], snap)]
+                pv = [min(p, max(-(-z // b) * b, 2 * b)) for p, z, b in zip(fixed, v["x"].shape[1:], snap)]   # >= 2 bottleneck
+                # cells per axis (a scan smaller than one: zero-padded; 1 x 1 x 1 broke InstanceNorm in training)
             elif pv and getattr(self, "fit", False) and v.get("align"):   # any_tile: never larger than the volume (its grid)
                 pv = [min(p, -(-s // a) * a) for p, s, a in zip(pv, v["x"].shape[1:], v["align"])]
             if pv and snap and not fixed:   # the nearest multiple (the voxel budget's tile kept: Willis 156x156x84 -> 160x160x80)
