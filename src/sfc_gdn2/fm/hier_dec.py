@@ -539,6 +539,7 @@ class HierUNet(HierDec):
 CH = (32, 64, 112, 112, 112, 112)   # (08/11) AlignUNet: nnU-Net's stage widths capped at 112 (7.9 M parameters; 128: 9.9 M)
 FC = 32                             # each stage's token field: channels (+ 1: read here / inherited from the parent)
 ALIGN_MIN_MM = float(os.environ.get("SFC_ALIGN_MIN_MM", "0"))   # aligned levels whose cell edge (mm) is below: not read
+NO_TOK = os.environ.get("SFC_ALIGN_NO_TOK") == "1"   # (08/11, user) AlignUNet's U-Net alone: no token read, no field
 ALPHA_GRID = tuple(i / 10 for i in range(10, -1, -1))   # AlignUNet: the U-Net head's weights tried on val (one pass)
 
 
@@ -576,7 +577,9 @@ class AlignUNet(HierDec):
         self.ds = nn.ModuleList([nn.Conv3d(CH[1], n_out, 1), nn.Conv3d(CH[2], n_out, 1)])
         self.tok_out = nn.Conv3d(FC, n_out, 1)
         self.cum, self.snap, self.vol_stats = None, None, {}
-        self.two_heads = True   # segrun's alpha pass: read_taus ["heads"] -> both heads' log-probabilities, any alpha after
+        if NO_TOK:   # no token head: segrun's alpha pass skipped (no read_taus), the test the U-Net head alone
+            del self.read_taus
+        self.two_heads = not NO_TOK   # segrun's alpha pass: read_taus ["heads"] -> both heads' log-probabilities, any alpha after
 
     def plan(self, ids) -> None:
         import numpy as np
@@ -690,7 +693,10 @@ class AlignUNet(HierDec):
         e = [self.down[0](x)]
         for s in range(1, S + 1):
             e.append(self.down[s](e[-1]))
-        fields, r, aux = self.cascade(xr[:, 0], sps, ids, corners, e, ys)
+        if NO_TOK:   # the control: the same U-Net, every field and R zero (the encoder never called)
+            fields, r, aux = {}, x.new_zeros(len(x), FC, *e[S].shape[2:]), 0.0
+        else:
+            fields, r, aux = self.cascade(xr[:, 0], sps, ids, corners, e, ys)
         fields = {s: f.to(e[0].dtype) for s, f in fields.items()}
         r = r.to(e[0].dtype)
         lm = getattr(self, "landmark", False)

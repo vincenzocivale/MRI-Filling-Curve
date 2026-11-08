@@ -180,7 +180,7 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
         else tuple(patch)
     snap = getattr(net, "snap", None)   # fm/hier_dec AlignUNet: tiles, corners and the padded volume on its bottleneck grid
     if snap:
-        patch = tuple(max(b, p // b * b) for p, b in zip(patch, snap))
+        patch = tuple(max(b, round(p / b) * b) for p, b in zip(patch, snap))
     xp, _ = pad_to(x, None, [-(-max(s, p) // b) * b for s, p, b in zip(S, patch, snap)] if snap else patch)
     P = tuple(xp.shape[1:])
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
@@ -373,8 +373,8 @@ class Patches:
             pv = tile_of(patch, v.get("align"), k)
             if pv and getattr(self, "fit", False) and v.get("align"):   # any_tile: never larger than the volume (its grid)
                 pv = [min(p, -(-s // a) * a) for p, s, a in zip(pv, v["x"].shape[1:], v["align"])]
-            if pv and snap:
-                pv = [max(b, p // b * b) for p, b in zip(pv, snap)]
+            if pv and snap:   # the nearest multiple (the voxel budget's tile kept: Willis 156x156x84 -> 160x160x80)
+                pv = [max(b, round(p / b) * b) for p, b in zip(pv, snap)]
             x, y = pad_to(v["x"], v["y"], pv) if pv else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
             self.align.append(v.get("align"))
