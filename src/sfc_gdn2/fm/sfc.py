@@ -248,12 +248,13 @@ class SFC(Wrapper):
             taps = [len(enc.blocks) * i // 4 - 1 for i in range(4 - taps, 4)]  # the patch embedding, block -1)
         enc.taps = tuple(taps)
         a = self.args
-        if a.get("hier_dec") or a.get("hier_unet"):   # fm/hier_dec (29/10): Dmix gerarchico + kernel continuo; hier_unet (30/10)
-            from .hier_dec import HierDec, HierUNet
+        # fm/hier_dec (29/10): Dmix gerarchico + kernel continuo; hier_unet (30/10); align_unet (08/11)
+        if a.get("hier_dec") or a.get("hier_unet") or a.get("align_unet"):
+            from .hier_dec import AlignUNet, HierDec, HierUNet
             # the 16 / 8 mm tokens read along one curve, hilbert (04/11, default; ablation C: one curve reads as the
             # mean of three, a third of the cost); args.token_curves for others (the table's runs: the view curves)
             tc = list(a.get("token_curves") or ["hilbert"])
-            net = (HierUNet if a.get("hier_unet") else HierDec)(enc, str(a["token_cache"]), n_out, tc,
+            net = (AlignUNet if a.get("align_unet") else HierUNet if a.get("hier_unet") else HierDec)(enc, str(a["token_cache"]), n_out, tc,
                                                                  int(self.run_cfg["seed"]))
             net.cache.sig = {"checkpoint": str(self.ckpt) if pretrained else f"random{os.environ.get('SFC_ENC_SEED', '')}", "taps": list(enc.taps),
                              "curves": tc, "blocks": None}

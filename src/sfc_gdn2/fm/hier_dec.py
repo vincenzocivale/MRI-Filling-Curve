@@ -534,3 +534,189 @@ class HierUNet(HierDec):
         al = self.read_taus if self.full else [0.5]
         out = [(a * pu + (1 - a) * pt).clamp(min=1e-8).log() for a in al]   # log-probabilities per alpha, side by side
         return torch.cat(out, 1)[:, :, : T0[0], : T0[1], : T0[2]]
+
+
+CH = (32, 64, 112, 112, 112, 112)   # (08/11) AlignUNet: nnU-Net's stage widths capped at 112 (7.9 M parameters; 128: 9.9 M)
+FC = 32                             # each stage's token field: channels (+ 1: read here / inherited from the parent)
+ALIGN_MIN_MM = float(os.environ.get("SFC_ALIGN_MIN_MM", "0"))   # aligned levels whose cell edge (mm) is below: not read
+
+
+class AlignUNet(HierDec):
+    """args.align_unet (08/11, user): the token levels ARE the U-Net's stages. nnU-Net's plan (an axis halves while finer
+    than twice the finest, its map >= 4 in a ~160 voxel tile, at most 6 stages, widths CH); the cells of stage s are its
+    cumulative stride in voxels (cum[s]), read where they hold >= 8 voxels (>= ALIGN_MIN_MM): exactly nested, and the tiles
+    sit on the bottleneck's grid (segrun snaps them to `snap`), so every cell lies whole in its tile (no zero padding, no
+    read past the tile). R: the 16 mm tokens of the cache, read on the whole scan (the context), the bottleneck cells'
+    parents (the R cell holding the centre) and at the bottleneck. Level S (bottleneck): every cell of the tile read live;
+    each finer stage the children of the cells with P(mixed) > tau. A token = parent + MLP(parent ++ encoder token + the
+    stage's vector) (one MLP for every stage, no voxel KernelEmbed: the U-Net's own stage sees the voxels). P(mixed) of a
+    cell from its token and the U-Net's down feature there, both detached (the BCE trains its head only; the down path
+    runs first, it never sees tokens). Unread cells inherit the parent's token; each stage's field = its own Linear
+    W -> FC (+ the read mask), concatenated 1:1 into that stage of the up path. Token head on the finest field, mixed with
+    the U-Net head (alpha on val), deep supervision at stages 1 and 2, path dropout as HierUNet."""
+
+    def __init__(self, encoder, cache: str, n_out: int, curves=(), seed: int = 17):
+        super().__init__(encoder, cache, n_out, curves, seed)
+        del self.stem, self.head, self.head2, self.out, self.vox, self.mlp, self.lhead, self.fproj
+        self.cache.levels = (16.0,)
+        self.TAUS, self.read_taus = ALPHAS, [0.5]
+        self.mlp = nn.Sequential(nn.Linear(2 * W, W), nn.GELU(), nn.Linear(W, W))
+        self.lvl = nn.Parameter(torch.zeros(len(CH), W))
+        self.lhead = nn.ModuleList(nn.Linear(W + c, 1) for c in CH)
+        for h in self.lhead:
+            nn.init.constant_(h.bias, -2.0)   # little read at the start, as HierDec
+        self.fproj = nn.ModuleList(nn.Linear(W, FC) for _ in CH)
+        self.rproj = nn.Linear(W, FC)
+        self.down = nn.ModuleList([block(1, CH[0])] + [block(CH[s - 1], CH[s], 2) for s in range(1, len(CH))])
+        self.mid = block(CH[-1] + 2 * FC + 1, CH[-1])   # the bottleneck's stage + its field + R (CH[S] = CH[-1]: S >= 2)
+        self.upc = nn.ModuleList(nn.ConvTranspose3d(CH[s + 1], CH[s], 2, 2) for s in range(len(CH) - 1))
+        self.dec = nn.ModuleList(block(2 * CH[s] + FC + 1, CH[s]) for s in range(len(CH) - 1))
+        self.out = nn.Conv3d(CH[0], n_out, 1)
+        self.ds = nn.ModuleList([nn.Conv3d(CH[1], n_out, 1), nn.Conv3d(CH[2], n_out, 1)])
+        self.tok_out = nn.Conv3d(FC, n_out, 1)
+        self.cum, self.snap, self.vol_stats = None, None, {}
+
+    def plan(self, ids) -> None:
+        import numpy as np
+        ids = [i for i in ids if (self.cache.root / f"{i}.json").exists()]
+        if not ids:
+            return
+        ms = [self.cache.meta(i) for i in ids]
+        cur = np.median([m["spacing"] for m in ms], 0).tolist()
+        size = np.minimum(np.median([m["shape"] for m in ms], 0), 160).tolist()
+        cum = [[1, 1, 1]]
+        while len(cum) < len(CH):
+            st = [2 if c <= 2 * min(cur) and z // (2 * a) >= 4 else 1 for c, z, a in zip(cur, size, cum[-1])]
+            if st == [1, 1, 1]:
+                break
+            cur, cum = [c * t for c, t in zip(cur, st)], cum + [[a * t for a, t in zip(cum[-1], st)]]
+        assert len(cum) >= 3, f"AlignUNet: {len(cum)} stages (scans too small for a bottleneck at >= stage 2)"
+        self.cum, self.snap = cum, cum[-1]
+        for s in range(1, len(cum)):
+            self.down[s][0].stride = tuple(b // a for a, b in zip(cum[s - 1], cum[s]))
+        print(f"[seg] align_unet plan: strides {cum[1:]} (median spacing {np.median([m['spacing'] for m in ms], 0).round(2).tolist()})",
+              flush=True)
+
+    def _enc(self, allp, g, ok, n, sp, k, mm) -> torch.Tensor:   # the encoder on the open cells -> [open, W]
+        h = self._read_snake(allp, g, ok, n, sp, k, mm)
+        return h if self._ftf() else self._proj(h)
+
+    def cascade(self, xs, sps, ids, corners, e, ys) -> tuple:
+        """Tiles xs [B, *T] (x / p99) -> {stage: field [B, FC + 1, *grid]}, R's field at the bottleneck, the BCE."""
+        B, T, dev = len(xs), tuple(xs.shape[1:]), xs.device
+        S = len(self.cum) - 1
+        kS = torch.tensor(self.cum[S], device=dev)
+        gS = self._grid([t // k for t, k in zip(T, self.cum[S])], dev)
+        R = []
+        for b in range(B):   # each bottleneck cell's parent: the 16 mm cell holding its centre
+            k16 = [4 * a for a in self.cache.meta(ids[b])["k4"]]
+            c0 = [c // k for c, k in zip(corners[b], k16)]
+            n16 = [-(-(c + t) // k) - a for c, t, k, a in zip(corners[b], T, k16, c0)]
+            tR = self._proj(self._cached(ids[b], 16.0, c0, n16, k16, dev))
+            q = (torch.tensor(corners[b], device=dev) + gS * kS + kS // 2) // torch.tensor(k16, device=dev) - torch.tensor(c0, device=dev)
+            q = torch.minimum(q, torch.tensor(n16, device=dev) - 1)
+            R.append(tR[(q[:, 0] * n16[1] + q[:, 1]) * n16[2] + q[:, 2]])
+        R = torch.stack(R)   # [B, N_S, W]
+        fields, loss, prev = {}, 0.0, None
+        for s in range(S, 0, -1):
+            k = self.cum[s]
+            if math.prod(k) < 8:
+                break
+            n = [t // kk for t, kk in zip(T, k)]
+            g = self._grid(n, dev)
+            mm = [math.prod(kk * z for kk, z in zip(k, sp)) ** (1 / 3) for sp in sps]   # each scan's cell edge (mm)
+            if prev is None:
+                parent, ok = R, torch.ones(B, len(g), dtype=torch.bool, device=dev)
+            else:
+                pn = [t // kk for t, kk in zip(T, self.cum[s + 1])]
+                pq = g * torch.tensor(k, device=dev) // torch.tensor(self.cum[s + 1], device=dev)
+                pidx = (pq[:, 0] * pn[1] + pq[:, 1]) * pn[2] + pq[:, 2]
+                parent, ok = prev[0][:, pidx], prev[1][:, pidx] & (prev[2][:, pidx] > self.tau)
+                if int(ok.sum(1).max()) > OPEN_MAX:   # the cap: the likeliest mixed parents
+                    top = torch.where(ok, prev[2][:, pidx], -1.0).topk(OPEN_MAX, 1).indices
+                    ok = ok & torch.zeros_like(ok).scatter_(1, top, True)
+            ok = ok & torch.tensor([m >= ALIGN_MIN_MM for m in mm], device=dev)[:, None]
+            t, pm = parent, torch.zeros(ok.shape, device=dev)
+            ti, ci = ok.nonzero(as_tuple=True)
+            if len(ti):
+                allp = _patchify_b(xs.float(), k)
+                h = None
+                for sp in dict.fromkeys(sps[b] for b in ti.unique().tolist()):   # one read per spacing (one kernel)
+                    bs = [b for b in range(B) if sps[b] == sp]
+                    hb = self._enc(allp[bs], g, ok[bs], n, torch.tensor(sp, device=dev), list(k), mm[bs[0]])
+                    h = hb.new_zeros(len(ti), W) if h is None else h
+                    h[torch.isin(ti, torch.tensor(bs, device=dev))] = hb
+                pr = parent[ti, ci]
+                t = parent.index_put((ti, ci), pr + self.mlp(torch.cat([pr, h.to(pr.dtype) + self.lvl[s]], -1)))
+                if s > 1 and math.prod(self.cum[s - 1]) >= 8:   # P(mixed): what the next stage reads
+                    feat = e[s].flatten(2).transpose(1, 2)[ti, ci]
+                    lg = self.lhead[s](torch.cat([t[ti, ci], feat], -1).detach().float())[:, 0]
+                    pm = pm.index_put((ti, ci), lg.sigmoid().detach())
+                    if ys is not None:
+                        yl = _patchify_b(ys.float(), k)[ti, ci]
+                        okl = yl != 255
+                        lo, hi = torch.where(okl, yl, 1e9).amin(1), torch.where(okl, yl, -1.0).amax(1)
+                        v = okl.any(1)
+                        if v.any():
+                            pos = (lo[v] != hi[v]).float()
+                            bce = F.binary_cross_entropy_with_logits(lg[v], pos, reduction="none")
+                            loss = loss + 0.5 * ((bce * pos).sum() / pos.sum().clamp(min=1)
+                                                 + (bce * (1 - pos)).sum() / (1 - pos).sum().clamp(min=1))
+            f = torch.cat([self.fproj[s](t), ok[..., None].to(t.dtype)], -1)
+            fields[s] = f.transpose(1, 2).reshape(B, FC + 1, *n)
+            prev = (t, ok, pm)
+        r = self.rproj(R).transpose(1, 2).reshape(B, FC, *[t // k for t, k in zip(T, self.cum[S])])
+        return fields, r, loss
+
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        from .segrun import loss_fn
+        if hasattr(self.cache, "new_step"):   # fine-tuning (GradCache): this step's encoder reads
+            self.cache.new_step(self.training)
+        rows = ctx.tolist()
+        sps, ids = [tuple(r[:3]) for r in rows], [self.cache.ids[int(r[6])] for r in rows]
+        corners = [[int(v) for v in r[7:10]] for r in rows]
+        T, S = tuple(x.shape[2:]), len(self.cum) - 1
+        assert all(t % b == 0 for t, b in zip(T, self.snap)) and all(c % b == 0 for cc in corners for c, b in zip(cc, self.snap)), \
+            f"AlignUNet: tile {T} / corners {corners} off the bottleneck grid {self.snap} (segrun snaps them)"
+        xr = x   # the reads: x / p99 (pretraining's input, never z-scored); the U-Net: z-score per scan
+        if self.vol_stats:
+            ms = torch.tensor([self.vol_stats[int(r[6])] for r in rows], device=x.device, dtype=x.dtype)
+            x = (x - ms[:, 0, None, None, None, None]) / ms[:, 1, None, None, None, None]
+        ys = None
+        if self.sel_y is not None and self.training:
+            ys = self.sel_y.to(x.device).reshape(len(x), *T).long()
+        e = [self.down[0](x)]
+        for s in range(1, S + 1):
+            e.append(self.down[s](e[-1]))
+        fields, r, aux = self.cascade(xr[:, 0], sps, ids, corners, e, ys)
+        fields = {s: f.to(e[0].dtype) for s, f in fields.items()}
+        r = r.to(e[0].dtype)
+        lm = getattr(self, "landmark", False)
+        fine = min(fields) if fields else None
+        tok = None if lm or fine is None else self.tok_out(F.gelu(F.interpolate(
+            fields[fine][:, :FC], size=T, mode="trilinear", align_corners=False)))
+        skips = list(e)
+        if self.training and PDROP:   # path dropout: u < PDROP the image's skips off, PDROP <= u < 2 PDROP the fields off
+            u = torch.rand(len(x), device=x.device)[:, None, None, None, None]
+            img, on = (u >= PDROP).to(e[0].dtype), ((u < PDROP) | (u >= 2 * PDROP)).to(e[0].dtype)
+            skips = [a * img for a in skips[:S]] + [skips[S]]
+            fields, r = {s: f * on for s, f in fields.items()}, r * on
+        h = self.mid(torch.cat([skips[S], fields.get(S, r.new_zeros(len(x), FC + 1, *r.shape[2:])), r], 1))
+        for s in range(S - 1, -1, -1):
+            st = [b // a for a, b in zip(self.cum[s], self.cum[s + 1])]
+            f = fields.get(s, h.new_zeros(len(x), FC + 1, *e[s].shape[2:]))
+            h = self.dec[s](torch.cat([_up(self.upc[s], h, st), skips[s], f], 1))
+            if ys is not None and not lm and s in (1, 2):   # deep supervision, nnU-Net's weights 0.5, 0.25
+                aux = aux + (0.5 if s == 1 else 0.25) * loss_fn(self.ds[s - 1](h).float(),
+                                                                _down_fg(ys, self.cum[s], self.out.out_channels), self.out.out_channels)
+        o = self.out(h)
+        if ys is not None:
+            if tok is not None:
+                aux = aux + loss_fn(tok, ys, self.out.out_channels)
+            self.aux, self.sel_y = aux, None
+        if lm or self.training:
+            return o
+        pu = o.float().softmax(1)
+        pt = pu if tok is None else tok.float().softmax(1)   # no level read (scans too coarse): the U-Net alone
+        al = self.read_taus if self.full else [0.5]
+        return torch.cat([(a * pu + (1 - a) * pt).clamp(min=1e-8).log() for a in al], 1)

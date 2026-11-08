@@ -177,10 +177,15 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     S = tuple(x.shape[1:])
     patch = S if patch is None else tuple(min(p, s) for p, s in zip(patch, S)) if getattr(net, "any_tile", False) \
         else tuple(patch)
-    xp, _ = pad_to(x, None, patch)
+    snap = getattr(net, "snap", None)   # fm/hier_dec AlignUNet: tiles, corners and the padded volume on its bottleneck grid
+    if snap:
+        patch = tuple(max(b, p // b * b) for p, b in zip(patch, snap))
+    xp, _ = pad_to(x, None, [-(-max(s, p) // b) * b for s, p, b in zip(S, patch, snap)] if snap else patch)
     P = tuple(xp.shape[1:])
     starts = [np.unique(np.round(np.linspace(0, s - p, math.ceil((s - p) / (p / 2)) + 1)).astype(int)) if s > p else [0]
               for s, p in zip(P, patch)]
+    if snap:   # the last start s - p is on the grid (both multiples): coverage kept
+        starts = [np.unique(st // b * b) for st, b in zip(starts, snap)]
     g = gaussian(patch, x.device)
     # fp16 accumulator on the device if it takes <= 1/4 of the free memory, else on the CPU (nnU-Net's predictor does
     # both; "fits at all" left the tiles' forward no room: nnF CNN OOM on whole-body TotalSeg grids)
@@ -359,14 +364,16 @@ class Patches:
     SFC_FT_SCANS=n (fine-tuning, 04/11): each batch's tiles from n scans drawn for the batch, so the encoder reads n
     whole scans per step with gradient (WMH: the planner's 40 small tiles came from ~40 scans, out of memory)."""
 
-    def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator, fit: bool = False):
-        self.fit = fit
+    def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator, fit: bool = False, snap=None):
+        self.fit, self.snap = fit, snap   # snap (fm/hier_dec AlignUNet): tiles and corners on the bottleneck's grid
         self.vols, self.ctx, self.patch, self.rng, self.align, self.lm = [], [], [], rng, [], []
         for v in vols:
             self.lm.append(v.get("lm"))
             pv = tile_of(patch, v.get("align"), k)
             if pv and getattr(self, "fit", False) and v.get("align"):   # any_tile: never larger than the volume (its grid)
                 pv = [min(p, -(-s // a) * a) for p, s, a in zip(pv, v["x"].shape[1:], v["align"])]
+            if pv and snap:
+                pv = [max(b, p // b * b) for p, b in zip(pv, snap)]
             x, y = pad_to(v["x"], v["y"], pv) if pv else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
             self.align.append(v.get("align"))
@@ -406,7 +413,8 @@ class Patches:
             else:
                 start = np.array([self.rng.integers(s - p + 1) for s, p in zip(S, P)])
             if self.align[j] is not None:   # on the volume's 16 mm grid (token cache)
-                start = (start // np.array(self.align[j])) * np.array(self.align[j])
+                a = np.array(self.snap or self.align[j])
+                start = (start // a) * a
                 cs[-1] = torch.cat([cs[-1], torch.tensor(start, dtype=torch.float)])
             sl = tuple(slice(int(a), int(a + p)) for a, p in zip(start, P))
             xs.append(x[(slice(None), *sl)].float())  # the cache mixes fp16 and fp32 volumes
@@ -577,7 +585,8 @@ class Scale:
 
     def __call__(self) -> tuple[int, float]:   # (index of the adapters used, the scale read)
         mm = float(self.pe.patch_mm)
-        return FT_SCALES.index(self.As.get(mm, mm)), mm
+        a = self.As.get(mm, mm)   # (08/11) AlignUNet reads cells of any edge (9.6, 2.4 mm ...): the nearest grain's adapters
+        return min(range(len(FT_SCALES)), key=lambda i: abs(math.log(FT_SCALES[i] / a))), mm
 
 
 class LoRA(torch.nn.Module):
@@ -794,7 +803,7 @@ def train(job: dict) -> None:
         if hasattr(net, "plan"):   # a live token cache is written by load(): the fingerprint again, now complete
             net.plan([it["id"] for it in split["train"]])
         val_v = [load(it) for it in split["val"]]
-        data = Patches(train_v, patch, k, rng, fit=getattr(net, "any_tile", False))
+        data = Patches(train_v, patch, k, rng, fit=getattr(net, "any_tile", False), snap=getattr(net, "snap", None))
         # the training scans scored at each validation (user 30-31/10): the first TRAIN_EVAL holding foreground
         tr_v = [v for v in train_v if bool(((v["y"] > 0) & (v["y"] < 255)).any())][:TRAIN_EVAL]
         del train_v
