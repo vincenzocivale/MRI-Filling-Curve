@@ -35,6 +35,7 @@ import json
 import math
 import os
 import resource
+import shutil
 import subprocess
 import sys
 import time
@@ -1063,13 +1064,20 @@ def train(job: dict) -> None:
         # selection score (Dice, or the lesion / detection F1). ponytail: landmarks keep the training threshold
         load_trained(best["state"])
         net.eval()
-        net.full, net.read_taus = True, list(net.TAUS)
-        nt = len(net.read_taus)
+        # (08/11) AlignUNet (two_heads): one pass with both heads' probabilities, every alpha of ALPHA_GRID mixed after
+        # (sliding sums probabilities linearly: the mix of the sums is the sum of the mixes) and kept per val scan in
+        # <out>.heads, so the chosen alpha's val predictions are composed there, not read again for the post-processing
+        two = getattr(net, "two_heads", False)
+        if two:
+            from .hier_dec import ALPHA_GRID
+        net.full, net.read_taus = True, ["heads"] if two else list(net.TAUS)
+        taus = list(ALPHA_GRID) if two else net.read_taus
+        nt, hd = len(taus), out_p.with_suffix(".heads")
         # (05/11) scored volume by volume and kept in <out>.taus.json: a job killed inside this pass resumes it (TotalSeg:
         # longer than a 45-min block, redone by every block); the same scores as keeping every prediction
         fdet = job.get("select") in ("f1", "det")
         md = ("det" if job["select"] == "det" else True) if fdet else None
-        tf, tk = out_p.with_suffix(".taus.json"), {"best_iter": best["iter"], "taus": [float(t) for t in net.read_taus]}
+        tf, tk = out_p.with_suffix(".taus.json"), {"best_iter": best["iter"], "taus": [float(t) for t in taus]}
         st = json.loads(tf.read_text()) if tf.exists() else {}
         st = st if st.get("key") == tk else {"key": tk, "ids": [], "per": []}
         t_th = time.time()
@@ -1077,13 +1085,20 @@ def train(job: dict) -> None:
             if it["id"] in st["ids"]:
                 continue
             v = load(it)
-            p = sliding(net, v["x"].to(dev).float(), patch, k * nt, amp, v["ctx"])
+            p = sliding(net, v["x"].to(dev).float(), patch, k * (2 if two else nt), amp, v["ctx"])
+            if two:   # the heads x 2 (each was / 2) as uint8, the GT mapping with them; mixed and scored on the GPU
+                p = (p.to(dev) * 2).clamp_(0, 1)   # (fp16; 11 alphas on a CPU accumulator: ~2x the pass)
+                hd.mkdir(parents=True, exist_ok=True)
+                np.savez(hd / f"{it['id']}.npz", p=(p * 255).round().to(torch.uint8).cpu().numpy(),
+                         grid_from_gt=np.asarray(v["grid_from_gt"]))
             rows = []
             for a in range(nt):
-                q = p[a * k:(a + 1) * k].argmax(0).to(torch.uint8).cpu()
+                q = (taus[a] * p[:k] + (1 - taus[a]) * p[k:] if two else p[a * k:(a + 1) * k]).argmax(0).to(torch.uint8)
+                if fdet:
+                    q = q.cpu()
                 rows.append([[float(x) for x in _score((q == c).numpy(), (v["y"] == c).numpy(), md, sp=v.get("sp"),
                                                        pts=v.get("pts"))] for c in range(1, k)] if fdet
-                            else dice_on(q, v["y"], k))
+                            else dice_on(q, v["y"].to(q.device), k))
             st["ids"].append(it["id"])
             st["per"].append(rows)
             tf.write_text(json.dumps(st))
@@ -1097,12 +1112,20 @@ def train(job: dict) -> None:
             by = [float(np.nanmean([r[a] for r in per])) for a in range(nt)]
         # 30/10: reading every cell is not the training read (the encoder reads the chosen cells as one sequence, so
         # their tokens change): the training read (None) is a candidate too, its val score the selection's own
-        by_t = {str(t): d for t, d in zip(net.read_taus, by)} | {"train": float(best.get("score", best["val"]))}
+        by_t = {str(t): d for t, d in zip(taus, by)} | {"train": float(best.get("score", best["val"]))}
         b_ = max(by_t, key=lambda t: by_t[t])
         best |= {"read_tau": None if b_ == "train" else float(b_), "val_by_tau": by_t}
         print(f"[seg] read threshold {best['read_tau']} (val {job.get('select') or 'dice'} per threshold "
               f"{best['val_by_tau']})", flush=True)
         torch.save({"key": key, "best": best, "curve": curve}, ckpt)
+        if two:   # the chosen alpha's val predictions from the kept heads (a scan missing here: read again below)
+            a, pv_ = best["read_tau"] if best["read_tau"] is not None else 0.5, out_p.with_suffix(".pred_val")
+            for f in sorted(hd.glob("*.npz")) if hd.exists() else []:
+                z = np.load(f)
+                h = torch.from_numpy(z["p"]).float() / 255
+                save_pred(pv_, f.stem, a * h[:k] + (1 - a) * h[k:], z["grid_from_gt"])
+            shutil.rmtree(hd, ignore_errors=True)   # both heads: an intermediate (the val predictions are kept)
+            print(f"[seg] alpha {a}: val predictions composed from the heads (no second val pass)", flush=True)
     if best.get("read_tau") is not None:   # the test reads every cell, its threshold a mask (as chosen)
         net.full, net.read_taus = True, [best["read_tau"]]
     elif hasattr(net, "read_taus"):   # the training read

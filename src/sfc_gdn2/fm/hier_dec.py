@@ -539,6 +539,7 @@ class HierUNet(HierDec):
 CH = (32, 64, 112, 112, 112, 112)   # (08/11) AlignUNet: nnU-Net's stage widths capped at 112 (7.9 M parameters; 128: 9.9 M)
 FC = 32                             # each stage's token field: channels (+ 1: read here / inherited from the parent)
 ALIGN_MIN_MM = float(os.environ.get("SFC_ALIGN_MIN_MM", "0"))   # aligned levels whose cell edge (mm) is below: not read
+ALPHA_GRID = tuple(i / 10 for i in range(10, -1, -1))   # AlignUNet: the U-Net head's weights tried on val (one pass)
 
 
 class AlignUNet(HierDec):
@@ -575,6 +576,7 @@ class AlignUNet(HierDec):
         self.ds = nn.ModuleList([nn.Conv3d(CH[1], n_out, 1), nn.Conv3d(CH[2], n_out, 1)])
         self.tok_out = nn.Conv3d(FC, n_out, 1)
         self.cum, self.snap, self.vol_stats = None, None, {}
+        self.two_heads = True   # segrun's alpha pass: read_taus ["heads"] -> both heads' log-probabilities, any alpha after
 
     def plan(self, ids) -> None:
         import numpy as np
@@ -718,5 +720,7 @@ class AlignUNet(HierDec):
             return o
         pu = o.float().softmax(1)
         pt = pu if tok is None else tok.float().softmax(1)   # no level read (scans too coarse): the U-Net alone
+        if self.full and self.read_taus == ["heads"]:   # sliding's softmax over both: each head's probabilities / 2
+            return torch.cat([pu.clamp(min=1e-8).log(), pt.clamp(min=1e-8).log()], 1)
         al = self.read_taus if self.full else [0.5]
         return torch.cat([(a * pu + (1 - a) * pt).clamp(min=1e-8).log() for a in al], 1)
