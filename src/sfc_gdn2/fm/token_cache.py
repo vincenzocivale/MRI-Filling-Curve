@@ -337,7 +337,9 @@ def read_grad(enc, x: torch.Tensor, sp: torch.Tensor, mm: float, k, curve: str, 
         xyz = grid_coords(g[None], int(g.prod()))[0]
         o = keys(curve, xyz, g, seed).argsort()
         cu = torch.tensor([0, len(t)], device=dev, dtype=torch.int32)
-        h = enc.flat(t[o], cu, ckpt=True, pos=xyz[o])[o.argsort()]   # checkpoint per block: one block's activations at a
-    finally:                                                          # time, recomputed in backward
+        # checkpoint per block: one block's activations at a time, recomputed in backward; (08/11) SFC_FT_CKPT=0: none
+        # (per-scale PEFT, segrun.Scale: the backward runs after the read, at another patch_mm)
+        h = enc.flat(t[o], cu, ckpt=os.environ.get("SFC_FT_CKPT", "1") != "0", pos=xyz[o])[o.argsort()]
+    finally:
         pe.patch_mm = keep
     return h.reshape(*g.tolist(), -1)

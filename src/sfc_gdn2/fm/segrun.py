@@ -558,38 +558,95 @@ def vox_budget(job: dict, vols: list, patch, k: int, lm: bool = False) -> None:
     job["batch"] = b
 
 
+FT_SCALES = (16.0, 8.0, 4.0, 2.0)   # (08/11) the encoder's reading scales (mm), per-scale PEFT
+
+
+class Scale:
+    """(08/11, Francesco: per-scale PEFT) the scale the encoder reads now: patch_embed.patch_mm, set around every read
+    (fm/hier_dec._read_snake, token_cache.read / read_grad) -> its index in FT_SCALES. Read when a weight is built in
+    the forward, so nothing may be recomputed in the backward (checkpointing off: SFC_FT_FINE_CKPT=0, SFC_FT_CKPT=0),
+    else the backward would rebuild it at the scale restored after the read. Test-time ablations on the same
+    checkpoint: SFC_FT_SCALE_AS="2:16" a scale read with another's adapters and offsets; SFC_FT_OFFSETS_OFF=1 the
+    offsets (gates, decay) zeroed; SFC_FT_LORA_OFF="4,2" those scales' LoRA off."""
+
+    def __init__(self, pe):
+        self.pe = pe
+        self.As = {float(a): float(b) for a, b in (q.split(":") for q in os.environ.get("SFC_FT_SCALE_AS", "").split(",") if q)}
+        self.lora_off = {float(q) for q in os.environ.get("SFC_FT_LORA_OFF", "").split(",") if q}
+        self.off = os.environ.get("SFC_FT_OFFSETS_OFF") == "1"
+
+    def __call__(self) -> tuple[int, float]:   # (index of the adapters used, the scale read)
+        mm = float(self.pe.patch_mm)
+        return FT_SCALES.index(self.As.get(mm, mm)), mm
+
+
 class LoRA(torch.nn.Module):
     """A weight's parametrization W -> W + 2 B A (LoRA, Hu et al. 2022; alpha = 2r, Biderman et al. 2024), B = 0: the
     pretrained net exactly at the start. A conv kernel is an [out, in k^3] matrix (loralib's ConvLoRA, Aleem et al.
     2024 on nnU-Net-style CNNs). A parametrization, not a wrapper: code reading `.weight` itself (timm's Eva:
-    F.linear(x, self.qkv.weight)) gets the adapted weight too."""
+    F.linear(x, self.qkv.weight)) gets the adapted weight too. `scale` (08/11): one (A, B) per reading scale."""
 
-    def __init__(self, w: torch.Tensor, r: int):
+    def __init__(self, w: torch.Tensor, r: int, scale: Scale | None = None):
         super().__init__()
-        n = w[0].numel()
-        self.A = torch.nn.Parameter(torch.empty(r, n, device=w.device).uniform_(-n ** -0.5, n ** -0.5))  # loralib's init
-        self.B = torch.nn.Parameter(torch.zeros(w.shape[0], r, device=w.device))
+        n, S = w[0].numel(), (len(FT_SCALES),) if scale else ()
+        self.A = torch.nn.Parameter(torch.empty(*S, r, n, device=w.device).uniform_(-n ** -0.5, n ** -0.5))  # loralib's init
+        self.B = torch.nn.Parameter(torch.zeros(*S, w.shape[0], r, device=w.device))
+        self.scale = scale
 
     def forward(self, w: torch.Tensor) -> torch.Tensor:
-        return w + (2 * self.B @ self.A).view_as(w).to(w.dtype)
+        if self.scale is None:
+            return w + (2 * self.B @ self.A).view_as(w).to(w.dtype)
+        i, mm = self.scale()
+        return w if mm in self.scale.lora_off else w + (2 * self.B[i] @ self.A[i]).view_as(w).to(w.dtype)
 
 
-def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True) -> tuple[set, set]:
+class Offset(torch.nn.Module):
+    """(08/11) a per-scale additive offset, 0 at the start: as a parametrization of GDN-2's decay (A_log, dt_bias: the
+    bias of the decay's input) and as an output hook of the bias-free gate projections (erase b_proj, write w_proj) and
+    of the attention's output gate (g). LoRA had spent its rank on them (sfc_runs/ft/lora_bias.log: erase of blocks 0-1
+    ~95 % constant, ~12 logits)."""
+
+    def __init__(self, shape, scale: Scale, device):
+        super().__init__()
+        self.d, self.scale = torch.nn.Parameter(torch.zeros(len(FT_SCALES), *shape, device=device)), scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.scale.off else x + self.d[self.scale()[0]].to(x.dtype)
+
+
+def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True, scales: bool = False) -> tuple[set, set]:
     """PEFT of the pretrained part (06/11, Francesco: LoRA after P2's fine-tuning; notes/LORA.md), `pre` its parameter
     names: LoRA of rank r (0: none) on every Linear / Conv2d / Conv3d weight (groups 1) under a `where` prefix; trained
     whole: the 1-D parameters (norms, biases: BitFit; not with norms False) and everything under a `full` prefix (ours: the patch embedding,
     surgical fine-tuning for an input-level shift, Lee et al. 2023); the rest frozen, GDN-2's decays (A_log, dt_bias)
-    too (LoRA fails on SSM modules, Galim et al. 2025). -> (trained, frozen) names of the pretrained part."""
+    too (LoRA fails on SSM modules, Galim et al. 2025). scales (08/11, Francesco): one LoRA of rank r per reading scale
+    (FT_SCALES) and per-scale Offsets on erase / write / decay / the attention gate. -> (trained, frozen) names of the
+    pretrained part."""
     from torch.nn.utils import parametrize
+    sc = None
+    if scales:
+        bad = {k: os.environ.get(k, "1") for k in ("SFC_FT_FINE_CKPT", "SFC_FT_CKPT")}
+        assert set(bad.values()) == {"0"}, f"per-scale PEFT needs every recomputation off: {bad}"
+        net.encoder.grad_checkpoint = False
+        sc = Scale(net.encoder.patch_embed)
     for name, m in list(net.named_modules()):
         if (r and isinstance(m, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.Conv3d)) and getattr(m, "groups", 1) == 1
                 and f"{name}.weight" in pre and name.startswith(where) and not name.startswith(full)):
-            parametrize.register_parametrization(m, "weight", LoRA(m.weight, r))
+            parametrize.register_parametrization(m, "weight", LoRA(m.weight, r, sc))
+    if sc is not None:
+        for name, m in list(net.encoder.named_modules()):
+            gates = [m.b_proj, m.w_proj] if hasattr(m, "A_log") else [m.g] if hasattr(m, "qkv") else []
+            for lin in gates:
+                lin.offset = Offset((lin.out_features,), sc, lin.weight.device)
+                lin.register_forward_hook(lambda mod, inp, out: mod.offset(out))
+            if hasattr(m, "A_log"):
+                for a in ("A_log", "dt_bias"):
+                    parametrize.register_parametrization(m, a, Offset(getattr(m, a).shape, sc, getattr(m, a).device))
     p = dict(net.named_parameters())
     keep = {n for n in pre & p.keys()
             if n.startswith(full) or norms and p[n].ndim <= 1 and n.rsplit(".", 1)[-1] not in ("A_log", "dt_bias")}
-    lora = {n for n in p if ".parametrizations.weight.0." in n}
-    orig = {n for n in p if n.endswith(".parametrizations.weight.original")}
+    lora = {n for n in p if ".parametrizations." in n and not n.endswith(".original") or ".offset." in n}
+    orig = {n for n in p if n.endswith(".original")}
     return lora | keep, orig | (pre & p.keys()) - keep
 
 
@@ -630,13 +687,13 @@ def train(job: dict) -> None:
         if "lora" in FT:   # (06/11) PEFT: FT["lora"] rank (0: norms + FT["full"] only), FT["full"] / FT["lora_in"] prefixes
             tup = lambda v: (v,) if isinstance(v, str) else tuple(v)   # a YAML string or list of prefixes
             enc_names, frozen_names = peft(net, enc_names, int(FT["lora"]), tup(FT.get("full", ())),
-                                           tup(FT.get("lora_in", "")), bool(FT.get("norms", 1)))
+                                           tup(FT.get("lora_in", "")), bool(FT.get("norms", 1)), bool(FT.get("scales", 0)))
             print(f"[seg] finetune: LoRA r {FT['lora']} on {sum('.original' in n for n in frozen_names)} weights, "
                   f"{len(enc_names)} pretrained tensors trained, {len(frozen_names)} frozen", flush=True)
         if enc_names:   # (06/11) none (lora 0, norms 0, no full): the control, the decoder alone from `init` on the
             net.finetune = True   # cached tokens, the frozen part in eval mode as in the table's run
             if hasattr(net, "encoder"):
-                net.encoder.grad_checkpoint = True
+                net.encoder.grad_checkpoint = not FT.get("scales")   # (08/11) per-scale PEFT: no recomputation
             if hasattr(net, "cache"):
                 from .token_cache import GradCache
                 old = net.cache
@@ -744,13 +801,16 @@ def train(job: dict) -> None:
         params = [p for p in net.parameters() if p.requires_grad]
         if FT:   # the pretrained part at enc_lr x the decoder's lr (discriminative lr), LoRA's factors at lora_lr x
             # (LoRA's best lr ~10x full fine-tuning's, Biderman et al. 2024), the same poly decay
-            side = lambda n: 0 if n not in enc_names else 2 if ".parametrizations." in n else 1
-            mult = (1.0, float(FT.get("enc_lr", 0.1)), float(FT.get("lora_lr", 1.0)))
+            # (08/11) side 3: the per-scale offsets (gates, decay) at off_lr x (default 10 x LoRA's: ~12 logits to travel)
+            side = lambda n: (0 if n not in enc_names else 3 if ".offset." in n or n.endswith(".0.d")
+                              else 2 if ".parametrizations." in n else 1)
+            mult = (1.0, float(FT.get("enc_lr", 0.1)), float(FT.get("lora_lr", 1.0)),
+                    float(FT.get("off_lr", 10 * float(FT.get("lora_lr", 1.0)))))
             groups = [{"params": [p for n, p in net.named_parameters() if n not in frozen_names and side(n) == g],
-                       "lr": job["lr"] * mult[g], "side": g} for g in range(3)]
+                       "lr": job["lr"] * mult[g], "side": g} for g in range(4)]
             groups = [g for g in groups if g["params"]]
             for g in groups[1:]:
-                print(f"[seg] finetune: {('', 'encoder', 'LoRA')[g['side']]} {sum(p.numel() for p in g['params']) / 1e6:.2f}M "
+                print(f"[seg] finetune: {('', 'encoder', 'LoRA', 'offsets')[g['side']]} {sum(p.numel() for p in g['params']) / 1e6:.2f}M "
                       f"at lr x{mult[g['side']]}", flush=True)
         opt = torch.optim.AdamW(groups if FT else params, lr=job["lr"], weight_decay=1e-4)
         # (06/11) FT["ramp"]: each group's lr ramps up over that fraction of the iterations from the iteration it starts
