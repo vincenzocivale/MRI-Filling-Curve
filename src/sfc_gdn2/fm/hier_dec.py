@@ -537,6 +537,9 @@ class HierUNet(HierDec):
 
 
 CH = (32, 64, 112, 112, 112, 112)   # (08/11) AlignUNet: nnU-Net's stage widths capped at 112 (7.9 M parameters; 128: 9.9 M)
+if os.environ.get("SFC_ALIGN_CH"):   # (08/11) e.g. "32,64,128,256,320,320": nnU-Net's own widths (the from-scratch baseline)
+    CH = tuple(int(c) for c in os.environ["SFC_ALIGN_CH"].split(","))
+NNUNET_PLAN = os.environ.get("SFC_NNUNET_PLAN") == "1"   # (08/11) nnU-Net's label-free patch (fixed_patch), batch 2 (segrun)
 FC = 32                             # each stage's token field: channels (+ 1: read here / inherited from the parent)
 ALIGN_MIN_MM = float(os.environ.get("SFC_ALIGN_MIN_MM", "0"))   # aligned levels whose cell edge (mm) is below: not read
 NO_TOK = os.environ.get("SFC_ALIGN_NO_TOK") == "1"   # (08/11, user) AlignUNet's U-Net alone: no token read, no field
@@ -576,7 +579,7 @@ class AlignUNet(HierDec):
         self.out = nn.Conv3d(CH[0], n_out, 1)
         self.ds = nn.ModuleList([nn.Conv3d(CH[1], n_out, 1), nn.Conv3d(CH[2], n_out, 1)])
         self.tok_out = nn.Conv3d(FC, n_out, 1)
-        self.cum, self.snap, self.vol_stats = None, None, {}
+        self.cum, self.snap, self.vol_stats, self.fixed_patch = None, None, {}, None
         if NO_TOK:   # no token head: segrun's alpha pass skipped (no read_taus), the test the U-Net head alone
             del self.read_taus
         self.two_heads = not NO_TOK   # segrun's alpha pass: read_taus ["heads"] -> both heads' log-probabilities, any alpha after
@@ -589,6 +592,11 @@ class AlignUNet(HierDec):
         ms = [self.cache.meta(i) for i in ids]
         cur = np.median([m["spacing"] for m in ms], 0).tolist()
         size = np.minimum(np.median([m["shape"] for m in ms], 0), 160).tolist()
+        if NNUNET_PLAN:   # nnU-Net's patch, from the images only: the median scan's shape, its physically longest axis
+            sp, size = list(cur), [int(v) for v in np.median([m["shape"] for m in ms], 0)]   # shaved until 160^3 voxels
+            while math.prod(size) > 160 ** 3:   # (the batch of 2 then holds the 2 x 160^3 budget of every model)
+                i = int(np.argmax([z * c for z, c in zip(size, sp)]))
+                size[i] -= max(1, size[i] // 16)
         cum = [[1, 1, 1]]
         while len(cum) < len(CH):
             st = [2 if c <= 2 * min(cur) and z // (2 * a) >= 4 else 1 for c, z, a in zip(cur, size, cum[-1])]
@@ -597,9 +605,11 @@ class AlignUNet(HierDec):
             cur, cum = [c * t for c, t in zip(cur, st)], cum + [[a * t for a, t in zip(cum[-1], st)]]
         assert len(cum) >= 3, f"AlignUNet: {len(cum)} stages (scans too small for a bottleneck at >= stage 2)"
         self.cum, self.snap = cum, cum[-1]
+        self.fixed_patch = [max(b, round(z / b) * b) for z, b in zip(size, cum[-1])] if NNUNET_PLAN else None
         for s in range(1, len(cum)):
             self.down[s][0].stride = tuple(b // a for a, b in zip(cum[s - 1], cum[s]))
-        print(f"[seg] align_unet plan: strides {cum[1:]} (median spacing {np.median([m['spacing'] for m in ms], 0).round(2).tolist()})",
+        print(f"[seg] align_unet plan: strides {cum[1:]} (median spacing {np.median([m['spacing'] for m in ms], 0).round(2).tolist()})"
+              + (f", nnU-Net patch {self.fixed_patch}, widths {CH}" if NNUNET_PLAN else ""),
               flush=True)
 
     def _enc(self, allp, g, ok, n, sp, k, mm) -> torch.Tensor:   # the encoder on the open cells -> [open, W]

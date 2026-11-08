@@ -179,7 +179,9 @@ def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Ten
     patch = S if patch is None else tuple(min(p, s) for p, s in zip(patch, S)) if getattr(net, "any_tile", False) \
         else tuple(patch)
     snap = getattr(net, "snap", None)   # fm/hier_dec AlignUNet: tiles, corners and the padded volume on its bottleneck grid
-    if snap:
+    if getattr(net, "fixed_patch", None):   # nnU-Net's patch (cut to the scan, on the grid)
+        patch = tuple(min(p, -(-s // b) * b) for p, s, b in zip(net.fixed_patch, S, snap))
+    elif snap:
         patch = tuple(max(b, round(p / b) * b) for p, b in zip(patch, snap))
     xp, _ = pad_to(x, None, [-(-max(s, p) // b) * b for s, p, b in zip(S, patch, snap)] if snap else patch)
     P = tuple(xp.shape[1:])
@@ -365,15 +367,18 @@ class Patches:
     SFC_FT_SCANS=n (fine-tuning, 04/11): each batch's tiles from n scans drawn for the batch, so the encoder reads n
     whole scans per step with gradient (WMH: the planner's 40 small tiles came from ~40 scans, out of memory)."""
 
-    def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator, fit: bool = False, snap=None):
+    def __init__(self, vols: list[dict], patch, k: int, rng: np.random.Generator, fit: bool = False, snap=None, fixed=None):
         self.fit, self.snap = fit, snap   # snap (fm/hier_dec AlignUNet): tiles and corners on the bottleneck's grid
+        # fixed (AlignUNet SFC_NNUNET_PLAN): nnU-Net's label-free patch for every scan, cut to the scan (its grid)
         self.vols, self.ctx, self.patch, self.rng, self.align, self.lm = [], [], [], rng, [], []
         for v in vols:
             self.lm.append(v.get("lm"))
             pv = tile_of(patch, v.get("align"), k)
-            if pv and getattr(self, "fit", False) and v.get("align"):   # any_tile: never larger than the volume (its grid)
+            if fixed:
+                pv = [min(p, -(-z // b) * b) for p, z, b in zip(fixed, v["x"].shape[1:], snap)]
+            elif pv and getattr(self, "fit", False) and v.get("align"):   # any_tile: never larger than the volume (its grid)
                 pv = [min(p, -(-s // a) * a) for p, s, a in zip(pv, v["x"].shape[1:], v["align"])]
-            if pv and snap:   # the nearest multiple (the voxel budget's tile kept: Willis 156x156x84 -> 160x160x80)
+            if pv and snap and not fixed:   # the nearest multiple (the voxel budget's tile kept: Willis 156x156x84 -> 160x160x80)
                 pv = [max(b, round(p / b) * b) for p, b in zip(pv, snap)]
             x, y = pad_to(v["x"], v["y"], pv) if pv else (v["x"], v["y"])
             self.ctx.append(v.get("ctx"))
@@ -812,7 +817,8 @@ def train(job: dict) -> None:
         if hasattr(net, "plan"):   # a live token cache is written by load(): the fingerprint again, now complete
             net.plan([it["id"] for it in split["train"]])
         val_v = [load(it) for it in split["val"]]
-        data = Patches(train_v, patch, k, rng, fit=getattr(net, "any_tile", False), snap=getattr(net, "snap", None))
+        data = Patches(train_v, patch, k, rng, fit=getattr(net, "any_tile", False), snap=getattr(net, "snap", None),
+                       fixed=getattr(net, "fixed_patch", None))
         # the training scans scored at each validation (user 30-31/10): the first TRAIN_EVAL holding foreground
         tr_v = [v for v in train_v if bool(((v["y"] > 0) & (v["y"] < 255)).any())][:TRAIN_EVAL]
         del train_v
