@@ -1094,7 +1094,7 @@ def train(job: dict) -> None:
                     sizes.setdefault(c, []).extend(np.bincount(cc.ravel())[1:].tolist())
         sizes = {c: [int(np.percentile(v, 1)), int(np.percentile(v, 5))] for c, v in sizes.items()}
         print(f"[seg] post-processing: choosing the rule ({(time.time() - t_pp) / 60:.1f} min)", flush=True)
-        rule = choose_postproc(vals, k, sizes, f1)
+        rule = choose_postproc(vals, k, sizes, f1, out_p.with_suffix(".postproc.part.json"), rkey)
         rf.write_text(json.dumps({"key": rkey, "rule": [[c, r] for c, r in rule.items()]}))
         del vals
     tkey = key | {"best_iter": best["iter"], "postproc": {str(c): r for c, r in rule.items()}} | \
@@ -1282,11 +1282,22 @@ def _metric(sums, f1: bool) -> float:
     return 2 * p * r / max(p + r, 1e-9)
 
 
-def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
+def choose_postproc(vals: list, k: int, sizes: dict, f1: bool, part: Path | None = None, pkey=None) -> dict:
     """Per foreground class, on the val volumes [(argmax, uint8 probs or None, labels)], the rule (tau, min size,
     largest only) that improves the task's metric (Dice, or lesion F1); no rule if nothing does (user, 23/10:
-    nnU-Net-style post-processing chosen on val, the same for every task)."""
-    rule = {}
+    nnU-Net-style post-processing chosen on val, the same for every task). (08/11) `part`: each class's choice
+    written as it is made, a killed job resumes at the next class (ResEnc-L TotalSeg: 51 classes outlasted a
+    30-min block after ~9 min of val loading)."""
+    rule, done = {}, {}
+    if part is not None and part.exists() and (pd := json.loads(part.read_text())).get("key") == pkey:
+        done = {int(c): r for c, r in pd["done"]}
+        print(f"[seg] post-processing search resumed: {len(done)} / {k - 1} classes done", flush=True)
+
+    def mark(c, r) -> None:
+        done[c] = None if r is None else list(r)
+        if part is not None:
+            part.with_suffix(".tmp").write_text(json.dumps({"key": pkey, "done": [[a, b] for a, b in done.items()]}))
+            os.replace(part.with_suffix(".tmp"), part)
     boxes = None
     if f1 != "det" and vals and vals[0][1] is not None:   # (05/11) with probabilities (k <= 8: SOOP stroke, prostate):
         # each class on the box of its argmax, true and q >= min(TAUS) voxels, which holds every candidate mask and its
@@ -1311,6 +1322,10 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
                 slice(min(x.start for x in (u, v) if x is not None), max(x.stop for x in (u, v) if x is not None))
                 for u, v in zip(sa or (None,) * lab.ndim, sb or (None,) * lab.ndim)) for sa, sb in zip(a, b)])
     for c in range(1, k):
+        if c in done:
+            if done[c] is not None:
+                rule[c] = tuple(done[c])
+            continue
         if boxes is not None:   # this class's view of the val volumes (an empty 1-voxel box where it is absent)
             vals_c = []
             for (lab, q, y, *rest), bx in zip(vals, boxes):
@@ -1325,6 +1340,7 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
             vals_c = vals
         t = [(y == c) for _, _, y, *_ in vals_c]
         if not any(x.any() for x in t):
+            mark(c, None)
             continue
         gts = [_components(tt) if f1 else None for tt in t]
         base = _metric([_score(lab == c, tt, f1, g, sp=sp, pts=pp) for (lab, _, _, sp, pp), tt, g in zip(vals_c, t, gts)], f1)
@@ -1345,6 +1361,7 @@ def choose_postproc(vals: list, k: int, sizes: dict, f1: bool) -> dict:
             rule[c] = br
             print(f"[seg] post-processing class {c}: tau {br[0]}, min {br[1]} voxels, largest {br[2]}: val "
                   f"{base:.4f} -> {best:.4f}", flush=True)
+        mark(c, br)
     return rule
 
 
