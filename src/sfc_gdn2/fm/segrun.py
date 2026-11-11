@@ -629,25 +629,31 @@ class Offset(torch.nn.Module):
     """(08/11) a per-scale additive offset, 0 at the start: as a parametrization of GDN-2's decay (A_log, dt_bias: the
     bias of the decay's input) and as an output hook of the bias-free gate projections (erase b_proj, write w_proj) and
     of the attention's output gate (g). LoRA had spent its rank on them (sfc_runs/ft/lora_bias.log: erase of blocks 0-1
-    ~95 % constant, ~12 logits)."""
+    ~95 % constant, ~12 logits). scale None (11/11, finetune.offsets without scales): one offset for every scale."""
 
-    def __init__(self, shape, scale: Scale, device):
+    def __init__(self, shape, scale: Scale | None, device):
         super().__init__()
-        self.d, self.scale = torch.nn.Parameter(torch.zeros(len(FT_SCALES), *shape, device=device)), scale
+        S = (len(FT_SCALES),) if scale else ()
+        self.d, self.scale = torch.nn.Parameter(torch.zeros(*S, *shape, device=device)), scale
+        self.off = scale.off if scale else os.environ.get("SFC_FT_OFFSETS_OFF") == "1"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x if self.scale.off else x + self.d[self.scale()[0]].to(x.dtype)
+        if self.off:
+            return x
+        return x + (self.d if self.scale is None else self.d[self.scale()[0]]).to(x.dtype)
 
 
 def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True, scales: bool = False,
-         full_re: str = "") -> tuple[set, set]:
+         full_re: str = "", offsets: bool = False) -> tuple[set, set]:
     """PEFT of the pretrained part (06/11, Francesco: LoRA after P2's fine-tuning; notes/LORA.md), `pre` its parameter
     names: LoRA of rank r (0: none) on every Linear / Conv2d / Conv3d weight (groups 1) under a `where` prefix; trained
     whole: the 1-D parameters (norms, biases: BitFit; not with norms False) and everything under a `full` prefix (ours: the patch embedding,
     surgical fine-tuning for an input-level shift, Lee et al. 2023); the rest frozen, GDN-2's decays (A_log, dt_bias)
     too (LoRA fails on SSM modules, Galim et al. 2025). scales (08/11, Francesco): one LoRA of rank r per reading scale
-    (FT_SCALES) and per-scale Offsets on erase / write / decay / the attention gate. -> (trained, frozen) names of the
-    pretrained part."""
+    (FT_SCALES) and per-scale Offsets on erase / write / decay / the attention gate. offsets (11/11, Francesco): the
+    same Offsets, one for every scale, with a plain LoRA: the bias-free gates get their bias (LoRA spent rank 1 on it,
+    notes/GATE_IDEA.md) and the decays (A_log, dt_bias) are no longer frozen (as offsets: own lr, no weight decay).
+    -> (trained, frozen) names of the pretrained part."""
     from torch.nn.utils import parametrize
     sc = None
     if scales:
@@ -659,7 +665,7 @@ def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True, s
         if (r and isinstance(m, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.Conv3d)) and getattr(m, "groups", 1) == 1
                 and f"{name}.weight" in pre and name.startswith(where) and not name.startswith(full)):
             parametrize.register_parametrization(m, "weight", LoRA(m.weight, r, sc))
-    if sc is not None:
+    if sc is not None or offsets:
         for name, m in list(net.encoder.named_modules()):
             gates = [m.b_proj, m.w_proj] if hasattr(m, "A_log") else [m.g] if hasattr(m, "qkv") else []
             for lin in gates:
@@ -715,7 +721,7 @@ def train(job: dict) -> None:
             tup = lambda v: (v,) if isinstance(v, str) else tuple(v)   # a YAML string or list of prefixes
             enc_names, frozen_names = peft(net, enc_names, int(FT["lora"]), tup(FT.get("full", ())),
                                            tup(FT.get("lora_in", "")), bool(FT.get("norms", 1)), bool(FT.get("scales", 0)),
-                                           str(FT.get("full_re", "")))
+                                           str(FT.get("full_re", "")), bool(FT.get("offsets", 0)))
             print(f"[seg] finetune: LoRA r {FT['lora']} on {sum('.original' in n for n in frozen_names)} weights, "
                   f"{len(enc_names)} pretrained tensors trained, {len(frozen_names)} frozen", flush=True)
         if enc_names:   # (06/11) none (lora 0, norms 0, no full): the control, the decoder alone from `init` on the
