@@ -34,6 +34,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -638,7 +639,8 @@ class Offset(torch.nn.Module):
         return x if self.scale.off else x + self.d[self.scale()[0]].to(x.dtype)
 
 
-def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True, scales: bool = False) -> tuple[set, set]:
+def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True, scales: bool = False,
+         full_re: str = "") -> tuple[set, set]:
     """PEFT of the pretrained part (06/11, Francesco: LoRA after P2's fine-tuning; notes/LORA.md), `pre` its parameter
     names: LoRA of rank r (0: none) on every Linear / Conv2d / Conv3d weight (groups 1) under a `where` prefix; trained
     whole: the 1-D parameters (norms, biases: BitFit; not with norms False) and everything under a `full` prefix (ours: the patch embedding,
@@ -668,7 +670,8 @@ def peft(net, pre: set, r: int, full: tuple, where: tuple, norms: bool = True, s
                     parametrize.register_parametrization(m, a, Offset(getattr(m, a).shape, sc, getattr(m, a).device))
     p = dict(net.named_parameters())
     keep = {n for n in pre & p.keys()
-            if n.startswith(full) or norms and p[n].ndim <= 1 and n.rsplit(".", 1)[-1] not in ("A_log", "dt_bias")}
+            if n.startswith(full) or norms and p[n].ndim <= 1 and n.rsplit(".", 1)[-1] not in ("A_log", "dt_bias")
+            or full_re and re.search(full_re, n)}   # (11/11) e.g. GDN-2's depthwise short convs (no LoRA: groups > 1)
     lora = {n for n in p if ".parametrizations." in n and not n.endswith(".original") or ".offset." in n}
     orig = {n for n in p if n.endswith(".original")}
     return lora | keep, orig | (pre & p.keys()) - keep
@@ -711,7 +714,8 @@ def train(job: dict) -> None:
         if "lora" in FT:   # (06/11) PEFT: FT["lora"] rank (0: norms + FT["full"] only), FT["full"] / FT["lora_in"] prefixes
             tup = lambda v: (v,) if isinstance(v, str) else tuple(v)   # a YAML string or list of prefixes
             enc_names, frozen_names = peft(net, enc_names, int(FT["lora"]), tup(FT.get("full", ())),
-                                           tup(FT.get("lora_in", "")), bool(FT.get("norms", 1)), bool(FT.get("scales", 0)))
+                                           tup(FT.get("lora_in", "")), bool(FT.get("norms", 1)), bool(FT.get("scales", 0)),
+                                           str(FT.get("full_re", "")))
             print(f"[seg] finetune: LoRA r {FT['lora']} on {sum('.original' in n for n in frozen_names)} weights, "
                   f"{len(enc_names)} pretrained tensors trained, {len(frozen_names)} frozen", flush=True)
         if enc_names:   # (06/11) none (lora 0, norms 0, no full): the control, the decoder alone from `init` on the

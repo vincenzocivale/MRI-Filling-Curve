@@ -149,6 +149,9 @@ class HierDec(nn.Module):
         self.full = False   # eval reads every cell (thresholds as masks): segrun sets it for the threshold's choice and the test
         self.sel_y, self.aux, self._n = None, 0.0, 0
         self.off = set()    # levels left out of the field (diagnosis: what each one adds)
+        # (11/11, Francesco) SFC_LEVELS_SKIP e.g. "4,2": those levels are never read (the live 4 / 2 mm re-reads off; the
+        # fine-tuned encoder's 16 / 8 mm tokens and the U-Net only), unlike SFC_LEVELS_OFF that reads them and zeroes them
+        self.skip = {LV.index(float(x)) for x in os.environ.get("SFC_LEVELS_SKIP", "").split(",") if x}
         if lo := os.environ.get("SFC_LEVELS_OFF"):   # (01/11, user) the decoder's knock-out at test: e.g. "2" or "4,2" mm
             self.off = {LV.index(float(x)) for x in lo.split(",")}
         # the CK-convs' shapes depend on the spacing (a few per task): cuDNN's autotuning pays (29/10: 7.5 -> 6.5 s per step)
@@ -267,7 +270,7 @@ class HierDec(nn.Module):
                     lo, hi = torch.where(okl, yl, 1e9).amin(1), torch.where(okl, yl, -1.0).amax(1)
                     TG.append(torch.where(okl.any(1), (lo != hi).long(), -1))
                 G_.append((bs, items, k, n, front, N, ti, ci))
-            if not G_:
+            if not G_ or j in self.skip:   # (11/11) SFC_LEVELS_SKIP: levels not read at all (no live reads)
                 break
             live = [b for gg in G_ for b in gg[0]]
             e = torch.cat(ENC)   # each piece projected to W first (04/11, default): row-wise, the same as projecting the
