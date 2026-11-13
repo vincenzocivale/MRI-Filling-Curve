@@ -16,6 +16,7 @@ MODELS = {
     "openmind": "nnssl", "nnfoundation": "nnssl",
     "fomo26": "asparagus",
     "brainfm": "brainfm",
+    "mars": "mars",
     "nnunet": "nnunet",
     "sfc_gdn2": "sfc",   # ours (LeJEPA GDN-2), run in our own env
 }

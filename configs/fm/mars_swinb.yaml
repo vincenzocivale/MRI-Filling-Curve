@@ -1,0 +1,15 @@
+# MARS (zqiuak/MARS, Nature Biomed. Eng. 2026; arXiv 2508.07165 "PRISM"): Swin-B SwinUNETR-v2 encoder, the only
+# released checkpoint (README Google Drive 1__lWJfBaCSQqkyPvxpQqK-MWH_d__bWz, 82 MB, 134 swinViT.* keys).
+# Pretraining pool: OAI, OASIS-3, ADNI, PI-CAI, fastMRI (brain/knee/prostate/breast) + 10 private cohorts (STable 3):
+#   none of our benchmark datasets by name; check OASIS-3 vs OASIS-1/2 and Private-BLCA vs FedBCa in the leakage step.
+# FLAG: spacing 1.0 mm = the pretraining spacing; the shipped downstream example reads native spacing (fm/mars.py).
+model: mars
+env: ${SFC_FM_ENVS}/fm-mars
+repo: ${SFC_FM_REPOS}/MARS
+commit: 7075cf9
+checkpoint: /leonardo_scratch/large/userexternal/fcorrent/fm_weights/mars/mars_pt.ckpt
+args:
+  roi: 96
+  overlap: 0.75          # repo config sw_overlap
+  sw_batch_size: 2       # repo config sw_batch_size
+  spacing: 1.0
