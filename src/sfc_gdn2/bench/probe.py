@@ -89,7 +89,7 @@ def load_globals(model_dir: Path) -> tuple[list[str], dict[str, torch.Tensor]]:
     ids = sorted(p.stem for p in model_dir.glob("*.pt") if not p.name.startswith("_"))
     if cache.exists():
         c = torch.load(cache)
-        if c["ids"] == ids:
+        if c["ids"] == ids or not ids:   # (13/11) a reference model shipped as its cache alone (MARS on LUMI: --common)
             return c["ids"], c["feats"]
     rows = list(_pmap(_globals_one, [model_dir / f"{i}.pt" for i in ids]))  # no mmap (OOM kill on 18k files)
     names = sorted(set.intersection(*(set(r) for r in rows)))
