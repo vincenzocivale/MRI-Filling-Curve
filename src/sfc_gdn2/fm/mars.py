@@ -103,6 +103,9 @@ class MARS(Wrapper):
         net = self._swinunetr(n_out)
         if pretrained:
             net.swinViT.load_state_dict(self.swin.state_dict(), strict=True)
+        # val / test with the repo's own sliding window (finetune/socks.py infer_model: MONAI sliding_window_inference,
+        # overlap = config sw_overlap 0.75, MONAI's default constant blending); fm/segrun.py `sliding` reads this
+        net.monai_slide = {"overlap": float(self.args.get("seg_overlap", 0.75)), "mode": "constant"}
         return net, ["swinViT"], (self.roi,) * 3
 
     # ---------------------------------------------------------------- inference

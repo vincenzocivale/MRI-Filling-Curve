@@ -24,6 +24,7 @@ fm:
     fomo26: {configs: [fomo26], workers: 7}
     brainfm: {configs: [brainfm], workers: 0}          # prepare_image resizes on the model's device
     bsf_ukb: {configs: [bsf_ukb_pretrain], workers: 7}
+    mars: {configs: [mars_swinb], workers: 7}   # (13/11) MARS Swin-B, run on LUMI
     bsf_atlas: {configs: [bsf_atlas_pretrain], workers: 7}
     medicalnet: {configs: [medicalnet_resnet50_23dataset], workers: 7}
     nnunet: {configs: [nnunet_totalseg_mr_870], workers: 7}   # 871 (muscles) dropped: same net and data as 870
@@ -44,6 +45,7 @@ fm:
     brainfm: {features: [feat_last_fgmean, feat_0, feat_1], drop_canonical: true,
               pool: [{from: feat_last, factor: 8, to: feat_last_pool8}]}
     bsf_ukb_pretrain: &bsf {features: [stage4_gap, stage4, stage3]}
+    mars_swinb: {features: [stage4_gap, stage4, stage3]}   # same Swin-ViT stages as BrainSegFounder
     bsf_atlas_pretrain: *bsf
     medicalnet_resnet50_23dataset: {features: [layer4_gap, layer4_pool144], drop_canonical: true,
                                     pool: [{from: layer4, factor: [1, 4, 4], to: layer4_pool144}]}

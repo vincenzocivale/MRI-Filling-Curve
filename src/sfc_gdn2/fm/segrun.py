@@ -176,6 +176,19 @@ def tile_of(patch, align, k: int = 2):
 def sliding(net, x: torch.Tensor, patch, n_out: int, amp, ctx=None) -> torch.Tensor:
     """[C, *S] -> class probabilities [n_out, *S] (Gaussian-weighted tiles, step 0.5 of the patch)."""
     lm = getattr(net, "landmark", False)   # landmark heatmaps: sigmoid per channel, the generic tile path
+    mo = getattr(net, "monai_slide", None)
+    if mo:   # (13/11, Francesco: "the sliding-window overlaps THEY say, use their code") the repo's own MONAI
+        # sliding_window_inference (fm/mars.py: overlap 0.75, constant blending, logits averaged as in their socks.py),
+        # then softmax (argmax-equivalent to theirs); only for wrappers that set net.monai_slide, everyone else below
+        from monai.inferers import sliding_window_inference
+        S = tuple(x.shape[1:])
+        free = torch.cuda.mem_get_info(x.device)[0] if x.is_cuda else 0
+        dev = x.device if x.is_cuda and n_out * math.prod(S) * 4 <= free / 4 else torch.device("cpu")
+        with amp():
+            lg = sliding_window_inference(x[None], roi_size=tuple(patch), sw_batch_size=SLIDE[0],
+                                          predictor=lambda t: call(net, t, None), overlap=float(mo["overlap"]),
+                                          mode=mo.get("mode", "constant"), device=dev)[0]
+        return (lg.float().sigmoid() if lm else lg.float().softmax(0)).half()
     S = tuple(x.shape[1:])
     patch = S if patch is None else tuple(min(p, s) for p, s in zip(patch, S)) if getattr(net, "any_tile", False) \
         else tuple(patch)
