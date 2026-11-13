@@ -650,7 +650,13 @@ def second_order_ext(d: Path, ids: list[str], keys: list[str], dim: int = 64, sa
     cache = d / "_second_order_ext.pt"
     if cache.exists() and (c := torch.load(cache))["ids"] == ids:
         return c["feats"]
-    basis = ext_basis(d, ids, keys, dim, sample, fit)
+    fixed = os.environ.get("SFC_EXT_BASIS")   # (13/11, MARS on LUMI) a basis fit earlier, reused: every task, one basis
+    if fixed and Path(fixed).exists():
+        basis = torch.load(fixed)
+        print(f"[probe] second order (ext) {d.name}: basis from {fixed}", flush=True)
+    else:
+        basis = ext_basis(d, ids, keys, dim, sample, fit)
+        torch.save(basis, d / "_ext_basis.pt")   # kept, so later runs on more volumes can reuse it (SFC_EXT_BASIS)
     out: dict[str, list] = {}
     for n, r in enumerate(_pmap(_ext_one, [d / f"{i}.pt" for i in ids], (basis, dim))):
         for name, c in r.items():
