@@ -82,8 +82,8 @@ objective:
   meta_ridge: 0.1             # (cross-contrast mate, FLAIR hyperintensity, intensity classes), 1 - R^2 on the far side
   meta_min_mm: 8.0            # of a random plane; weight, ridge strength (x mean |x|^2), coarsest grain read
   top_levels: [volume, session]   # the levels above the view ([] for the A/B check)
-  rec_weight: 0.2             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
-  rec_visible: 0.2            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens
+  rec_weight: 0.0             # masked tokens predict their patch's native voxels in rec_cells^3 cells (normalised per
+  rec_visible: 0.0            # patch; PatchDecode needs that layout in each token); rec_visible: B's foreground tokens
   max_packed_tokens: 65536    # tokens per encoder call (GDN-2's backward peak follows it; 262144: -12% s/step at d=512)
 
 train:
